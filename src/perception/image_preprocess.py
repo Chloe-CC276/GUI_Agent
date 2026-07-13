@@ -1,6 +1,11 @@
 """
 image_preprocess
 
+Resize
+Grey
+Blur(Gaussian, Median)
+Threshold (Binary, Adaptive, CLAHE)
+Sherpen
 """
 
 from __future__ import annotations
@@ -164,7 +169,7 @@ class ImageProcessor(BaseImageProcessor):
     ) -> np.ndarray:
         
         result = image.copy()
-        
+
         # Resize
         if resize_width or resize_height:
             result = self.resize(
