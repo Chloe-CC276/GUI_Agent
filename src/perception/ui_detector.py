@@ -649,7 +649,7 @@ class UIDetector:
         return UIDetector._sort_elements(related)
     
 
-     @staticmethod
+    @staticmethod
     def _merge_ocr_text(
         elements: Sequence[GUIElement],
     ) -> str:
@@ -1005,6 +1005,7 @@ class UIDetector:
     # Input handling
     # ------------------------------------------------------------------
 
+    # image preprocessing
     @staticmethod
     def _prepare_image(
         image: np.ndarray | str | Path,
@@ -1092,6 +1093,7 @@ class UIDetector:
         )
 
 
+    # 剪裁区域检查
     @staticmethod
     def _validate_region(
         image: np.ndarray,
