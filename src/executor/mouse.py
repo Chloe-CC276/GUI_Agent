@@ -440,4 +440,272 @@ class MouseController:
         return result
 
 
+    # ------------------------------------------------------------------
+    # Mouse button press and release 长按和释放
+    # ------------------------------------------------------------------
+
+    def mouse_down(
+        self,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+        button: Optional[MouseButton] = None,
+        duration: Optional[float] = None,
+    ) -> MouseActionResult:
+
+        resolved_button = button or self.default_button
+        self._validate_button(resolved_button)
+
+        target = self._resolve_optional_position(x, y)
+        resolved_duration = self._resolve_duration(duration)
+
+        def operation() -> None:
+            if target is not None:
+                pyautogui.moveTo(
+                    target.x,
+                    target.y,
+                    duration=resolved_duration,
+                    tween=pyautogui.linear,
+                )
+
+            pyautogui.mouseDown(button=resolved_button)
+
+        return self._execute_action(
+            action_name="mouse_down",
+            operation=operation,
+            message=f"Press and hold the {resolved_button} mouse button.",
+            metadata={
+                "button": resolved_button,
+                "x": target.x if target else None,
+                "y": target.y if target else None,
+            },
+            dry_run_end_position=target,
+        )
+
+
+    def mouse_up(
+        self,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+        button: Optional[MouseButton] = None,
+        duration: Optional[float] = None,
+    ) -> MouseActionResult:
+        """
+        Release a mouse button.
+        """
+
+        resolved_button = button or self.default_button
+        self._validate_button(resolved_button)
+
+        target = self._resolve_optional_position(x, y)
+        resolved_duration = self._resolve_duration(duration)
+
+        def operation() -> None:
+            if target is not None:
+                pyautogui.moveTo(
+                    target.x,
+                    target.y,
+                    duration=resolved_duration,
+                    tween=pyautogui.linear,
+                )
+
+            pyautogui.mouseUp(button=resolved_button)
+
+        return self._execute_action(
+            action_name="mouse_up",
+            operation=operation,
+            message=f"Release the {resolved_button} mouse button.",
+            metadata={
+                "button": resolved_button,
+                "x": target.x if target else None,
+                "y": target.y if target else None,
+            },
+            dry_run_end_position=target,
+        )
+
+
+    # ------------------------------------------------------------------
+    # Dragging
+    # ------------------------------------------------------------------
+
+    # 拖拽到绝对位置
+    def drag_to(
+        self,
+        x: int,
+        y: int,
+        duration: Optional[float] = None,
+        button: Optional[MouseButton] = None,
+        tween: Optional[Callable[[float], float]] = None,
+    ) -> MouseActionResult:
+
+        self.validate_position(x, y)
+
+        resolved_duration = self._resolve_duration(duration)
+        resolved_button = button or self.default_button
+        self._validate_button(resolved_button)
+
+        return self._execute_action(
+            action_name="drag_to",
+            operation=lambda: pyautogui.dragTo(
+                x=x,
+                y=y,
+                duration=resolved_duration,
+                button=resolved_button,
+                tween=tween or pyautogui.linear,
+            ),
+            message=(
+                f"Drag the {resolved_button} mouse button "
+                f"to ({x}, {y})."
+            ),
+            metadata={
+                "x": x,
+                "y": y,
+                "duration": resolved_duration,
+                "button": resolved_button,
+            },
+            dry_run_end_position=MousePosition(x, y),
+        )
     
+
+    def drag_by(
+        self,
+        offset_x: int,
+        offset_y: int,
+        duration: Optional[float] = None,
+        button: Optional[MouseButton] = None,
+        tween: Optional[Callable[[float], float]] = None,
+    ) -> MouseActionResult:
+        """
+        Drag the mouse by a relative offset.
+        """
+
+        self._validate_coordinate_type(
+            offset_x,
+            offset_y,
+            names=("offset_x", "offset_y"),
+        )
+
+        start = self.get_position()
+        target_x = start.x + offset_x
+        target_y = start.y + offset_y
+
+        self.validate_position(target_x, target_y)
+
+        resolved_duration = self._resolve_duration(duration)
+        resolved_button = button or self.default_button
+        self._validate_button(resolved_button)
+
+        return self._execute_action(
+            action_name="drag_by",
+            operation=lambda: pyautogui.dragRel(
+                xOffset=offset_x,
+                yOffset=offset_y,
+                duration=resolved_duration,
+                button=resolved_button,
+                tween=tween or pyautogui.linear,
+            ),
+            message=(
+                f"Drag the {resolved_button} mouse button by "
+                f"({offset_x}, {offset_y})."
+            ),
+            metadata={
+                "offset_x": offset_x,
+                "offset_y": offset_y,
+                "target_x": target_x,
+                "target_y": target_y,
+                "duration": resolved_duration,
+                "button": resolved_button,
+            },
+            dry_run_end_position=MousePosition(
+                target_x,
+                target_y,
+            ),
+        )
+    
+
+    # ------------------------------------------------------------------
+    # Scrolling
+    # ------------------------------------------------------------------
+
+    # 垂直滚动，正-up,负-down
+    def scroll(
+        self,
+        amount: int,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+    ) -> MouseActionResult:
+
+        if not isinstance(amount, int) or isinstance(amount, bool):
+            raise TypeError("amount must be an integer.")
+
+        if amount == 0:
+            raise ValueError("amount must not be zero.")
+
+        target = self._resolve_optional_position(x, y)
+
+        def operation() -> None:
+            if target is not None:
+                pyautogui.moveTo(
+                    target.x,
+                    target.y,
+                    duration=self.default_duration,
+                    tween=pyautogui.linear,
+                )
+
+            pyautogui.scroll(amount)
+
+        return self._execute_action(
+            action_name="scroll",
+            operation=operation,
+            message=f"Scroll vertically by {amount}.",
+            metadata={
+                "amount": amount,
+                "x": target.x if target else None,
+                "y": target.y if target else None,
+            },
+            dry_run_end_position=target,
+        )
+
+    # 水平滚动
+    def horizontal_scroll(
+        self,
+        amount: int,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+    ) -> MouseActionResult:
+
+        if not isinstance(amount, int) or isinstance(amount, bool):
+            raise TypeError("amount must be an integer.")
+
+        if amount == 0:
+            raise ValueError("amount must not be zero.")
+
+        if not hasattr(pyautogui, "hscroll"):
+            raise NotImplementedError(
+                "Horizontal scrolling is not supported by this "
+                "PyAutoGUI installation."
+            )
+
+        target = self._resolve_optional_position(x, y)
+
+        def operation() -> None:
+            if target is not None:
+                pyautogui.moveTo(
+                    target.x,
+                    target.y,
+                    duration=self.default_duration,
+                    tween=pyautogui.linear,
+                )
+
+            pyautogui.hscroll(amount)
+
+        return self._execute_action(
+            action_name="horizontal_scroll",
+            operation=operation,
+            message=f"Scroll horizontally by {amount}.",
+            metadata={
+                "amount": amount,
+                "x": target.x if target else None,
+                "y": target.y if target else None,
+            },
+            dry_run_end_position=target,
+        )
