@@ -13,7 +13,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from perception.base_preprocess import BaseImageProcessor
+from .base_preprocess import BaseImageProcessor
 
 
 MAX_PIXEL_VALUE=255
