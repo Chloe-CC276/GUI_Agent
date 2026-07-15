@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 MouseButton = Literal["left", "right", "middle"]
 
 
+@dataclass(frozen=True)
+class MousePosition:
+
+    x: int
+    y: int
+
+    def as_tuple(self) -> tuple[int, int]:
+
+        return self.x, self.y
+
+
 @dataclass
 class MouseActionResult:
 
@@ -45,7 +56,6 @@ class MouseActionResult:
 
 
 class MouseController:
-
 
     VALID_BUTTONS: set[str] = {
         "left",
@@ -373,7 +383,7 @@ class MouseController:
         )
     
 
-     def middle_click(
+    def middle_click(
         self,
         x: Optional[int] = None,
         y: Optional[int] = None,
@@ -709,3 +719,297 @@ class MouseController:
             },
             dry_run_end_position=target,
         )
+    
+
+    # ------------------------------------------------------------------
+    # Timing and safety
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def wait(seconds: float) -> None:
+        """
+        Pause execution for the specified number of seconds.
+        """
+
+        MouseController._validate_non_negative_number(
+            seconds,
+            "seconds",
+        )
+
+        time.sleep(float(seconds))
+
+    def set_dry_run(self, enabled: bool) -> None:
+        """
+        Enable or disable dry-run mode.
+        """
+
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool.")
+
+        self.dry_run = enabled
+
+    def set_fail_safe(self, enabled: bool) -> None:
+        """
+        Enable or disable PyAutoGUI fail-safe behaviour.
+        """
+
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool.")
+
+        self.fail_safe = enabled
+        pyautogui.FAILSAFE = enabled
+
+
+    # ------------------------------------------------------------------
+    # Internal action execution
+    # ------------------------------------------------------------------
+
+    def _execute_action(
+        self,
+        action_name: str,
+        operation: Callable[[], None],
+        message: str,
+        metadata: Optional[dict[str, Any]] = None,
+        dry_run_end_position: Optional[MousePosition] = None,
+    ) -> MouseActionResult:
+        """
+        Execute one mouse operation and return a structured result.
+        """
+
+        with self._lock:
+            start_time = time.perf_counter()
+            start_position = self.get_position()
+
+            try:
+                if self.dry_run:
+                    logger.info(
+                        "[DRY RUN] %s",
+                        message,
+                    )
+
+                    end_position = (
+                        dry_run_end_position
+                        if dry_run_end_position is not None
+                        else start_position
+                    )
+                else:
+                    logger.info(message)
+                    operation()
+                    end_position = self.get_position()
+
+                elapsed_time = time.perf_counter() - start_time
+
+                return MouseActionResult(
+                    action=action_name,
+                    success=True,
+                    start_position=start_position,
+                    end_position=end_position,
+                    elapsed_time=elapsed_time,
+                    dry_run=self.dry_run,
+                    message=message,
+                    metadata=metadata or {},
+                )
+
+            except pyautogui.FailSafeException as error:
+                elapsed_time = time.perf_counter() - start_time
+                end_position = self.get_position()
+
+                logger.warning(
+                    "Mouse fail-safe interrupted action %s: %s",
+                    action_name,
+                    error,
+                )
+
+                result = MouseActionResult(
+                    action=action_name,
+                    success=False,
+                    start_position=start_position,
+                    end_position=end_position,
+                    elapsed_time=elapsed_time,
+                    dry_run=self.dry_run,
+                    message=message,
+                    error=str(error),
+                    metadata=metadata or {},
+                )
+
+                if self.raise_on_error:
+                    raise
+
+                return result
+
+            except Exception as error:
+                elapsed_time = time.perf_counter() - start_time
+
+                try:
+                    end_position = self.get_position()
+                except Exception:
+                    end_position = start_position
+
+                logger.exception(
+                    "Mouse action %s failed.",
+                    action_name,
+                )
+
+                result = MouseActionResult(
+                    action=action_name,
+                    success=False,
+                    start_position=start_position,
+                    end_position=end_position,
+                    elapsed_time=elapsed_time,
+                    dry_run=self.dry_run,
+                    message=message,
+                    error=str(error),
+                    metadata=metadata or {},
+                )
+
+                if self.raise_on_error:
+                    raise
+
+                return result
+    
+
+    # ------------------------------------------------------------------
+    # Validation helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_optional_position(
+        self,
+        x: Optional[int],
+        y: Optional[int],
+    ) -> Optional[MousePosition]:
+        """
+        Resolve optional x/y values into MousePosition.
+        """
+
+        if x is None and y is None:
+            return None
+
+        if x is None or y is None:
+            raise ValueError(
+                "x and y must either both be provided or both be omitted."
+            )
+
+        self.validate_position(x, y)
+
+        return MousePosition(x=x, y=y)
+
+    def _resolve_duration(
+        self,
+        duration: Optional[float],
+    ) -> float:
+        """
+        Resolve an optional duration value.
+        """
+
+        if duration is None:
+            return self.default_duration
+
+        self._validate_non_negative_number(
+            duration,
+            "duration",
+        )
+
+        return float(duration)
+
+    @classmethod
+    def _validate_button(
+        cls,
+        button: str,
+    ) -> None:
+        """
+        Validate a mouse button name.
+        """
+
+        if not isinstance(button, str):
+            raise TypeError("button must be a string.")
+
+        if button not in cls.VALID_BUTTONS:
+            raise ValueError(
+                f"Unsupported mouse button: {button!r}. "
+                f"Expected one of {sorted(cls.VALID_BUTTONS)}."
+            )
+
+    @staticmethod
+    def _validate_click_count(clicks: int) -> None:
+        """
+        Validate a click count.
+        """
+
+        if not isinstance(clicks, int) or isinstance(clicks, bool):
+            raise TypeError("clicks must be an integer.")
+
+        if clicks <= 0:
+            raise ValueError("clicks must be greater than zero.")
+
+    @staticmethod
+    def _validate_coordinate_type(
+        x: int,
+        y: int,
+        names: tuple[str, str] = ("x", "y"),
+    ) -> None:
+        """
+        Validate coordinate data types.
+        """
+
+        for name, value in zip(names, (x, y)):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{name} must be an integer, "
+                    f"received {type(value).__name__}."
+                )
+
+    @staticmethod
+    def _validate_non_negative_number(
+        value: float,
+        name: str,
+    ) -> None:
+        """
+        Validate a non-negative numeric value.
+        """
+
+        if isinstance(value, bool) or not isinstance(
+            value,
+            (int, float),
+        ):
+            raise TypeError(
+                f"{name} must be an int or float."
+            )
+
+        if value < 0:
+            raise ValueError(
+                f"{name} must be non-negative."
+            )
+
+    @staticmethod
+    def _validate_normalised_coordinate(
+        value: float,
+        name: str,
+    ) -> None:
+        """
+        Validate a normalised coordinate in [0, 1].
+        """
+
+        if isinstance(value, bool) or not isinstance(
+            value,
+            (int, float),
+        ):
+            raise TypeError(
+                f"{name} must be a numeric value."
+            )
+
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError(
+                f"{name} must be in the range [0, 1]."
+            )
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"pause={self.pause}, "
+            f"fail_safe={self.fail_safe}, "
+            f"default_duration={self.default_duration}, "
+            f"default_button={self.default_button!r}, "
+            f"dry_run={self.dry_run}, "
+            f"raise_on_error={self.raise_on_error}"
+            f")"
+        )    
