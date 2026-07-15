@@ -6,7 +6,6 @@ test mouse perception integration
 3.在右键菜单中点击属性
 4.鼠标移动到文件列表区域
 5.向上滚动10格，再向下滚动10格
-6.将executor文件夹拖拽到桌面
 """
 
 
@@ -18,6 +17,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, Sequence
+import pyautogui
 
 from src.executor.mouse import (
     MouseActionResult,
@@ -45,9 +45,7 @@ PROPERTY_TEXT_CANDIDATES = (
 # Windows property dialog close-button candidates.
 CLOSE_TEXT_CANDIDATES = (
     "确定",
-    "OK",
     "取消",
-    "Cancel",
 )
 
 # Wait times for File Explorer and context menu refresh.
@@ -453,6 +451,59 @@ def drag_element_to_element(
         y=target_element.center[1],
         duration=duration,
         button="left",
+    )
+
+
+def close_properties_dialog(
+    pipeline: PerceptionPipeline,
+    mouse: MouseController,
+    max_attempts: int = 3,
+) -> Optional[MouseActionResult]:
+
+    print_separator("阶段4：关闭属性窗口")
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"关闭尝试       : {attempt}/{max_attempts}")
+
+        dialog_result = capture_perception(
+            pipeline=pipeline,
+            title=f"阶段4：识别属性窗口，第{attempt}次",
+        )
+
+        close_candidates = find_text_candidates(
+            pipeline=pipeline,
+            result=dialog_result,
+            texts=CLOSE_TEXT_CANDIDATES,
+            exact_match=True,
+        )
+
+        close_element = select_best_element(close_candidates)
+
+        # 方法1：点击确定、取消、OK或Cancel
+        if close_element is not None:
+            print_gui_element(
+                title="定位结果：属性窗口关闭按钮",
+                element=close_element,
+            )
+
+            click_result = left_click_element(
+                mouse=mouse,
+                element=close_element,
+            )
+
+            print_mouse_result(
+                step_number=4,
+                title="点击按钮关闭属性窗口",
+                result=click_result,
+            )
+
+            time.sleep(AFTER_CLOSE_WAIT)
+            return click_result
+
+
+    raise RuntimeError(
+        "属性窗口关闭失败。请检查窗口是否仍处于前台，"
+        "或适当增加 AFTER_CLOSE_WAIT。"
     )
 
 # ================================================================
@@ -912,7 +963,7 @@ def print_final_summary(
 
 def test_mouse_perception_integration() -> None:
     run_mouse_perception_test()
-    
+
 
 if __name__ == "__main__":
     try:
