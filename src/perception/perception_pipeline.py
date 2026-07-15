@@ -43,7 +43,7 @@ class PerceptionResult:
     def element_count(self) -> int:
         return len(self.merged_elements)
 
-    # 返回OCR文本组件数量
+    # 返回OCR识别元素数量
     @property
     def text_count(self) -> int:
         return len(self.ocr_elements)
@@ -62,7 +62,7 @@ class PerceptionResult:
             if element.text.strip()
         ]
 
-    # 返回指定类型的elements
+    # 根据组件类型筛选元素
     def get_elements_by_type(
         self,
         element_type: str,
@@ -149,6 +149,7 @@ class PerceptionPipeline:
     # Main pipeline API 输出image和region,输出Perception Result
     # ------------------------------------------------------------------
 
+    # 执行'图像获取->preprocessing->OCR->UI detection->merge result->result'
     def run(
         self,
         image: Optional[np.ndarray | str | Path] = None,
@@ -268,22 +269,19 @@ class PerceptionPipeline:
 
         return result
 
+    # 截取当前桌面并感知
     def capture_and_run(
         self,
         region: Optional[tuple[int, int, int, int]] = None,
         **run_options: Any,
     ) -> PerceptionResult:
-        """
-        Capture the current desktop and execute the pipeline.
-
-        This is a convenience wrapper around :meth:`run`.
-        """
 
         return self.run(
             image=None,
             region=region,
             **run_options,
         )
+
 
     def process_image(
         self,
@@ -336,6 +334,7 @@ class PerceptionPipeline:
             element_type=element_type,
         )
 
+    # 根据文本匹配与最高置信度寻找元素
     def find_best_text_match(
         self,
         result: PerceptionResult,
