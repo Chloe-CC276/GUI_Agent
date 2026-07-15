@@ -1286,7 +1286,7 @@ def test_save_full_pipeline_result(
     paths = pipeline.save_result(
         result=full_result,
         output_dir=OUTPUT_DIR,
-        prefix="full_screen",
+        prefix="pp_full_screen",
         save_original=True,
         save_processed=True,
         save_visualization=True,
@@ -1358,7 +1358,7 @@ def test_save_region_pipeline_result(
     paths = pipeline.save_result(
         result=result,
         output_dir=OUTPUT_DIR,
-        prefix="region",
+        prefix="pp_region",
         save_original=True,
         save_processed=True,
         save_visualization=True,
@@ -1728,7 +1728,7 @@ def run_manual_test() -> None:
     full_paths = pipeline.save_result(
         result=full_result,
         output_dir=OUTPUT_DIR,
-        prefix="full_screen",
+        prefix="pp_full_screen",
     )
 
     for name, path in full_paths.items():
@@ -1754,7 +1754,7 @@ def run_manual_test() -> None:
     region_paths = pipeline.save_result(
         result=region_result,
         output_dir=OUTPUT_DIR,
-        prefix="region",
+        prefix="pp_region",
     )
 
     for name, path in region_paths.items():
