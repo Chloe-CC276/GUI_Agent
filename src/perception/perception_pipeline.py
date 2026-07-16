@@ -329,8 +329,14 @@ class PerceptionPipeline:
         Find GUI elements by element type.
         """
 
+        source_elements = (
+            result.ui_elements
+            if result.ui_elements
+            else result.merged_elements
+        )
+
         return self.ui_detector.find_by_type(
-            elements=result.merged_elements,
+            elements=source_elements,
             element_type=element_type,
         )
 
@@ -552,29 +558,23 @@ class PerceptionPipeline:
             return []
 
         if use_ocr and use_ui_detection:
-            local_ocr = list(ocr_elements)
+            merged_elements = list(ui_elements)
 
-            if coordinate_offset != (0, 0):
-                local_ocr = self._offset_elements(
-                    elements=ocr_elements,
-                    offset_x=-coordinate_offset[0],
-                    offset_y=-coordinate_offset[1],
+            if self.include_unmatched_ocr:
+                existing_texts = {
+                    element.text
+                    for element in merged_elements
+                    if element.text.strip()
+                }
+
+                merged_elements.extend(
+                    element
+                    for element in ocr_elements
+                    if element.text.strip()
+                    and element.text not in existing_texts
                 )
 
-            local_merged = self.ui_detector.detect_and_merge(
-                image=image,
-                ocr_elements=local_ocr,
-                include_unmatched_ocr=self.include_unmatched_ocr,
-            )
-
-            if coordinate_offset != (0, 0):
-                return self._offset_elements(
-                    elements=local_merged,
-                    offset_x=coordinate_offset[0],
-                    offset_y=coordinate_offset[1],
-                )
-
-            return local_merged
+            return merged_elements
 
         if use_ocr:
             return list(ocr_elements)
