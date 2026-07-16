@@ -156,25 +156,27 @@ class FakeOCREngine:
         elements: Optional[Sequence[GUIElement]] = None,
     ) -> None:
         self.elements = list(
-            elements
-            or [
-                GUIElement(
-                    text="src",
-                    bbox=(50, 40, 120, 80),
-                    confidence=0.98,
-                    element_type="text",
-                    center=(85, 60),
-                ),
-                GUIElement(
-                    text="executor",
-                    bbox=(180, 100, 290, 140),
-                    confidence=0.96,
-                    element_type="text",
-                    center=(235, 120),
-                ),
-            ]
-        )
-
+    [
+        GUIElement(
+            text="src",
+            bbox=(50, 40, 120, 80),
+            confidence=0.98,
+            element_type="text",
+            center=(85, 60),
+        ),
+        GUIElement(
+            text="executor",
+            bbox=(180, 100, 290, 140),
+            confidence=0.96,
+            element_type="text",
+            center=(235, 120),
+        ),
+    ]
+    if elements is None
+    else elements
+)
+        
+        
     def detect(
         self,
         image: np.ndarray,
@@ -216,24 +218,25 @@ class FakeUIDetector:
         elements: Optional[Sequence[GUIElement]] = None,
     ) -> None:
         self.elements = list(
-            elements
-            or [
-                GUIElement(
-                    text="src",
-                    bbox=(40, 30, 135, 90),
-                    confidence=0.90,
-                    element_type="button",
-                    center=(87, 60),
-                ),
-                GUIElement(
-                    text="executor",
-                    bbox=(170, 90, 310, 155),
-                    confidence=0.88,
-                    element_type="button",
-                    center=(240, 122),
-                ),
-            ]
-        )
+        [
+        GUIElement(
+            text="src",
+            bbox=(50, 40, 120, 80),
+            confidence=0.98,
+            element_type="text",
+            center=(85, 60),
+        ),
+        GUIElement(
+            text="executor",
+            bbox=(180, 100, 290, 140),
+            confidence=0.96,
+            element_type="text",
+            center=(235, 120),
+        ),
+    ]
+    if elements is None
+    else elements
+)
 
     def detect(
         self,
