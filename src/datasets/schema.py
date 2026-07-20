@@ -1,5 +1,5 @@
 """
-schema
+schema.py
 
 Convert all datasets (ScreenAgent, Mind2Web, WebArena) into schema format.
 Task step: step_id, screenshot_path, instruction, action, llm_response, corrected_response, language, metadata
