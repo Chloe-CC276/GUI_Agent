@@ -28,11 +28,11 @@ class GUITaskStep:
 
     step_id: int
 
-    screenshot_path: Path
+    screenshot_path: Path | None
 
     instruction: str
 
-    action: Action
+    action: Action | SemanticAction
 
     llm_response: str | None = None
 
@@ -44,7 +44,11 @@ class GUITaskStep:
 
     @property
     def screenshot_exists(self) -> bool:
-        return self.screenshot_path.exists()
+        return (
+            self.screenshot_path is not None
+            and self.screenshot_path.exists()
+            )
+
 
     def to_dict(self) -> dict:
 
@@ -235,3 +239,37 @@ class DatasetSplit:
     def test_size(self):
 
         return len(self.test)
+    
+
+@dataclass
+class SemanticAction:
+    """
+    没有屏幕坐标的语义 GUI 动作。
+
+    主要用于 Mind2Web 等基于 DOM 的网页操作数据。
+    """
+
+    action_type: str
+
+    value: str | None = None
+
+    target_tag: str | None = None
+
+    target_attributes: dict[str, Any] = field(default_factory=dict)
+
+    backend_node_id: str | None = None
+
+    action_repr: str | None = None
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type,
+            "value": self.value,
+            "target_tag": self.target_tag,
+            "target_attributes": self.target_attributes,
+            "backend_node_id": self.backend_node_id,
+            "action_repr": self.action_repr,
+            "metadata": self.metadata,
+        }
