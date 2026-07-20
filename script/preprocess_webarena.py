@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from src.datasets.webarena_loader import WebArenaLoader
@@ -20,7 +22,7 @@ OUTPUT_ROOT = (
 )
 
 
-def main() -> None:
+def preprocess_webarena() -> dict[str, Path]:
     loader = WebArenaLoader(
         source=SOURCE_ROOT,
         strict=False,
@@ -36,10 +38,19 @@ def main() -> None:
         OUTPUT_ROOT / "task_configs.jsonl"
     )
 
-    print("任务数量：", len(loader))
-    print("统一任务格式：", tasks_path)
-    print("WebArena配置格式：", configs_path)
-    print("统计结果：", loader.statistics().to_dict())
+    print(
+        f"[WebArena] {len(loader)} 个任务 "
+        f"-> {tasks_path}"
+    )
+
+    return {
+        "tasks": tasks_path,
+        "configs": configs_path,
+    }
+
+
+def main() -> None:
+    preprocess_webarena()
 
 
 if __name__ == "__main__":

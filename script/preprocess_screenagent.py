@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from src.datasets.screenagent_loader import ScreenAgentLoader
@@ -21,31 +23,39 @@ OUTPUT_ROOT = (
 )
 
 
-def export_split(split: str) -> None:
-    source_path = SOURCE_ROOT / split
+def preprocess_screenagent() -> dict[str, Path]:
+    outputs: dict[str, Path] = {}
 
-    if not source_path.exists():
-        print(f"跳过，不存在：{source_path}")
-        return
+    for split in ("train", "test"):
+        source_path = SOURCE_ROOT / split
 
-    loader = ScreenAgentLoader(
-        data_root=source_path,
-        language="zh",
-        strict=False,
-        require_images=True,
-    )
+        if not source_path.exists():
+            print(f"[ScreenAgent] 跳过不存在的目录：{source_path}")
+            continue
 
-    output_path = loader.export_jsonl(
-        OUTPUT_ROOT / f"{split}.jsonl"
-    )
+        loader = ScreenAgentLoader(
+            data_root=source_path,
+            language="zh",
+            strict=False,
+            require_images=True,
+        )
 
-    print(f"{split} Session 数量：{len(loader)}")
-    print(f"{split} 导出路径：{output_path}")
+        output_path = loader.export_jsonl(
+            OUTPUT_ROOT / f"{split}.jsonl"
+        )
+
+        outputs[split] = output_path
+
+        print(
+            f"[ScreenAgent] {split}: "
+            f"{len(loader)} 个任务 -> {output_path}"
+        )
+
+    return outputs
 
 
 def main() -> None:
-    export_split("train")
-    export_split("test")
+    preprocess_screenagent()
 
 
 if __name__ == "__main__":

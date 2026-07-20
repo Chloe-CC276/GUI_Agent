@@ -7,10 +7,10 @@ from typing import Callable
 from .preprocess_mind2web import (
     preprocess_mind2web,
 )
-from preprocess_screenagent import (
+from .preprocess_screenagent import (
     preprocess_screenagent,
 )
-from preprocess_webarena import (
+from .preprocess_webarena import (
     preprocess_webarena,
 )
 
