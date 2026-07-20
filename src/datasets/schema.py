@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 # Reuse executor Action
-from executor.action import Action, ActionSequence
+from ..executor.action import Action, ActionSequence
 
 
 # ============================================================
