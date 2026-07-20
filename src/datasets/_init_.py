@@ -5,6 +5,8 @@ from .schema import (
     GUITaskStep,
     PlanningSample,
     SemanticAction,
+    WebArenaEvaluation,
+    WebArenaTaskConfig,
 )
 
 from .mind2web_loader import (
@@ -17,6 +19,11 @@ from .screenagent_loader import (
     ScreenAgentDataError,
     ScreenAgentLoader,
     UnsupportedScreenAgentActionError,
+)
+
+from .webarena_loader import (
+    WebArenaDataError,
+    WebArenaLoader,
 )
 
 
@@ -33,4 +40,8 @@ __all__ = [
     "ScreenAgentDataError",
     "ScreenAgentLoader",
     "UnsupportedScreenAgentActionError",
+    "WebArenaEvaluation",
+    "WebArenaTaskConfig",
+    "WebArenaDataError",
+    "WebArenaLoader",
 ]

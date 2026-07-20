@@ -49,14 +49,25 @@ class GUITaskStep:
             and self.screenshot_path.exists()
             )
 
+    @property
+    def is_executable(self) -> bool:
+        return isinstance(self.action, Action)
 
-    def to_dict(self) -> dict:
-
+    def to_dict(self) -> dict[str, Any]:
         return {
             "step_id": self.step_id,
-            "screenshot_path": str(self.screenshot_path),
+            "screenshot_path": (
+                str(self.screenshot_path)
+                if self.screenshot_path is not None
+                else None
+            ),
             "instruction": self.instruction,
             "action": self.action.to_dict(),
+            "action_kind": (
+                "executable"
+                if isinstance(self.action, Action)
+                else "semantic"
+            ),
             "llm_response": self.llm_response,
             "corrected_response": self.corrected_response,
             "language": self.language,
@@ -77,7 +88,7 @@ class GUITaskSample:
 
     instruction: str
 
-    steps: list[GUITaskStep]
+    steps: list[GUITaskStep] = field(default_factory=list) 
 
     language: str = "en"
 
@@ -87,13 +98,29 @@ class GUITaskSample:
     def num_steps(self) -> int:
 
         return len(self.steps)
+    
+
+    @property
+    def has_demonstration(self) -> bool:
+        return bool(self.steps)
+
+    @property
+    def executable_step_count(self) -> int:
+        return sum(
+            isinstance(step.action, Action)
+            for step in self.steps
+            )
 
     def to_action_sequence(self) -> ActionSequence:
 
-        return ActionSequence(
-            [step.action for step in self.steps]
-        )
+        executable_actions = [
+            step.action
+            for step in self.steps
+            if isinstance(step.action, Action)
+        ]
 
+        return ActionSequence(executable_actions)
+    
     def to_dict(self):
 
         return {
@@ -114,6 +141,144 @@ class GUITaskSample:
             "metadata": self.metadata,
         }
 
+
+# ============================================================
+# WebArena evaluation configuration
+# ============================================================
+
+@dataclass
+class WebArenaEvaluation:
+    """
+    WebArena task evaluation specification.
+    """
+
+    eval_types: list[str] = field(
+        default_factory=list
+    )
+
+    reference_answers: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    reference_url: str = ""
+
+    program_html: list[Any] = field(
+        default_factory=list
+    )
+
+    string_note: str = ""
+
+    reference_answer_raw_annotation: Any = None
+
+    metadata: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "eval_types": self.eval_types,
+            "reference_answers": self.reference_answers,
+            "reference_url": self.reference_url,
+            "program_html": self.program_html,
+            "string_note": self.string_note,
+            "reference_answer_raw_annotation": (
+                self.reference_answer_raw_annotation
+            ),
+            "metadata": self.metadata,
+        }
+
+
+# ============================================================
+# WebArena task configuration
+# ============================================================
+
+@dataclass
+class WebArenaTaskConfig:
+    """
+    Structured representation of one WebArena benchmark task.
+
+    This is the source-level WebArena schema before conversion into
+    GUITaskSample.
+    """
+
+    task_id: str
+
+    sites: list[str]
+
+    require_login: bool
+
+    storage_state: str | None
+
+    start_url: str
+
+    geolocation: dict[str, Any] | None
+
+    intent_template: str
+
+    instantiation_dict: dict[str, Any]
+
+    intent: str
+
+    require_reset: bool
+
+    evaluation: WebArenaEvaluation
+
+    intent_template_id: int | None = None
+
+    metadata: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    def to_gui_task_sample(self) -> GUITaskSample:
+        """
+        Convert WebArena configuration into unified GUI Agent format.
+
+        WebArena does not provide a demonstration trajectory, so
+        steps remains empty.
+        """
+        return GUITaskSample(
+            task_id=self.task_id,
+            source="webarena",
+            instruction=self.intent,
+            steps=[],
+            language="en",
+            metadata={
+                "sites": self.sites,
+                "require_login": self.require_login,
+                "storage_state": self.storage_state,
+                "start_url": self.start_url,
+                "geolocation": self.geolocation,
+                "intent_template": self.intent_template,
+                "instantiation_dict": (
+                    self.instantiation_dict
+                ),
+                "require_reset": self.require_reset,
+                "evaluation": self.evaluation.to_dict(),
+                "intent_template_id": (
+                    self.intent_template_id
+                ),
+                "has_demonstration_trajectory": False,
+                **self.metadata,
+            },
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "sites": self.sites,
+            "require_login": self.require_login,
+            "storage_state": self.storage_state,
+            "start_url": self.start_url,
+            "geolocation": self.geolocation,
+            "intent_template": self.intent_template,
+            "instantiation_dict": self.instantiation_dict,
+            "intent": self.intent,
+            "require_reset": self.require_reset,
+            "eval": self.evaluation.to_dict(),
+            "intent_template_id": self.intent_template_id,
+            "metadata": self.metadata,
+        }
+    
 
 # ============================================================
 # Planning Sample
@@ -176,7 +341,7 @@ class DatasetStatistics:
 
     num_steps: int = 0
 
-    avg_steps_per_task: float = 0
+    avg_steps_per_task: float = 0.0
 
     action_distribution: dict[str, int] = field(
         default_factory=dict
@@ -219,11 +384,17 @@ class DatasetStatistics:
 @dataclass
 class DatasetSplit:
 
-    train: list[GUITaskSample]
+    train: list[GUITaskSample] = field(
+        default_factory=list
+    )
 
-    validation: list[GUITaskSample]
+    validation: list[GUITaskSample] = field(
+        default_factory=list
+    )
 
-    test: list[GUITaskSample]
+    test: list[GUITaskSample] = field(
+        default_factory=list
+    )
 
     @property
     def train_size(self):
@@ -239,6 +410,13 @@ class DatasetSplit:
     def test_size(self):
 
         return len(self.test)
+    
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "train_size": self.train_size,
+            "validation_size": self.validation_size,
+            "test_size": self.test_size,
+        }
     
 
 @dataclass
