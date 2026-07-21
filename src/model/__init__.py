@@ -21,6 +21,13 @@ from .base_vlm import (
     parse_json_text,
 )
 
+from .qwen_vlm import (
+    QwenVLM,
+    QwenVLMConfigurationError,
+    QwenVLMProviderError,
+    QwenVLMResponseError,
+)
+
 
 __all__ =[
     "BaseVLM",
@@ -42,4 +49,8 @@ __all__ =[
     "VLMStructuredOutputError",
     "VLMUsage",
     "normalise_image",
-    "parse_json_text",]
+    "parse_json_text",
+    "QwenVLM",
+    "QwenVLMConfigurationError",
+    "QwenVLMProviderError",
+    "QwenVLMResponseError",]
