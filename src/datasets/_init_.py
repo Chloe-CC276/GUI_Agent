@@ -26,6 +26,12 @@ from .webarena_loader import (
     WebArenaLoader,
 )
 
+from .processed_loader import (
+    DuplicateTaskIDError,
+    ProcessedDatasetError,
+    ProcessedDatasetLoader,
+)
+
 
 __all__ = [
     "DatasetSplit",
@@ -44,4 +50,7 @@ __all__ = [
     "WebArenaTaskConfig",
     "WebArenaDataError",
     "WebArenaLoader",
+    "DuplicateTaskIDError",
+    "ProcessedDatasetError",
+    "ProcessedDatasetLoader",
 ]
