@@ -1,0 +1,2264 @@
+"""
+planner
+
+Planner implementation for the GUI Agent.
+
+The Planner is the decision-making layer between AgentState and BaseVLM:
+
+    AgentState
+        -> build prompt
+        -> call VLM
+        -> parse structured response
+        -> create Action
+        -> return PlannerResult
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+import math
+import re
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Mapping, Protocol, Sequence, TYPE_CHECKING
+
+from .result import (
+    ErrorInfo,
+    PlannerDecision,
+    PlannerResult,
+    ResultStatus,
+    TimingInfo,
+    UsageInfo,
+)
+from .state import AgentPhase, AgentState
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
+
+# ============================================================
+# Exceptions
+# ============================================================
+
+
+class PlannerError(RuntimeError):
+    """Base exception raised by Planner."""
+
+
+class PlannerConfigurationError(PlannerError):
+    """Raised when Planner configuration is invalid."""
+
+
+class PlannerStateError(PlannerError):
+    """Raised when AgentState is not ready for planning."""
+
+
+class PlannerResponseError(PlannerError):
+    """Raised when the VLM response is empty or unusable."""
+
+
+class PlannerParseError(PlannerResponseError):
+    """Raised when the VLM response cannot be parsed as JSON."""
+
+
+class PlannerValidationError(PlannerResponseError):
+    """Raised when parsed planner output violates the schema."""
+
+
+class PlannerActionError(PlannerResponseError):
+    """Raised when an action cannot be created or validated."""
+
+
+# ============================================================
+# Protocols
+# ============================================================
+
+
+class VLMProtocol(Protocol):
+    """
+    Minimal interface expected from BaseVLM/QwenVLM.
+
+    The concrete model may expose either:
+    - generate_json(...)
+    - generate(...)
+    - generate_request(...)
+
+    Planner resolves the best available method dynamically.
+    """
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        ...
+
+
+class ActionFactoryProtocol(Protocol):
+    """Convert normalized action data into a concrete action object."""
+
+    def __call__(
+        self,
+        action_type: str,
+        parameters: Mapping[str, Any],
+    ) -> Any:
+        ...
+
+
+# ============================================================
+# Enums and constants
+# ============================================================
+
+
+class PlannerOutputMode(str, Enum):
+    """Preferred VLM output mode."""
+
+    JSON = "json"
+    TEXT = "text"
+
+
+class InvalidResponsePolicy(str, Enum):
+    """What Planner should return after all local attempts fail."""
+
+    RETRY = "retry"
+    FAIL = "fail"
+
+
+class ActionName(str, Enum):
+    """Canonical GUI action names understood by the default schema."""
+
+    MOVE_TO = "move_to"
+    MOVE_BY = "move_by"
+    CLICK = "click"
+    DOUBLE_CLICK = "double_click"
+    RIGHT_CLICK = "right_click"
+    MIDDLE_CLICK = "middle_click"
+    MOUSE_DOWN = "mouse_down"
+    MOUSE_UP = "mouse_up"
+    DRAG_TO = "drag_to"
+    DRAG_BY = "drag_by"
+    SCROLL = "scroll"
+    HORIZONTAL_SCROLL = "horizontal_scroll"
+    PRESS = "press"
+    HOTKEY = "hotkey"
+    TYPE_TEXT = "type_text"
+    WAIT = "wait"
+    SCREENSHOT = "screenshot"
+    FINISH = "finish"
+    RETRY = "retry"
+    FAIL = "fail"
+
+
+DEFAULT_ALLOWED_ACTIONS: tuple[str, ...] = tuple(
+    action.value for action in ActionName
+)
+
+FINISH_ALIASES = {
+    "finish",
+    "finished",
+    "done",
+    "complete",
+    "completed",
+    "success",
+    "stop",
+}
+
+RETRY_ALIASES = {
+    "retry",
+    "replan",
+    "observe_again",
+    "try_again",
+}
+
+FAIL_ALIASES = {
+    "fail",
+    "failed",
+    "abort",
+    "error",
+}
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+
+@dataclass(slots=True)
+class PlannerConfig:
+    """Configuration for prompt building, parsing, retry, and validation."""
+
+    system_prompt: str | None = None
+    output_mode: PlannerOutputMode = PlannerOutputMode.JSON
+    invalid_response_policy: InvalidResponsePolicy = (
+        InvalidResponsePolicy.RETRY
+    )
+
+    max_attempts: int = 2
+    retry_on_empty_response: bool = True
+    retry_on_parse_error: bool = True
+    retry_on_validation_error: bool = True
+    retry_on_action_error: bool = False
+
+    temperature: float = 0.0
+    max_tokens: int | None = 1200
+    timeout_seconds: float | None = None
+
+    include_screenshot: bool = True
+    include_previous_observation: bool = True
+    history_limit: int = 10
+    max_ocr_chars: int = 2000
+    max_elements: int = 100
+
+    require_reason: bool = True
+    require_confidence: bool = False
+    confidence_default: float | None = None
+
+    allowed_actions: tuple[str, ...] = DEFAULT_ALLOWED_ACTIONS
+    allow_unknown_actions: bool = False
+    validate_coordinates: bool = True
+    clamp_coordinates: bool = False
+    allow_negative_relative_coordinates: bool = True
+    allow_empty_text: bool = False
+    max_text_length: int = 10000
+
+    expose_thought: bool = False
+    send_thought_field: bool = False
+    include_raw_response: bool = True
+    include_prompt_in_metadata: bool = False
+
+    model_kwargs: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.output_mode, str):
+            self.output_mode = PlannerOutputMode(self.output_mode)
+
+        if isinstance(self.invalid_response_policy, str):
+            self.invalid_response_policy = InvalidResponsePolicy(
+                self.invalid_response_policy
+            )
+
+        if self.max_attempts <= 0:
+            raise PlannerConfigurationError(
+                "max_attempts must be greater than zero."
+            )
+
+        if not 0.0 <= self.temperature <= 2.0:
+            raise PlannerConfigurationError(
+                "temperature must be between 0 and 2."
+            )
+
+        if self.max_tokens is not None and self.max_tokens <= 0:
+            raise PlannerConfigurationError(
+                "max_tokens must be positive or None."
+            )
+
+        if (
+            self.timeout_seconds is not None
+            and self.timeout_seconds <= 0
+        ):
+            raise PlannerConfigurationError(
+                "timeout_seconds must be positive or None."
+            )
+
+        if self.history_limit < 0:
+            raise PlannerConfigurationError(
+                "history_limit must be non-negative."
+            )
+
+        if self.max_ocr_chars <= 0:
+            raise PlannerConfigurationError(
+                "max_ocr_chars must be positive."
+            )
+
+        if self.max_elements <= 0:
+            raise PlannerConfigurationError(
+                "max_elements must be positive."
+            )
+
+        if self.max_text_length <= 0:
+            raise PlannerConfigurationError(
+                "max_text_length must be positive."
+            )
+
+        allowed = []
+
+        for item in self.allowed_actions:
+            normalized = str(item).strip().lower()
+
+            if normalized and normalized not in allowed:
+                allowed.append(normalized)
+
+        if not allowed:
+            raise PlannerConfigurationError(
+                "allowed_actions must not be empty."
+            )
+
+        self.allowed_actions = tuple(allowed)
+
+        if self.confidence_default is not None:
+            if not 0.0 <= self.confidence_default <= 1.0:
+                raise PlannerConfigurationError(
+                    "confidence_default must be between 0 and 1."
+                )
+
+
+# ============================================================
+# Parsed response model
+# ============================================================
+
+
+@dataclass(slots=True)
+class ParsedPlannerOutput:
+    """Normalized representation of one VLM planner response."""
+
+    decision: PlannerDecision
+    action_type: str | None = None
+    parameters: dict[str, Any] = field(default_factory=dict)
+    reason: str | None = None
+    thought: str | None = None
+    observation_summary: str | None = None
+    goal_progress: str | None = None
+    finish_message: str | None = None
+    confidence: float | None = None
+    raw_data: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision": self.decision.value,
+            "action_type": self.action_type,
+            "parameters": dict(self.parameters),
+            "reason": self.reason,
+            "thought": self.thought,
+            "observation_summary": self.observation_summary,
+            "goal_progress": self.goal_progress,
+            "finish_message": self.finish_message,
+            "confidence": self.confidence,
+            "raw_data": dict(self.raw_data),
+        }
+
+
+# ============================================================
+# Default action factory
+# ============================================================
+
+
+def dictionary_action_factory(
+    action_type: str,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    Default action factory.
+
+    It returns a normalized dictionary. Projects with a concrete Action class
+    should inject a custom factory into Planner.
+    """
+    return {
+        "action_type": action_type,
+        **dict(parameters),
+    }
+
+
+# ============================================================
+# Planner
+# ============================================================
+
+
+class Planner:
+    """
+    GUI Agent planner.
+
+    Parameters
+    ----------
+    vlm:
+        BaseVLM-compatible instance, such as QwenVLM.
+
+    config:
+        Planner configuration.
+
+    action_factory:
+        Callable converting normalized action type and parameters into the
+        concrete object accepted by Executor.
+
+    prompt_builder:
+        Optional custom prompt builder. Signature:
+            prompt_builder(state, config) -> str
+
+    response_parser:
+        Optional custom response parser. Signature:
+            response_parser(response) -> Mapping[str, Any]
+
+    logger:
+        Optional logger.
+    """
+
+    def __init__(
+        self,
+        vlm: VLMProtocol,
+        *,
+        config: PlannerConfig | None = None,
+        action_factory: ActionFactoryProtocol | None = None,
+        prompt_builder: Callable[
+            [AgentState, PlannerConfig],
+            str,
+        ]
+        | None = None,
+        response_parser: Callable[
+            [Any],
+            Mapping[str, Any],
+        ]
+        | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        if vlm is None:
+            raise PlannerConfigurationError(
+                "vlm must not be None."
+            )
+
+        self.vlm = vlm
+        self.config = config or PlannerConfig()
+        self.action_factory = (
+            action_factory or dictionary_action_factory
+        )
+        self.prompt_builder = prompt_builder
+        self.response_parser = response_parser
+        self.logger = logger or logging.getLogger(
+            f"{__name__}.{self.__class__.__name__}"
+        )
+
+    # --------------------------------------------------------
+    # Public API
+    # --------------------------------------------------------
+
+    def plan(self, state: AgentState) -> PlannerResult:
+        """
+        Generate the next GUI action or a terminal decision.
+
+        This method never raises ordinary provider/parser exceptions to the
+        caller. It returns PlannerResult.retry(...) or PlannerResult.failed(...)
+        according to PlannerConfig.
+        """
+        timing = TimingInfo()
+        started = time.perf_counter()
+        last_error: ErrorInfo | None = None
+        prompt: str | None = None
+        raw_response: Any = None
+
+        try:
+            self._validate_state(state)
+            prompt = self.build_prompt(state)
+            images = self._collect_images(state)
+        except Exception as error:
+            timing.finish()
+            return PlannerResult.failed(
+                error=ErrorInfo.from_exception(
+                    error,
+                    retryable=False,
+                ),
+                reason="Planner input state is invalid.",
+                timing=timing,
+                metadata={
+                    "attempts": 0,
+                    "planner_config": self._config_metadata(),
+                },
+            )
+
+        for attempt in range(1, self.config.max_attempts + 1):
+            try:
+                raw_response = self.call_vlm(
+                    prompt=prompt,
+                    images=images,
+                    state=state,
+                    attempt=attempt,
+                )
+
+                parsed_mapping = self.parse_response(raw_response)
+                parsed = self.normalize_response(parsed_mapping, state)
+                result = self._build_result(
+                    parsed=parsed,
+                    raw_response=raw_response,
+                    timing=timing,
+                    prompt=prompt,
+                    attempt=attempt,
+                )
+
+                timing.finish()
+                result.timing = timing
+                result.metadata.setdefault(
+                    "elapsed_perf_seconds",
+                    time.perf_counter() - started,
+                )
+                return result
+
+            except Exception as error:
+                retryable = self._is_retryable_local_error(error)
+                last_error = ErrorInfo.from_exception(
+                    error,
+                    retryable=retryable,
+                    details={
+                        "attempt": attempt,
+                        "max_attempts": self.config.max_attempts,
+                    },
+                )
+
+                self.logger.warning(
+                    "Planner attempt %s/%s failed: %s",
+                    attempt,
+                    self.config.max_attempts,
+                    error,
+                )
+
+                if (
+                    attempt >= self.config.max_attempts
+                    or not retryable
+                ):
+                    break
+
+                prompt = self._build_repair_prompt(
+                    original_prompt=prompt,
+                    error=error,
+                    raw_response=raw_response,
+                )
+
+        timing.finish()
+
+        return self._failure_result(
+            error=last_error
+            or ErrorInfo(
+                error_type="PlannerUnknownError",
+                message="Planner failed without an exception.",
+                retryable=False,
+            ),
+            timing=timing,
+            raw_response=raw_response,
+            prompt=prompt,
+        )
+
+    async def aplan(self, state: AgentState) -> PlannerResult:
+        """
+        Async planner API.
+
+        It uses an async VLM method when available; otherwise it executes the
+        synchronous plan method in a worker thread.
+        """
+        import asyncio
+
+        async_method = self._resolve_async_vlm_method()
+
+        if async_method is None:
+            return await asyncio.to_thread(self.plan, state)
+
+        timing = TimingInfo()
+        prompt: str | None = None
+        raw_response: Any = None
+        last_error: ErrorInfo | None = None
+
+        try:
+            self._validate_state(state)
+            prompt = self.build_prompt(state)
+            images = self._collect_images(state)
+        except Exception as error:
+            timing.finish()
+            return PlannerResult.failed(
+                error=ErrorInfo.from_exception(error),
+                reason="Planner input state is invalid.",
+                timing=timing,
+            )
+
+        for attempt in range(1, self.config.max_attempts + 1):
+            try:
+                kwargs = self._build_vlm_kwargs(
+                    prompt=prompt,
+                    images=images,
+                    state=state,
+                    attempt=attempt,
+                )
+
+                raw_response = await async_method(**kwargs)
+                parsed_mapping = self.parse_response(raw_response)
+                parsed = self.normalize_response(parsed_mapping, state)
+                result = self._build_result(
+                    parsed=parsed,
+                    raw_response=raw_response,
+                    timing=timing,
+                    prompt=prompt,
+                    attempt=attempt,
+                )
+
+                timing.finish()
+                result.timing = timing
+                return result
+
+            except Exception as error:
+                retryable = self._is_retryable_local_error(error)
+                last_error = ErrorInfo.from_exception(
+                    error,
+                    retryable=retryable,
+                    details={
+                        "attempt": attempt,
+                        "max_attempts": self.config.max_attempts,
+                    },
+                )
+
+                if (
+                    attempt >= self.config.max_attempts
+                    or not retryable
+                ):
+                    break
+
+                prompt = self._build_repair_prompt(
+                    original_prompt=prompt,
+                    error=error,
+                    raw_response=raw_response,
+                )
+
+        timing.finish()
+
+        return self._failure_result(
+            error=last_error
+            or ErrorInfo(
+                error_type="PlannerUnknownError",
+                message="Planner failed without an exception.",
+            ),
+            timing=timing,
+            raw_response=raw_response,
+            prompt=prompt,
+        )
+
+    # --------------------------------------------------------
+    # State validation
+    # --------------------------------------------------------
+
+    def _validate_state(self, state: AgentState) -> None:
+        if not isinstance(state, AgentState):
+            raise PlannerStateError(
+                "state must be AgentState."
+            )
+
+        if state.is_terminal:
+            raise PlannerStateError(
+                f"Cannot plan from terminal phase: {state.phase.value}."
+            )
+
+        if state.phase not in {
+            AgentPhase.PLANNING,
+            AgentPhase.OBSERVING,
+            AgentPhase.VERIFYING,
+        }:
+            raise PlannerStateError(
+                "Planner requires PLANNING, OBSERVING, or VERIFYING "
+                f"phase; got {state.phase.value}."
+            )
+
+        if state.observation is None:
+            raise PlannerStateError(
+                "Planner requires a current observation."
+            )
+
+        if not state.instruction.strip():
+            raise PlannerStateError(
+                "Agent task instruction is empty."
+            )
+
+        if state.runtime.reached_max_steps:
+            raise PlannerStateError(
+                "Maximum number of steps has already been reached."
+            )
+
+        if state.runtime.is_timed_out:
+            raise PlannerStateError(
+                "Agent runtime deadline has been reached."
+            )
+
+    # --------------------------------------------------------
+    # Prompt building
+    # --------------------------------------------------------
+
+    def build_prompt(self, state: AgentState) -> str:
+        """Build the planner prompt from AgentState."""
+        if self.prompt_builder is not None:
+            prompt = self.prompt_builder(state, self.config)
+
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise PlannerConfigurationError(
+                    "Custom prompt_builder returned an empty prompt."
+                )
+
+            return prompt.strip()
+
+        context = state.planner_context(
+            history_limit=self.config.history_limit,
+            max_ocr_chars=self.config.max_ocr_chars,
+            max_elements=self.config.max_elements,
+        )
+
+        system_prompt = (
+            self.config.system_prompt
+            or self._default_system_prompt()
+        )
+
+        response_schema = self._response_schema_text()
+
+        return (
+            f"{system_prompt}\n\n"
+            "## Current task\n"
+            f"{state.instruction}\n\n"
+            "## Current agent context\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
+            "## Allowed actions\n"
+            f"{', '.join(self.config.allowed_actions)}\n\n"
+            "## Required output schema\n"
+            f"{response_schema}\n\n"
+            "Return exactly one JSON object. Do not use Markdown fences. "
+            "Choose only the next single action. Do not invent GUI elements "
+            "that are absent from the observation."
+        )
+
+    def _default_system_prompt(self) -> str:
+        thought_instruction = (
+            "Do not expose hidden chain-of-thought. Provide only a short, "
+            "task-relevant reason."
+        )
+
+        if self.config.send_thought_field:
+            thought_instruction = (
+                "The optional thought field must contain only a brief "
+                "operational note, not private chain-of-thought."
+            )
+
+        return (
+            "You are the Planner of a desktop GUI Agent. "
+            "Your job is to inspect the current task, current GUI observation, "
+            "and recent history, then select exactly one safe next action. "
+            "Prefer visible evidence from OCR and GUI elements. "
+            "Use coordinates only when they are supported by the observation. "
+            "If the task is already complete, return a finish decision. "
+            "If the observation is insufficient, request retry rather than "
+            "guessing. "
+            f"{thought_instruction}"
+        )
+
+    def _response_schema_text(self) -> str:
+        schema = {
+            "decision": "act | finish | retry | fail",
+            "action": {
+                "type": "required only when decision=act",
+                "parameters": {
+                    "x": "integer when required",
+                    "y": "integer when required",
+                    "dx": "integer when required",
+                    "dy": "integer when required",
+                    "button": "left | right | middle",
+                    "clicks": "positive integer",
+                    "text": "string",
+                    "key": "string",
+                    "keys": ["string"],
+                    "amount": "integer",
+                    "duration": "non-negative number",
+                },
+            },
+            "reason": "short explanation",
+            "observation_summary": "optional short summary",
+            "goal_progress": "optional progress summary",
+            "finish_message": "required when decision=finish",
+            "confidence": "number from 0 to 1",
+        }
+
+        if self.config.send_thought_field:
+            schema["thought"] = "optional brief operational note"
+
+        return json.dumps(schema, ensure_ascii=False, indent=2)
+
+    def _build_repair_prompt(
+        self,
+        *,
+        original_prompt: str,
+        error: Exception,
+        raw_response: Any,
+    ) -> str:
+        raw_text = self._extract_text(raw_response)
+
+        if len(raw_text) > 3000:
+            raw_text = raw_text[:3000] + "...<truncated>"
+
+        return (
+            f"{original_prompt}\n\n"
+            "## Previous response was invalid\n"
+            f"Validation error: {type(error).__name__}: {error}\n"
+            f"Previous response: {raw_text or '<empty>'}\n\n"
+            "Return a corrected JSON object only. Do not add commentary."
+        )
+
+    # --------------------------------------------------------
+    # Image and VLM call
+    # --------------------------------------------------------
+
+    def _collect_images(self, state: AgentState) -> list[Any]:
+        if not self.config.include_screenshot:
+            return []
+
+        observation = state.observation
+
+        if observation is None:
+            return []
+
+        if observation.screenshot is not None:
+            return [observation.screenshot]
+
+        if observation.screenshot_path is not None:
+            return [observation.screenshot_path]
+
+        return []
+
+    def call_vlm(
+        self,
+        *,
+        prompt: str,
+        images: Sequence[Any],
+        state: AgentState,
+        attempt: int,
+    ) -> Any:
+        """Call the best available synchronous VLM method."""
+        method = self._resolve_vlm_method()
+        kwargs = self._build_vlm_kwargs(
+            prompt=prompt,
+            images=images,
+            state=state,
+            attempt=attempt,
+        )
+
+        return method(**kwargs)
+
+    def _resolve_vlm_method(self) -> Callable[..., Any]:
+        preferred_names = []
+
+        if self.config.output_mode == PlannerOutputMode.JSON:
+            preferred_names.extend(
+                ["generate_json", "generate"]
+            )
+        else:
+            preferred_names.extend(
+                ["generate", "generate_json"]
+            )
+
+        preferred_names.append("generate_request")
+
+        for name in preferred_names:
+            method = getattr(self.vlm, name, None)
+
+            if callable(method):
+                return method
+
+        raise PlannerConfigurationError(
+            "VLM does not expose generate_json(), generate(), "
+            "or generate_request()."
+        )
+
+    def _resolve_async_vlm_method(
+        self,
+    ) -> Callable[..., "Awaitable[Any]"] | None:
+        names = (
+            "agenerate_json",
+            "agenerate",
+            "generate_json_async",
+            "generate_async",
+        )
+
+        for name in names:
+            method = getattr(self.vlm, name, None)
+
+            if callable(method):
+                return method
+
+        return None
+
+    def _build_vlm_kwargs(
+        self,
+        *,
+        prompt: str,
+        images: Sequence[Any],
+        state: AgentState,
+        attempt: int,
+    ) -> dict[str, Any]:
+        method = self._resolve_vlm_method()
+        signature = self._safe_signature(method)
+        kwargs: dict[str, Any] = dict(
+            self.config.model_kwargs
+        )
+
+        candidate_values = {
+            "prompt": prompt,
+            "messages": self._build_messages(prompt, images),
+            "images": list(images),
+            "image": images[0] if images else None,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "timeout": self.config.timeout_seconds,
+            "timeout_seconds": self.config.timeout_seconds,
+            "response_format": (
+                {"type": "json_object"}
+                if self.config.output_mode
+                == PlannerOutputMode.JSON
+                else None
+            ),
+        }
+
+        accepts_var_kwargs = (
+            signature is None
+            or any(
+                parameter.kind
+                == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        )
+
+        for key, value in candidate_values.items():
+            if value is None:
+                continue
+
+            if (
+                accepts_var_kwargs
+                or signature is None
+                or key in signature.parameters
+            ):
+                kwargs.setdefault(key, value)
+
+        kwargs.setdefault(
+            "metadata",
+            {
+                "run_id": state.run_id,
+                "task_id": state.task.task_id,
+                "step_index": state.step_index,
+                "planner_attempt": attempt,
+            },
+        )
+
+        if (
+            signature is not None
+            and "metadata" not in signature.parameters
+            and not accepts_var_kwargs
+        ):
+            kwargs.pop("metadata", None)
+
+        return kwargs
+
+    def _build_messages(
+        self,
+        prompt: str,
+        images: Sequence[Any],
+    ) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        ]
+
+        for image in images:
+            content.append(
+                {
+                    "type": "image",
+                    "image": image,
+                }
+            )
+
+        return [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ]
+
+    @staticmethod
+    def _safe_signature(
+        method: Callable[..., Any],
+    ) -> inspect.Signature | None:
+        try:
+            return inspect.signature(method)
+        except (TypeError, ValueError):
+            return None
+
+    # --------------------------------------------------------
+    # Response parsing
+    # --------------------------------------------------------
+
+    def parse_response(
+        self,
+        response: Any,
+    ) -> Mapping[str, Any]:
+        """Extract one JSON object from provider-specific response formats."""
+        if self.response_parser is not None:
+            parsed = self.response_parser(response)
+
+            if not isinstance(parsed, Mapping):
+                raise PlannerParseError(
+                    "Custom response_parser must return a mapping."
+                )
+
+            return parsed
+
+        if response is None:
+            raise PlannerResponseError(
+                "VLM returned None."
+            )
+
+        if isinstance(response, Mapping):
+            direct = self._unwrap_mapping_response(response)
+
+            if isinstance(direct, Mapping):
+                return direct
+
+        json_method = getattr(response, "json", None)
+
+        if callable(json_method):
+            try:
+                parsed_json = json_method()
+            except Exception:
+                parsed_json = None
+
+            if isinstance(parsed_json, Mapping):
+                return self._unwrap_mapping_response(
+                    parsed_json
+                )
+
+        for attribute in (
+            "parsed",
+            "json_data",
+            "data",
+            "output_json",
+        ):
+            value = getattr(response, attribute, None)
+
+            if isinstance(value, Mapping):
+                return self._unwrap_mapping_response(value)
+
+        text = self._extract_text(response)
+
+        if not text.strip():
+            raise PlannerResponseError(
+                "VLM returned an empty response."
+            )
+
+        return self._parse_json_text(text)
+
+    def _unwrap_mapping_response(
+        self,
+        data: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if self._looks_like_planner_output(data):
+            return data
+
+        for key in (
+            "parsed",
+            "json",
+            "result",
+            "output",
+            "data",
+            "content",
+        ):
+            value = data.get(key)
+
+            if isinstance(value, Mapping):
+                if self._looks_like_planner_output(value):
+                    return value
+
+            if isinstance(value, str):
+                try:
+                    parsed = self._parse_json_text(value)
+                except PlannerParseError:
+                    continue
+
+                if self._looks_like_planner_output(parsed):
+                    return parsed
+
+        choices = data.get("choices")
+
+        if isinstance(choices, Sequence) and choices:
+            first = choices[0]
+
+            if isinstance(first, Mapping):
+                message = first.get("message")
+
+                if isinstance(message, Mapping):
+                    content = message.get("content")
+
+                    if isinstance(content, str):
+                        return self._parse_json_text(content)
+
+        raise PlannerParseError(
+            "Mapping response does not contain planner output."
+        )
+
+    @staticmethod
+    def _looks_like_planner_output(
+        data: Mapping[str, Any],
+    ) -> bool:
+        keys = {str(key).lower() for key in data}
+
+        return bool(
+            keys
+            & {
+                "decision",
+                "action",
+                "action_type",
+                "type",
+                "finish",
+                "status",
+            }
+        )
+
+    def _extract_text(self, response: Any) -> str:
+        if response is None:
+            return ""
+
+        if isinstance(response, str):
+            return response
+
+        if isinstance(response, bytes):
+            return response.decode(
+                "utf-8",
+                errors="replace",
+            )
+
+        if isinstance(response, Mapping):
+            for key in (
+                "text",
+                "content",
+                "output_text",
+                "response",
+                "raw_response",
+            ):
+                value = response.get(key)
+
+                if isinstance(value, str):
+                    return value
+
+        for attribute in (
+            "text",
+            "content",
+            "output_text",
+            "response",
+            "raw_response",
+        ):
+            value = getattr(response, attribute, None)
+
+            if isinstance(value, str):
+                return value
+
+        return str(response)
+
+    def _parse_json_text(
+        self,
+        text: str,
+    ) -> Mapping[str, Any]:
+        cleaned = text.strip()
+        cleaned = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\s*```$",
+            "",
+            cleaned,
+        )
+
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            candidate = self._extract_first_json_object(cleaned)
+
+            if candidate is None:
+                raise PlannerParseError(
+                    "No JSON object found in VLM response."
+                )
+
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError as error:
+                raise PlannerParseError(
+                    f"Invalid planner JSON: {error}"
+                ) from error
+
+        if not isinstance(parsed, Mapping):
+            raise PlannerParseError(
+                "Planner response must be one JSON object."
+            )
+
+        return parsed
+
+    @staticmethod
+    def _extract_first_json_object(
+        text: str,
+    ) -> str | None:
+        start = text.find("{")
+
+        if start < 0:
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index in range(start, len(text)):
+            char = text[index]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+
+                if depth == 0:
+                    return text[start : index + 1]
+
+        return None
+
+    # --------------------------------------------------------
+    # Normalization and validation
+    # --------------------------------------------------------
+
+    def normalize_response(
+        self,
+        data: Mapping[str, Any],
+        state: AgentState,
+    ) -> ParsedPlannerOutput:
+        raw = dict(data)
+        decision = self._normalize_decision(raw)
+
+        reason = self._optional_text(
+            raw.get("reason")
+            or raw.get("rationale")
+            or raw.get("explanation")
+        )
+        thought = self._optional_text(
+            raw.get("thought")
+            or raw.get("analysis")
+        )
+        observation_summary = self._optional_text(
+            raw.get("observation_summary")
+            or raw.get("observation")
+        )
+        goal_progress = self._optional_text(
+            raw.get("goal_progress")
+            or raw.get("progress")
+        )
+        finish_message = self._optional_text(
+            raw.get("finish_message")
+            or raw.get("message")
+            or raw.get("final_answer")
+        )
+        confidence = self._normalize_confidence(
+            raw.get("confidence")
+        )
+
+        if (
+            confidence is None
+            and self.config.confidence_default is not None
+        ):
+            confidence = self.config.confidence_default
+
+        if self.config.require_reason and not reason:
+            if decision == PlannerDecision.FINISH:
+                reason = "The task appears complete."
+            elif decision == PlannerDecision.RETRY:
+                reason = "The current observation is insufficient."
+            elif decision == PlannerDecision.FAIL:
+                reason = "The task cannot continue."
+            else:
+                raise PlannerValidationError(
+                    "Planner output requires a non-empty reason."
+                )
+
+        if self.config.require_confidence and confidence is None:
+            raise PlannerValidationError(
+                "Planner output requires confidence."
+            )
+
+        action_type: str | None = None
+        parameters: dict[str, Any] = {}
+
+        if decision == PlannerDecision.ACT:
+            action_type, parameters = self._normalize_action(raw)
+            action_type = self._normalize_action_type(
+                action_type
+            )
+            parameters = self._validate_action_parameters(
+                action_type,
+                parameters,
+                state,
+            )
+
+        elif decision == PlannerDecision.FINISH:
+            if not finish_message:
+                finish_message = reason or "Task completed."
+
+        return ParsedPlannerOutput(
+            decision=decision,
+            action_type=action_type,
+            parameters=parameters,
+            reason=reason,
+            thought=(
+                thought
+                if self.config.expose_thought
+                else None
+            ),
+            observation_summary=observation_summary,
+            goal_progress=goal_progress,
+            finish_message=finish_message,
+            confidence=confidence,
+            raw_data=raw,
+        )
+
+    def _normalize_decision(
+        self,
+        data: Mapping[str, Any],
+    ) -> PlannerDecision:
+        raw_decision = (
+            data.get("decision")
+            or data.get("status")
+            or data.get("result")
+        )
+
+        finish_flag = data.get("finish")
+
+        if isinstance(finish_flag, bool) and finish_flag:
+            return PlannerDecision.FINISH
+
+        if raw_decision is not None:
+            normalized = str(raw_decision).strip().lower()
+
+            if normalized in {"act", "action", "continue"}:
+                return PlannerDecision.ACT
+
+            if normalized in FINISH_ALIASES:
+                return PlannerDecision.FINISH
+
+            if normalized in RETRY_ALIASES:
+                return PlannerDecision.RETRY
+
+            if normalized in FAIL_ALIASES:
+                return PlannerDecision.FAIL
+
+        action_data = data.get("action")
+
+        if isinstance(action_data, Mapping):
+            action_type = (
+                action_data.get("type")
+                or action_data.get("action_type")
+                or action_data.get("name")
+            )
+
+            if action_type is not None:
+                normalized = str(action_type).strip().lower()
+
+                if normalized in FINISH_ALIASES:
+                    return PlannerDecision.FINISH
+
+                if normalized in RETRY_ALIASES:
+                    return PlannerDecision.RETRY
+
+                if normalized in FAIL_ALIASES:
+                    return PlannerDecision.FAIL
+
+                return PlannerDecision.ACT
+
+        if any(
+            key in data
+            for key in (
+                "action_type",
+                "type",
+                "x",
+                "y",
+                "text",
+                "key",
+                "keys",
+            )
+        ):
+            action_type = (
+                data.get("action_type")
+                or data.get("type")
+            )
+
+            if str(action_type).strip().lower() in FINISH_ALIASES:
+                return PlannerDecision.FINISH
+
+            return PlannerDecision.ACT
+
+        raise PlannerValidationError(
+            "Unable to determine planner decision."
+        )
+
+    def _normalize_action(
+        self,
+        data: Mapping[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        action = data.get("action")
+
+        if isinstance(action, str):
+            return action, self._extract_top_level_parameters(data)
+
+        if isinstance(action, Mapping):
+            action_type = (
+                action.get("type")
+                or action.get("action_type")
+                or action.get("name")
+            )
+
+            parameters = action.get("parameters")
+
+            if isinstance(parameters, Mapping):
+                result = dict(parameters)
+            else:
+                result = {
+                    key: value
+                    for key, value in action.items()
+                    if key
+                    not in {
+                        "type",
+                        "action_type",
+                        "name",
+                        "parameters",
+                    }
+                }
+
+            if action_type is None:
+                raise PlannerValidationError(
+                    "Action object requires type."
+                )
+
+            return str(action_type), result
+
+        action_type = (
+            data.get("action_type")
+            or data.get("type")
+            or data.get("name")
+        )
+
+        if action_type is None:
+            raise PlannerValidationError(
+                "ACT decision requires an action type."
+            )
+
+        return (
+            str(action_type),
+            self._extract_top_level_parameters(data),
+        )
+
+    @staticmethod
+    def _extract_top_level_parameters(
+        data: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        ignored = {
+            "decision",
+            "status",
+            "result",
+            "action",
+            "action_type",
+            "type",
+            "name",
+            "reason",
+            "rationale",
+            "explanation",
+            "thought",
+            "analysis",
+            "observation",
+            "observation_summary",
+            "goal_progress",
+            "progress",
+            "finish",
+            "finish_message",
+            "message",
+            "final_answer",
+            "confidence",
+        }
+
+        parameters = data.get("parameters")
+
+        if isinstance(parameters, Mapping):
+            result = dict(parameters)
+        else:
+            result = {}
+
+        for key, value in data.items():
+            if key not in ignored:
+                result.setdefault(str(key), value)
+
+        return result
+
+    def _normalize_action_type(
+        self,
+        action_type: str,
+    ) -> str:
+        normalized = (
+            action_type.strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+
+        aliases = {
+            "tap": "click",
+            "left_click": "click",
+            "doubleclick": "double_click",
+            "rightclick": "right_click",
+            "middleclick": "middle_click",
+            "move": "move_to",
+            "drag": "drag_to",
+            "drag_and_drop": "drag_to",
+            "type": "type_text",
+            "input": "type_text",
+            "write": "type_text",
+            "keyboard_input": "type_text",
+            "key_press": "press",
+            "shortcut": "hotkey",
+            "vertical_scroll": "scroll",
+            "scroll_vertical": "scroll",
+            "scroll_horizontal": "horizontal_scroll",
+        }
+
+        normalized = aliases.get(normalized, normalized)
+
+        if (
+            normalized not in self.config.allowed_actions
+            and not self.config.allow_unknown_actions
+        ):
+            raise PlannerValidationError(
+                f"Unsupported action type: {normalized!r}."
+            )
+
+        return normalized
+
+    def _validate_action_parameters(
+        self,
+        action_type: str,
+        parameters: Mapping[str, Any],
+        state: AgentState,
+    ) -> dict[str, Any]:
+        params = dict(parameters)
+
+        position_actions = {
+            "move_to",
+            "click",
+            "double_click",
+            "right_click",
+            "middle_click",
+            "mouse_down",
+            "mouse_up",
+            "drag_to",
+        }
+
+        relative_actions = {
+            "move_by",
+            "drag_by",
+        }
+
+        if action_type in position_actions:
+            if action_type in {
+                "click",
+                "double_click",
+                "right_click",
+                "middle_click",
+                "mouse_down",
+                "mouse_up",
+            } and (
+                "x" not in params
+                and "y" not in params
+            ):
+                pass
+            else:
+                params["x"] = self._required_integer(
+                    params,
+                    "x",
+                )
+                params["y"] = self._required_integer(
+                    params,
+                    "y",
+                )
+                params = self._validate_absolute_coordinates(
+                    params,
+                    state,
+                )
+
+        if action_type in relative_actions:
+            params["dx"] = self._required_integer(
+                params,
+                "dx",
+            )
+            params["dy"] = self._required_integer(
+                params,
+                "dy",
+            )
+
+            if not self.config.allow_negative_relative_coordinates:
+                if params["dx"] < 0 or params["dy"] < 0:
+                    raise PlannerValidationError(
+                        "Negative relative coordinates are disabled."
+                    )
+
+        if action_type in {
+            "scroll",
+            "horizontal_scroll",
+        }:
+            amount_key = (
+                "amount"
+                if "amount" in params
+                else "clicks"
+                if "clicks" in params
+                else "delta"
+            )
+            params["amount"] = self._required_integer(
+                params,
+                amount_key,
+            )
+
+            for alias in ("clicks", "delta"):
+                if alias != "amount":
+                    params.pop(alias, None)
+
+        if action_type == "type_text":
+            text = params.get("text")
+
+            if text is None:
+                text = params.get("value")
+
+            if text is None:
+                raise PlannerValidationError(
+                    "type_text requires text."
+                )
+
+            text = str(text)
+
+            if not text and not self.config.allow_empty_text:
+                raise PlannerValidationError(
+                    "type_text text must not be empty."
+                )
+
+            if len(text) > self.config.max_text_length:
+                raise PlannerValidationError(
+                    "type_text exceeds max_text_length."
+                )
+
+            params["text"] = text
+            params.pop("value", None)
+
+        if action_type == "press":
+            key = params.get("key")
+
+            if key is None:
+                raise PlannerValidationError(
+                    "press requires key."
+                )
+
+            params["key"] = str(key).strip()
+
+            if not params["key"]:
+                raise PlannerValidationError(
+                    "press key must not be empty."
+                )
+
+        if action_type == "hotkey":
+            keys = params.get("keys")
+
+            if isinstance(keys, str):
+                keys = [
+                    item.strip()
+                    for item in re.split(r"[+,]", keys)
+                    if item.strip()
+                ]
+
+            if not isinstance(keys, Sequence) or not keys:
+                raise PlannerValidationError(
+                    "hotkey requires a non-empty keys list."
+                )
+
+            params["keys"] = [
+                str(item).strip()
+                for item in keys
+                if str(item).strip()
+            ]
+
+            if not params["keys"]:
+                raise PlannerValidationError(
+                    "hotkey keys must not be empty."
+                )
+
+        if action_type == "wait":
+            duration = (
+                params.get("duration")
+                if "duration" in params
+                else params.get("seconds", 1.0)
+            )
+
+            try:
+                duration = float(duration)
+            except (TypeError, ValueError) as error:
+                raise PlannerValidationError(
+                    "wait duration must be numeric."
+                ) from error
+
+            if not math.isfinite(duration) or duration < 0:
+                raise PlannerValidationError(
+                    "wait duration must be finite and non-negative."
+                )
+
+            params["duration"] = duration
+            params.pop("seconds", None)
+
+        if "duration" in params and action_type != "wait":
+            try:
+                duration = float(params["duration"])
+            except (TypeError, ValueError) as error:
+                raise PlannerValidationError(
+                    "duration must be numeric."
+                ) from error
+
+            if not math.isfinite(duration) or duration < 0:
+                raise PlannerValidationError(
+                    "duration must be finite and non-negative."
+                )
+
+            params["duration"] = duration
+
+        if "clicks" in params:
+            clicks = self._coerce_integer(
+                params["clicks"],
+                "clicks",
+            )
+
+            if clicks <= 0:
+                raise PlannerValidationError(
+                    "clicks must be positive."
+                )
+
+            params["clicks"] = clicks
+
+        return params
+
+    def _validate_absolute_coordinates(
+        self,
+        params: dict[str, Any],
+        state: AgentState,
+    ) -> dict[str, Any]:
+        if not self.config.validate_coordinates:
+            return params
+
+        observation = state.observation
+
+        if observation is None:
+            return params
+
+        width = observation.screen_width
+        height = observation.screen_height
+
+        if width is None or height is None:
+            return params
+
+        x = params["x"]
+        y = params["y"]
+
+        if self.config.clamp_coordinates:
+            params["x"] = min(max(0, x), width - 1)
+            params["y"] = min(max(0, y), height - 1)
+            return params
+
+        if not 0 <= x < width:
+            raise PlannerValidationError(
+                f"x={x} is outside screen width {width}."
+            )
+
+        if not 0 <= y < height:
+            raise PlannerValidationError(
+                f"y={y} is outside screen height {height}."
+            )
+
+        return params
+
+    @staticmethod
+    def _required_integer(
+        data: Mapping[str, Any],
+        key: str,
+    ) -> int:
+        if key not in data:
+            raise PlannerValidationError(
+                f"Action requires {key}."
+            )
+
+        return Planner._coerce_integer(
+            data[key],
+            key,
+        )
+
+    @staticmethod
+    def _coerce_integer(
+        value: Any,
+        name: str,
+    ) -> int:
+        if isinstance(value, bool):
+            raise PlannerValidationError(
+                f"{name} must be an integer."
+            )
+
+        if isinstance(value, int):
+            return value
+
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+
+            raise PlannerValidationError(
+                f"{name} must be an integer."
+            )
+
+        if isinstance(value, str):
+            stripped = value.strip()
+
+            if re.fullmatch(r"-?\d+", stripped):
+                return int(stripped)
+
+        raise PlannerValidationError(
+            f"{name} must be an integer."
+        )
+
+    @staticmethod
+    def _normalize_confidence(
+        value: Any,
+    ) -> float | None:
+        if value is None or value == "":
+            return None
+
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError) as error:
+            raise PlannerValidationError(
+                "confidence must be numeric."
+            ) from error
+
+        if not math.isfinite(confidence):
+            raise PlannerValidationError(
+                "confidence must be finite."
+            )
+
+        if confidence > 1.0 and confidence <= 100.0:
+            confidence = confidence / 100.0
+
+        if not 0.0 <= confidence <= 1.0:
+            raise PlannerValidationError(
+                "confidence must be between 0 and 1."
+            )
+
+        return confidence
+
+    @staticmethod
+    def _optional_text(value: Any) -> str | None:
+        if value is None:
+            return None
+
+        text = str(value).strip()
+        return text or None
+
+    # --------------------------------------------------------
+    # Action creation and result construction
+    # --------------------------------------------------------
+
+    def create_action(
+        self,
+        action_type: str,
+        parameters: Mapping[str, Any],
+    ) -> Any:
+        try:
+            action = self.action_factory(
+                action_type,
+                parameters,
+            )
+        except Exception as error:
+            raise PlannerActionError(
+                f"Action factory failed for {action_type}: {error}"
+            ) from error
+
+        if action is None:
+            raise PlannerActionError(
+                "Action factory returned None."
+            )
+
+        validate_method = getattr(action, "validate", None)
+
+        if callable(validate_method):
+            try:
+                validate_method()
+            except Exception as error:
+                raise PlannerActionError(
+                    f"Concrete action validation failed: {error}"
+                ) from error
+
+        return action
+
+    def _build_result(
+        self,
+        *,
+        parsed: ParsedPlannerOutput,
+        raw_response: Any,
+        timing: TimingInfo,
+        prompt: str,
+        attempt: int,
+    ) -> PlannerResult:
+        usage = self._extract_usage(raw_response)
+        raw_text = self._extract_text(raw_response)
+        metadata = {
+            "attempt": attempt,
+            "max_attempts": self.config.max_attempts,
+            "planner_config": self._config_metadata(),
+        }
+
+        if self.config.include_prompt_in_metadata:
+            metadata["prompt"] = prompt
+
+        metadata.update(self.config.metadata)
+
+        common = {
+            "reason": parsed.reason,
+            "thought": parsed.thought,
+            "observation_summary": parsed.observation_summary,
+            "goal_progress": parsed.goal_progress,
+            "confidence": parsed.confidence,
+            "raw_output": (
+                raw_text
+                if self.config.include_raw_response
+                else None
+            ),
+            "parsed_output": parsed.to_dict(),
+            "usage": usage,
+            "timing": timing,
+            "metadata": metadata,
+        }
+
+        if parsed.decision == PlannerDecision.ACT:
+            if parsed.action_type is None:
+                raise PlannerActionError(
+                    "ACT decision has no action type."
+                )
+
+            action = self.create_action(
+                parsed.action_type,
+                parsed.parameters,
+            )
+
+            return PlannerResult.act(
+                action=action,
+                **common,
+            )
+
+        if parsed.decision == PlannerDecision.FINISH:
+            return PlannerResult.finish(
+                message=(
+                    parsed.finish_message
+                    or "Task completed."
+                ),
+                **common,
+            )
+
+        if parsed.decision == PlannerDecision.RETRY:
+            return PlannerResult.retry(
+                reason=(
+                    parsed.reason
+                    or "Planner requested another observation."
+                ),
+                **{
+                    key: value
+                    for key, value in common.items()
+                    if key != "reason"
+                },
+            )
+
+        error = ErrorInfo(
+            error_type="PlannerDeclaredFailure",
+            message=(
+                parsed.reason
+                or "Planner declared that the task cannot continue."
+            ),
+            retryable=False,
+            details=parsed.to_dict(),
+        )
+
+        return PlannerResult.failed(
+            error=error,
+            reason=parsed.reason,
+            **{
+                key: value
+                for key, value in common.items()
+                if key != "reason"
+            },
+        )
+
+    def _failure_result(
+        self,
+        *,
+        error: ErrorInfo,
+        timing: TimingInfo,
+        raw_response: Any,
+        prompt: str | None,
+    ) -> PlannerResult:
+        metadata = {
+            "attempts": self.config.max_attempts,
+            "planner_config": self._config_metadata(),
+        }
+
+        if self.config.include_prompt_in_metadata:
+            metadata["prompt"] = prompt
+
+        raw_text = self._extract_text(raw_response)
+
+        if (
+            self.config.invalid_response_policy
+            == InvalidResponsePolicy.RETRY
+        ):
+            return PlannerResult.retry(
+                reason=(
+                    "Planner could not produce a valid action. "
+                    "A new observation or another planning attempt is needed."
+                ),
+                error=error,
+                raw_output=(
+                    raw_text
+                    if self.config.include_raw_response
+                    else None
+                ),
+                timing=timing,
+                metadata=metadata,
+            )
+
+        return PlannerResult.failed(
+            error=error,
+            reason="Planner failed to produce a valid result.",
+            raw_output=(
+                raw_text
+                if self.config.include_raw_response
+                else None
+            ),
+            timing=timing,
+            metadata=metadata,
+        )
+
+    # --------------------------------------------------------
+    # Usage extraction
+    # --------------------------------------------------------
+
+    def _extract_usage(
+        self,
+        response: Any,
+    ) -> UsageInfo:
+        usage = None
+        model = None
+        provider = None
+        request_id = None
+
+        if isinstance(response, Mapping):
+            usage = response.get("usage")
+            model = response.get("model")
+            provider = response.get("provider")
+            request_id = (
+                response.get("request_id")
+                or response.get("id")
+            )
+        elif response is not None:
+            usage = getattr(response, "usage", None)
+            model = getattr(response, "model", None)
+            provider = getattr(response, "provider", None)
+            request_id = (
+                getattr(response, "request_id", None)
+                or getattr(response, "id", None)
+            )
+
+        return UsageInfo.from_vlm_usage(
+            usage,
+            model=model,
+            provider=provider,
+            request_id=request_id,
+        )
+
+    # --------------------------------------------------------
+    # Retry policy
+    # --------------------------------------------------------
+
+    def _is_retryable_local_error(
+        self,
+        error: Exception,
+    ) -> bool:
+        if isinstance(error, PlannerResponseError):
+            if isinstance(error, PlannerParseError):
+                return self.config.retry_on_parse_error
+
+            if isinstance(error, PlannerValidationError):
+                return self.config.retry_on_validation_error
+
+            if isinstance(error, PlannerActionError):
+                return self.config.retry_on_action_error
+
+            return self.config.retry_on_empty_response
+
+        retryable_attr = getattr(error, "retryable", None)
+
+        if isinstance(retryable_attr, bool):
+            return retryable_attr
+
+        status_code = (
+            getattr(error, "status_code", None)
+            or getattr(error, "code", None)
+        )
+
+        if status_code in {
+            408,
+            409,
+            425,
+            429,
+            500,
+            502,
+            503,
+            504,
+        }:
+            return True
+
+        return False
+
+    # --------------------------------------------------------
+    # Metadata and representation
+    # --------------------------------------------------------
+
+    def _config_metadata(self) -> dict[str, Any]:
+        return {
+            "output_mode": self.config.output_mode.value,
+            "invalid_response_policy": (
+                self.config.invalid_response_policy.value
+            ),
+            "max_attempts": self.config.max_attempts,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+            "include_screenshot": self.config.include_screenshot,
+            "history_limit": self.config.history_limit,
+            "allowed_actions": list(
+                self.config.allowed_actions
+            ),
+            "validate_coordinates": (
+                self.config.validate_coordinates
+            ),
+            "clamp_coordinates": (
+                self.config.clamp_coordinates
+            ),
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"vlm={self.vlm.__class__.__name__}, "
+            f"output_mode={self.config.output_mode.value!r}, "
+            f"max_attempts={self.config.max_attempts}"
+            f")"
+        )
+
+
+# ============================================================
+# Optional concrete Action adapter
+# ============================================================
+
+
+def build_executor_action_factory(
+    action_class: type[Any],
+    *,
+    action_type_enum: type[Enum] | None = None,
+    action_type_field: str = "action_type",
+) -> ActionFactoryProtocol:
+    """
+    Build an action factory for the project's concrete executor Action class.
+
+    Examples
+    --------
+    factory = build_executor_action_factory(
+        Action,
+        action_type_enum=ActionType,
+    )
+
+    planner = Planner(
+        vlm=qwen,
+        action_factory=factory,
+    )
+
+    The helper supports either:
+    - Action(action_type=ActionType.CLICK, x=..., y=...)
+    - Action(type=..., ...)
+    - a dataclass-like constructor accepting normalized parameters.
+    """
+
+    def factory(
+        action_type: str,
+        parameters: Mapping[str, Any],
+    ) -> Any:
+        resolved_type: Any = action_type
+
+        if action_type_enum is not None:
+            try:
+                resolved_type = action_type_enum(action_type)
+            except ValueError:
+                try:
+                    resolved_type = action_type_enum[
+                        action_type.upper()
+                    ]
+                except (KeyError, TypeError) as error:
+                    raise PlannerActionError(
+                        "Unable to map action type "
+                        f"{action_type!r} to {action_type_enum.__name__}."
+                    ) from error
+
+        kwargs = dict(parameters)
+        kwargs[action_type_field] = resolved_type
+
+        try:
+            return action_class(**kwargs)
+        except TypeError as first_error:
+            alternate_field = (
+                "type"
+                if action_type_field != "type"
+                else "action_type"
+            )
+            alternate_kwargs = dict(parameters)
+            alternate_kwargs[alternate_field] = resolved_type
+
+            try:
+                return action_class(**alternate_kwargs)
+            except TypeError:
+                raise PlannerActionError(
+                    "Unable to construct concrete Action. "
+                    f"Primary error: {first_error}"
+                ) from first_error
+
+    return factory
+
+
+__all__ = [
+    "PlannerError",
+    "PlannerConfigurationError",
+    "PlannerStateError",
+    "PlannerResponseError",
+    "PlannerParseError",
+    "PlannerValidationError",
+    "PlannerActionError",
+    "VLMProtocol",
+    "ActionFactoryProtocol",
+    "PlannerOutputMode",
+    "InvalidResponsePolicy",
+    "ActionName",
+    "PlannerConfig",
+    "ParsedPlannerOutput",
+    "dictionary_action_factory",
+    "build_executor_action_factory",
+    "Planner",
+]
