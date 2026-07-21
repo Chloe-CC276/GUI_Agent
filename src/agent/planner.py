@@ -895,7 +895,7 @@ class Planner:
             "timeout": self.config.timeout_seconds,
             "timeout_seconds": self.config.timeout_seconds,
             "response_format": (
-                {"type": "json_object"}
+                "json_object"
                 if self.config.output_mode
                 == PlannerOutputMode.JSON
                 else None
