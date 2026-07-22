@@ -76,6 +76,18 @@ from .memory import(
     summarize_with_vlm,
     )
 
+from .agent_chain import(
+    AgentChain,
+    AgentChainConfig,
+    AgentChainDependencyError,
+    AgentChainError,
+    ChainStage,
+    ChainState,ModelResponseError,
+    PlannerProtocol,
+    VLMProtocol,
+    create_agent_chain,
+    )
+
 from .agent_graph import(
     AgentGraph,
     AgentGraphConfig,
@@ -114,8 +126,11 @@ __all__ = [
     "MemoryImportance", "MemoryItem", "MemoryKind", "MemorySerializationError",
     "MemorySummarizationError", "MemorySummary", "MemoryValidationError",
     "SummarizerProtocol", "make_vlm_summarizer", "summarize_with_vlm",
+    # Langchain
+    "AgentChain", "AgentChainConfig", "AgentChainDependencyError",
+    "AgentChainError", "ChainStage", "ChainState", "ModelResponseError",
+    "PlannerProtocol", "VLMProtocol", "create_agent_chain",
     # Langgraph
     "AgentGraph", "AgentGraphConfig", "AgentGraphDependencyError", "AgentGraphError",
-    "GraphRoute", "GraphState", "ModelResponseError",
-    "PlannerProtocol", "VLMProtocol", "create_agent_graph",
+    "GraphRoute", "GraphState",
     ]
