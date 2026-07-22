@@ -1,8 +1,6 @@
-"""Build bounded, JSON-safe prompt context from GUI Agent runtime state.
-
-The module uses duck typing deliberately: mappings, project dataclasses and
-objects exposing equivalent attributes are all accepted.  This keeps the
-prompt package independent from ``agent.state`` and prevents circular imports.
+"""
+prompts/context_builder
+Build bounded, JSON-safe prompt context from GUI Agent runtime state.
 """
 
 from __future__ import annotations
