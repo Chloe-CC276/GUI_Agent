@@ -302,8 +302,34 @@ def format_history(
         raise ValueError("limit must be non-negative")
     if history is None or limit == 0:
         return empty_text
+
     items = list(history)[-limit:]
-    lines = [f"{index}. {format_history_item(item, max_chars=max_item_chars)}" for index, item in enumerate(items, 1)]
+    lines: list[str] = []
+
+    for index, item in enumerate(items, 1):
+        if isinstance(item, dict) and item.get("type") == "reflection":
+            content = item.get("content", {})
+            if isinstance(content, dict):
+                rendered = (
+                    "reflection feedback: "
+                    f"failure_type={content.get('failure_type', '')}; "
+                    f"summary={content.get('summary', '')}; "
+                    f"likely_cause={content.get('likely_cause', '')}; "
+                    f"avoid={content.get('avoid', [])}; "
+                    f"strategy={content.get('strategy', [])}; "
+                    f"should_replan={content.get('should_replan', '')}; "
+                    f"confidence={content.get('confidence', '')}"
+                )
+            else:
+                rendered = f"reflection feedback: {content}"
+        else:
+            rendered = format_history_item(item, max_chars=max_item_chars)
+
+        if len(rendered) > max_item_chars:
+            rendered = rendered[: max_item_chars - 3] + "..."
+
+        lines.append(f"{index}. {rendered}")
+
     return "\n".join(lines) if lines else empty_text
 
 
