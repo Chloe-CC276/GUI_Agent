@@ -30,6 +30,7 @@ screenagent_loader
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import random
@@ -1372,20 +1373,55 @@ class ScreenAgentLoader:
 
         return results
 
-    def export_jsonl(
+    def export_csv(
         self,
         output_path: str | Path,
         samples: Sequence[GUITaskSample] | None = None,
-        ensure_ascii: bool = False,
+        *,
+        encoding: str = "utf-8-sig",
+        include_action_json: bool = True,
+        include_metadata_json: bool = True,
     ) -> Path:
         """
-        导出统一格式 JSONL。
+        将 ScreenAgent 数据导出为 CSV。
 
-        每行对应一个 GUITaskSample。
+        导出粒度
+        --------
+        每个 ``GUITaskStep`` 对应 CSV 中的一行，因此一个 Session 中的
+        多个动作会被展开成多行。任务级字段（task_id、task_instruction
+        等）会在每个 Step 行中重复，便于直接使用 pandas 读取、筛选和
+        训练。
+
+        复杂字段处理
+        ------------
+        - ``action`` 的常用字段会被展开为独立列；
+        - 完整 action 可选保存到 ``action_json``；
+        - task/step metadata 可选保存为 JSON 字符串；
+        - 截图仅保存文件路径，不把图片二进制写入 CSV。
+
+        Parameters
+        ----------
+        output_path:
+            CSV 输出路径。
+
+        samples:
+            指定导出的样本；None 时导出全部 Session。
+
+        encoding:
+            默认 ``utf-8-sig``，便于 Windows Excel 正确显示中文。
+
+        include_action_json:
+            是否保留完整 Action JSON 字符串。
+
+        include_metadata_json:
+            是否保留 task_metadata 和 step_metadata JSON 字符串。
         """
         destination = Path(
             output_path
         ).expanduser().resolve()
+
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
 
         destination.parent.mkdir(
             parents=True,
@@ -1398,20 +1434,408 @@ class ScreenAgentLoader:
             else self.load_all()
         )
 
-        with destination.open(
-            "w",
-            encoding="utf-8",
-        ) as file:
-            for sample in records:
-                file.write(
-                    json.dumps(
-                        sample.to_dict(),
-                        ensure_ascii=ensure_ascii,
+        rows: list[dict[str, Any]] = []
+
+        for sample in records:
+            for step in sample.steps:
+                rows.append(
+                    self._step_to_csv_row(
+                        sample=sample,
+                        step=step,
+                        include_action_json=include_action_json,
+                        include_metadata_json=include_metadata_json,
                     )
                 )
-                file.write("\n")
+
+        fieldnames = self._csv_fieldnames(rows)
+
+        with destination.open(
+            "w",
+            encoding=encoding,
+            newline="",
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+
+            for row in rows:
+                writer.writerow(
+                    {
+                        field_name: row.get(field_name, "")
+                        for field_name in fieldnames
+                    }
+                )
+
+        LOGGER.info(
+            "Exported ScreenAgent CSV: path=%s, tasks=%d, rows=%d",
+            destination,
+            len(records),
+            len(rows),
+        )
 
         return destination
+
+    def export_split_csv(
+        self,
+        output_dir: str | Path,
+        *,
+        train_ratio: float = 0.8,
+        validation_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        seed: int = 42,
+        shuffle: bool = True,
+        file_prefix: str = "screenagent",
+        encoding: str = "utf-8-sig",
+    ) -> dict[str, Path]:
+        """
+        按 Session 划分数据并分别导出 train/validation/test CSV。
+
+        同一 Session 的所有 Step 始终位于同一数据集，避免轨迹泄漏。
+        """
+        destination = Path(
+            output_dir
+        ).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+
+        dataset_split = self.split(
+            train_ratio=train_ratio,
+            validation_ratio=validation_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+            shuffle=shuffle,
+        )
+
+        paths = {
+            "train": self.export_csv(
+                destination / f"{file_prefix}_train.csv",
+                samples=dataset_split.train,
+                encoding=encoding,
+            ),
+            "validation": self.export_csv(
+                destination / f"{file_prefix}_validation.csv",
+                samples=dataset_split.validation,
+                encoding=encoding,
+            ),
+            "test": self.export_csv(
+                destination / f"{file_prefix}_test.csv",
+                samples=dataset_split.test,
+                encoding=encoding,
+            ),
+        }
+
+        return paths
+
+    def export_statistics_csv(
+        self,
+        output_path: str | Path,
+        *,
+        limit: int | None = None,
+        encoding: str = "utf-8-sig",
+    ) -> Path:
+        """将数据集总体统计和动作/语言分布导出为 CSV。"""
+        destination = Path(
+            output_path
+        ).expanduser().resolve()
+
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        stats = self.statistics(limit=limit)
+
+        rows: list[dict[str, Any]] = [
+            {
+                "category": "summary",
+                "name": "num_tasks",
+                "value": stats.num_tasks,
+            },
+            {
+                "category": "summary",
+                "name": "num_steps",
+                "value": stats.num_steps,
+            },
+            {
+                "category": "summary",
+                "name": "avg_steps_per_task",
+                "value": stats.avg_steps_per_task,
+            },
+        ]
+
+        rows.extend(
+            {
+                "category": "action_distribution",
+                "name": action_name,
+                "value": count,
+            }
+            for action_name, count in sorted(
+                stats.action_distribution.items()
+            )
+        )
+
+        rows.extend(
+            {
+                "category": "language_distribution",
+                "name": language_name,
+                "value": count,
+            }
+            for language_name, count in sorted(
+                stats.language_distribution.items()
+            )
+        )
+
+        with destination.open(
+            "w",
+            encoding=encoding,
+            newline="",
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=["category", "name", "value"],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        return destination
+
+    @classmethod
+    def _step_to_csv_row(
+        cls,
+        *,
+        sample: GUITaskSample,
+        step: GUITaskStep,
+        include_action_json: bool,
+        include_metadata_json: bool,
+    ) -> dict[str, Any]:
+        """将一个 GUITaskStep 展平为单行 CSV 记录。"""
+        action_dict = cls._action_to_dict(step.action)
+
+        action_type = action_dict.get("type")
+
+        if isinstance(action_type, ActionType):
+            action_type = action_type.value
+
+        row: dict[str, Any] = {
+            # Task-level fields
+            "task_id": sample.task_id,
+            "source": sample.source,
+            "task_instruction": sample.instruction,
+            "task_language": sample.language,
+            "task_num_steps": sample.num_steps,
+
+            # Step-level fields
+            "step_id": step.step_id,
+            "step_instruction": step.instruction,
+            "screenshot_path": (
+                str(step.screenshot_path)
+                if step.screenshot_path is not None
+                else ""
+            ),
+            "screenshot_exists": step.screenshot_exists,
+            "step_language": step.language,
+            "llm_response": step.llm_response or "",
+            "corrected_response": step.corrected_response or "",
+
+            # Common action fields
+            "action_type": action_type or "",
+            "action_status": cls._enum_value(
+                action_dict.get("status")
+            ),
+            "action_description": action_dict.get(
+                "description",
+                "",
+            ),
+            "x": action_dict.get("x", ""),
+            "y": action_dict.get("y", ""),
+            "offset_x": action_dict.get("offset_x", ""),
+            "offset_y": action_dict.get("offset_y", ""),
+            "button": cls._enum_value(
+                action_dict.get("button")
+            ),
+            "clicks": action_dict.get("clicks", ""),
+            "interval": action_dict.get("interval", ""),
+            "duration": action_dict.get("duration", ""),
+            "amount": action_dict.get("amount", ""),
+            "key": action_dict.get("key", ""),
+            "keys": cls._json_cell(
+                action_dict.get("keys")
+            ),
+            "text": action_dict.get("text", ""),
+            "seconds": action_dict.get("seconds", ""),
+        }
+
+        # Preserve additional Action fields without losing information.
+        common_action_fields = {
+            "type",
+            "status",
+            "description",
+            "x",
+            "y",
+            "offset_x",
+            "offset_y",
+            "button",
+            "clicks",
+            "interval",
+            "duration",
+            "amount",
+            "key",
+            "keys",
+            "text",
+            "seconds",
+            "metadata",
+        }
+
+        for key, value in action_dict.items():
+            if key in common_action_fields:
+                continue
+
+            column_name = f"action_{key}"
+            row[column_name] = cls._csv_scalar(value)
+
+        if include_action_json:
+            row["action_json"] = cls._json_cell(
+                action_dict
+            )
+
+        if include_metadata_json:
+            row["task_metadata_json"] = cls._json_cell(
+                sample.metadata
+            )
+            row["step_metadata_json"] = cls._json_cell(
+                step.metadata
+            )
+            row["action_metadata_json"] = cls._json_cell(
+                action_dict.get("metadata", {})
+            )
+
+        return row
+
+    @staticmethod
+    def _action_to_dict(action: Any) -> dict[str, Any]:
+        if isinstance(action, dict):
+            return dict(action)
+
+        to_dict = getattr(action, "to_dict", None)
+
+        if callable(to_dict):
+            converted = to_dict()
+
+            if not isinstance(converted, dict):
+                raise ScreenAgentDataError(
+                    "Action.to_dict() must return a dictionary."
+                )
+
+            return converted
+
+        raise ScreenAgentDataError(
+            "CSV export requires Action or dictionary action data."
+        )
+
+    @staticmethod
+    def _enum_value(value: Any) -> Any:
+        enum_value = getattr(value, "value", None)
+        return enum_value if enum_value is not None else value
+
+    @classmethod
+    def _csv_scalar(cls, value: Any) -> Any:
+        if value is None:
+            return ""
+
+        value = cls._enum_value(value)
+
+        if isinstance(value, (str, int, float, bool)):
+            return value
+
+        return cls._json_cell(value)
+
+    @classmethod
+    def _json_cell(cls, value: Any) -> str:
+        if value is None:
+            return ""
+
+        def default(item: Any) -> Any:
+            enum_value = getattr(item, "value", None)
+
+            if enum_value is not None:
+                return enum_value
+
+            to_dict = getattr(item, "to_dict", None)
+
+            if callable(to_dict):
+                return to_dict()
+
+            if isinstance(item, Path):
+                return str(item)
+
+            return str(item)
+
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=default,
+        )
+
+    @staticmethod
+    def _csv_fieldnames(
+        rows: Sequence[dict[str, Any]],
+    ) -> list[str]:
+        """生成稳定列顺序，同时保留动态 Action 字段。"""
+        preferred = [
+            "task_id",
+            "source",
+            "task_instruction",
+            "task_language",
+            "task_num_steps",
+            "step_id",
+            "step_instruction",
+            "screenshot_path",
+            "screenshot_exists",
+            "step_language",
+            "llm_response",
+            "corrected_response",
+            "action_type",
+            "action_status",
+            "action_description",
+            "x",
+            "y",
+            "offset_x",
+            "offset_y",
+            "button",
+            "clicks",
+            "interval",
+            "duration",
+            "amount",
+            "key",
+            "keys",
+            "text",
+            "seconds",
+            "action_json",
+            "task_metadata_json",
+            "step_metadata_json",
+            "action_metadata_json",
+        ]
+
+        discovered = {
+            key
+            for row in rows
+            for key in row
+        }
+
+        ordered = [
+            field_name
+            for field_name in preferred
+            if field_name in discovered
+        ]
+
+        ordered.extend(
+            sorted(discovered.difference(ordered))
+        )
+
+        # Empty datasets still need a valid, predictable CSV header.
+        return ordered or preferred
 
     def split(
         self,
