@@ -7,6 +7,7 @@ GUITaskSample objects.
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import random
@@ -611,6 +612,146 @@ class ProcessedDatasetLoader:
                 file.write(json.dumps(sample.to_dict(), ensure_ascii=ensure_ascii))
                 file.write("\n")
         return destination
+
+    def export_csv(
+        self,
+        output_path: str | Path,
+        samples: Sequence[GUITaskSample] | None = None,
+        *,
+        encoding: str = "utf-8-sig",
+        include_action_json: bool = True,
+        include_metadata_json: bool = True,
+        preserve_empty_tasks: bool = True,
+    ) -> Path:
+        """Export unified processed samples to CSV, normally one step per row."""
+        destination = Path(output_path).expanduser().resolve()
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        output_samples = list(samples) if samples is not None else self.load_all()
+        rows: list[dict[str, Any]] = []
+
+        for sample in output_samples:
+            if not sample.steps and preserve_empty_tasks:
+                row = self._base_csv_row(sample)
+                row.update({"step_id": "", "step_instruction": "", "action_kind": "none", "action_type": ""})
+                if include_metadata_json:
+                    row["task_metadata_json"] = self._csv_json(sample.metadata)
+                rows.append(row)
+                continue
+
+            for step in sample.steps:
+                row = self._base_csv_row(sample)
+                action = step.action
+                action_dict = action.to_dict()
+                is_executable = isinstance(action, Action)
+                action_type = action_dict.get("type") if is_executable else action_dict.get("action_type")
+                if hasattr(action_type, "value"):
+                    action_type = action_type.value
+                row.update({
+                    "step_id": step.step_id,
+                    "step_instruction": step.instruction,
+                    "step_language": step.language,
+                    "screenshot_path": str(step.screenshot_path) if step.screenshot_path else "",
+                    "screenshot_exists": step.screenshot_exists,
+                    "llm_response": step.llm_response or "",
+                    "corrected_response": step.corrected_response or "",
+                    "action_kind": "executable" if is_executable else "semantic",
+                    "action_type": action_type or "",
+                    "x": action_dict.get("x", ""),
+                    "y": action_dict.get("y", ""),
+                    "offset_x": action_dict.get("offset_x", ""),
+                    "offset_y": action_dict.get("offset_y", ""),
+                    "button": self._enum_value(action_dict.get("button")),
+                    "clicks": action_dict.get("clicks", ""),
+                    "duration": action_dict.get("duration", ""),
+                    "amount": action_dict.get("amount", ""),
+                    "key": action_dict.get("key", ""),
+                    "keys_json": self._csv_json(action_dict.get("keys", [])),
+                    "text": action_dict.get("text", ""),
+                    "seconds": action_dict.get("seconds", ""),
+                    "action_value": action_dict.get("value", ""),
+                    "target_tag": action_dict.get("target_tag", ""),
+                    "backend_node_id": action_dict.get("backend_node_id", ""),
+                    "action_repr": action_dict.get("action_repr", ""),
+                    "target_attributes_json": self._csv_json(action_dict.get("target_attributes", {})),
+                })
+                if include_action_json:
+                    row["action_json"] = self._csv_json(action_dict)
+                if include_metadata_json:
+                    row["task_metadata_json"] = self._csv_json(sample.metadata)
+                    row["step_metadata_json"] = self._csv_json(step.metadata)
+                    row["action_metadata_json"] = self._csv_json(action_dict.get("metadata", {}))
+                rows.append(row)
+
+        self._write_csv(destination, rows, encoding=encoding)
+        LOGGER.info("Exported processed CSV: path=%s, tasks=%d, rows=%d", destination, len(output_samples), len(rows))
+        return destination
+
+    def export_split_csv(
+        self,
+        output_dir: str | Path,
+        *,
+        train_ratio: float = 0.8,
+        validation_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        seed: int = 42,
+        shuffle: bool = True,
+        source: str | None = None,
+        prefix: str = "processed",
+        encoding: str = "utf-8-sig",
+    ) -> dict[str, Path]:
+        split = self.split_dataset(train_ratio, validation_ratio, test_ratio, seed, shuffle, source)
+        destination = Path(output_dir).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        return {
+            "train": self.export_csv(destination / f"{prefix}_train.csv", split.train, encoding=encoding),
+            "validation": self.export_csv(destination / f"{prefix}_validation.csv", split.validation, encoding=encoding),
+            "test": self.export_csv(destination / f"{prefix}_test.csv", split.test, encoding=encoding),
+        }
+
+    def export_statistics_csv(self, output_path: str | Path, *, limit: int | None = None, source: str | None = None, encoding: str = "utf-8-sig") -> Path:
+        statistics = self.statistics(limit=limit, source=source).to_dict()
+        row = {key: self._csv_json(value) if isinstance(value, (dict, list, tuple)) else value for key, value in statistics.items()}
+        destination = Path(output_path).expanduser().resolve()
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+        self._write_csv(destination, [row], encoding=encoding)
+        return destination
+
+    @staticmethod
+    def _base_csv_row(sample: GUITaskSample) -> dict[str, Any]:
+        return {
+            "task_id": sample.task_id,
+            "source": sample.source,
+            "task_instruction": sample.instruction,
+            "task_language": sample.language,
+            "task_num_steps": sample.num_steps,
+            "has_demonstration": sample.has_demonstration,
+        }
+
+    @staticmethod
+    def _enum_value(value: Any) -> Any:
+        return getattr(value, "value", value)
+
+    @staticmethod
+    def _csv_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+    @staticmethod
+    def _write_csv(destination: Path, rows: Sequence[dict[str, Any]], *, encoding: str) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        if not fieldnames:
+            fieldnames = ["task_id"]
+        with destination.open("w", encoding=encoding, newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
 
     def source_counts(self) -> dict[str, int]:
         counter: Counter[str] = Counter()

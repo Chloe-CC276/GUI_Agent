@@ -1064,7 +1064,7 @@ class WebArenaLoader:
 
         return destination
 
-     def export_csv(
+    def export_csv(
         self,
         output_path: str | Path,
         samples: Sequence[GUITaskSample] | None = None,
