@@ -17,6 +17,7 @@ Therefore, each task becomes a GUITaskSample with steps=[].
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -1063,41 +1064,144 @@ class WebArenaLoader:
 
         return destination
 
-    def export_configs_jsonl(
+     def export_csv(
         self,
         output_path: str | Path,
-        ensure_ascii: bool = False,
+        samples: Sequence[GUITaskSample] | None = None,
+        *,
+        encoding: str = "utf-8-sig",
+        include_metadata_json: bool = True,
     ) -> Path:
-        """
-        Export structured WebArenaTaskConfig records.
-        """
-        destination = Path(
-            output_path
-        ).expanduser().resolve()
+        """Export WebArena tasks to CSV, one task configuration per row."""
+        destination = Path(output_path).expanduser().resolve()
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+        destination.parent.mkdir(parents=True, exist_ok=True)
 
-        destination.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        output_samples = list(samples) if samples is not None else self.load_all()
+        rows: list[dict[str, Any]] = []
+        for sample in output_samples:
+            metadata = sample.metadata
+            evaluation = metadata.get("evaluation", {}) or {}
+            row: dict[str, Any] = {
+                "task_id": sample.task_id,
+                "source": sample.source,
+                "instruction": sample.instruction,
+                "language": sample.language,
+                "sites": self._csv_json(metadata.get("sites", [])),
+                "require_login": metadata.get("require_login", False),
+                "storage_state": metadata.get("storage_state", ""),
+                "start_url": metadata.get("start_url", ""),
+                "start_url_domain": metadata.get("start_url_domain", ""),
+                "geolocation_json": self._csv_json(metadata.get("geolocation")),
+                "intent_template": metadata.get("intent_template", ""),
+                "intent_template_id": metadata.get("intent_template_id", ""),
+                "instantiation_dict_json": self._csv_json(metadata.get("instantiation_dict", {})),
+                "require_reset": metadata.get("require_reset", False),
+                "eval_types": self._csv_json(evaluation.get("eval_types", [])),
+                "reference_answers_json": self._csv_json(evaluation.get("reference_answers", {})),
+                "reference_url": evaluation.get("reference_url", ""),
+                "program_html_json": self._csv_json(evaluation.get("program_html", [])),
+                "string_note": evaluation.get("string_note", ""),
+                "has_demonstration": sample.has_demonstration,
+                "num_steps": sample.num_steps,
+            }
+            if include_metadata_json:
+                row["metadata_json"] = self._csv_json(metadata)
+            rows.append(row)
 
-        with destination.open(
-            "w",
-            encoding="utf-8",
-        ) as file:
-            for config in self._task_configs:
-                file.write(
-                    json.dumps(
-                        config.to_dict(),
-                        ensure_ascii=ensure_ascii,
-                    )
-                )
-                file.write("\n")
-
+        self._write_csv(destination, rows, encoding=encoding)
+        LOGGER.info("Exported WebArena CSV: path=%s, tasks=%d", destination, len(rows))
         return destination
 
-    # ============================================================
-    # Local split
-    # ============================================================
+    def export_configs_csv(
+        self,
+        output_path: str | Path,
+        *,
+        encoding: str = "utf-8-sig",
+        include_metadata_json: bool = True,
+    ) -> Path:
+        """Export internal WebArenaTaskConfig objects to CSV."""
+        destination = Path(output_path).expanduser().resolve()
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+        rows: list[dict[str, Any]] = []
+        for config in self._task_configs:
+            data = config.to_dict()
+            evaluation = data.get("eval", {}) or {}
+            row: dict[str, Any] = {
+                "task_id": data.get("task_id", ""),
+                "sites": self._csv_json(data.get("sites", [])),
+                "require_login": data.get("require_login", False),
+                "storage_state": data.get("storage_state", ""),
+                "start_url": data.get("start_url", ""),
+                "geolocation_json": self._csv_json(data.get("geolocation")),
+                "intent_template": data.get("intent_template", ""),
+                "intent_template_id": data.get("intent_template_id", ""),
+                "instantiation_dict_json": self._csv_json(data.get("instantiation_dict", {})),
+                "intent": data.get("intent", ""),
+                "require_reset": data.get("require_reset", False),
+                "eval_types": self._csv_json(evaluation.get("eval_types", [])),
+                "reference_answers_json": self._csv_json(evaluation.get("reference_answers", {})),
+                "reference_url": evaluation.get("reference_url", ""),
+                "program_html_json": self._csv_json(evaluation.get("program_html", [])),
+                "string_note": evaluation.get("string_note", ""),
+            }
+            if include_metadata_json:
+                row["metadata_json"] = self._csv_json(data.get("metadata", {}))
+                row["evaluation_metadata_json"] = self._csv_json(evaluation.get("metadata", {}))
+            rows.append(row)
+        self._write_csv(destination, rows, encoding=encoding)
+        return destination
+
+    def export_split_csv(
+        self,
+        output_dir: str | Path,
+        *,
+        train_ratio: float = 0.8,
+        validation_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        seed: int = 42,
+        shuffle: bool = True,
+        prefix: str = "webarena",
+        encoding: str = "utf-8-sig",
+    ) -> dict[str, Path]:
+        split = self.split_dataset(train_ratio, validation_ratio, test_ratio, seed, shuffle)
+        destination = Path(output_dir).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        return {
+            "train": self.export_csv(destination / f"{prefix}_train.csv", split.train, encoding=encoding),
+            "validation": self.export_csv(destination / f"{prefix}_validation.csv", split.validation, encoding=encoding),
+            "test": self.export_csv(destination / f"{prefix}_test.csv", split.test, encoding=encoding),
+        }
+
+    def export_statistics_csv(self, output_path: str | Path, *, limit: int | None = None, encoding: str = "utf-8-sig") -> Path:
+        statistics = self.statistics(limit=limit).to_dict()
+        row = {key: self._csv_json(value) if isinstance(value, (dict, list, tuple)) else value for key, value in statistics.items()}
+        destination = Path(output_path).expanduser().resolve()
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+        self._write_csv(destination, [row], encoding=encoding)
+        return destination
+
+    @staticmethod
+    def _csv_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+    @staticmethod
+    def _write_csv(destination: Path, rows: Sequence[dict[str, Any]], *, encoding: str) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        if not fieldnames:
+            fieldnames = ["task_id"]
+        with destination.open("w", encoding=encoding, newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
 
     def split_dataset(
         self,
