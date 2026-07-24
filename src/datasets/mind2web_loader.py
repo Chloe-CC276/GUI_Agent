@@ -33,6 +33,7 @@ Therefore:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import random
@@ -960,6 +961,133 @@ class Mind2WebLoader:
     # ============================================================
     # Train / validation / test split
     # ============================================================
+
+    def export_csv(
+        self,
+        output_path: str | Path,
+        samples: Sequence[GUITaskSample] | None = None,
+        *,
+        encoding: str = "utf-8-sig",
+        include_action_json: bool = True,
+        include_metadata_json: bool = True,
+    ) -> Path:
+        """Export Mind2Web data to CSV, one semantic action per row."""
+        destination = Path(output_path).expanduser().resolve()
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        output_samples = list(samples) if samples is not None else self.load_all()
+        rows: list[dict[str, Any]] = []
+
+        for sample in output_samples:
+            for step in sample.steps:
+                action = step.action
+                action_dict = action.to_dict()
+                row: dict[str, Any] = {
+                    "task_id": sample.task_id,
+                    "source": sample.source,
+                    "task_instruction": sample.instruction,
+                    "task_language": sample.language,
+                    "task_num_steps": sample.num_steps,
+                    "dataset_index": sample.metadata.get("dataset_index", ""),
+                    "split": sample.metadata.get("split", self.split),
+                    "website": sample.metadata.get("website", ""),
+                    "domain": sample.metadata.get("domain", ""),
+                    "subdomain": sample.metadata.get("subdomain", ""),
+                    "step_id": step.step_id,
+                    "step_instruction": step.instruction,
+                    "step_language": step.language,
+                    "screenshot_path": str(step.screenshot_path) if step.screenshot_path else "",
+                    "llm_response": step.llm_response or "",
+                    "corrected_response": step.corrected_response or "",
+                    "action_kind": "semantic",
+                    "action_type": action_dict.get("action_type", ""),
+                    "action_value": action_dict.get("value", ""),
+                    "target_tag": action_dict.get("target_tag", ""),
+                    "backend_node_id": action_dict.get("backend_node_id", ""),
+                    "action_repr": action_dict.get("action_repr", ""),
+                    "target_attributes_json": self._csv_json(action_dict.get("target_attributes", {})),
+                }
+                if include_action_json:
+                    row["action_json"] = self._csv_json(action_dict)
+                if include_metadata_json:
+                    row["task_metadata_json"] = self._csv_json(sample.metadata)
+                    row["step_metadata_json"] = self._csv_json(step.metadata)
+                    row["action_metadata_json"] = self._csv_json(action_dict.get("metadata", {}))
+                rows.append(row)
+
+        self._write_csv(destination, rows, encoding=encoding)
+        LOGGER.info("Exported Mind2Web CSV: path=%s, tasks=%d, rows=%d", destination, len(output_samples), len(rows))
+        return destination
+
+    def export_split_csv(
+        self,
+        output_dir: str | Path,
+        *,
+        train_ratio: float = 0.8,
+        validation_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        seed: int = 42,
+        shuffle: bool = True,
+        group_by_domain: bool = False,
+        prefix: str = "mind2web",
+        encoding: str = "utf-8-sig",
+    ) -> dict[str, Path]:
+        """Split Mind2Web tasks and export train/validation/test CSV files."""
+        split = self.split_dataset(
+            train_ratio=train_ratio,
+            validation_ratio=validation_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+            shuffle=shuffle,
+            group_by_domain=group_by_domain,
+        )
+        destination = Path(output_dir).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        return {
+            "train": self.export_csv(destination / f"{prefix}_train.csv", split.train, encoding=encoding),
+            "validation": self.export_csv(destination / f"{prefix}_validation.csv", split.validation, encoding=encoding),
+            "test": self.export_csv(destination / f"{prefix}_test.csv", split.test, encoding=encoding),
+        }
+
+    def export_statistics_csv(
+        self,
+        output_path: str | Path,
+        *,
+        limit: int | None = None,
+        encoding: str = "utf-8-sig",
+    ) -> Path:
+        """Export the dataset statistics summary as a single-row CSV."""
+        statistics = self.statistics(limit=limit).to_dict()
+        row = {
+            key: self._csv_json(value) if isinstance(value, (dict, list, tuple)) else value
+            for key, value in statistics.items()
+        }
+        destination = Path(output_path).expanduser().resolve()
+        if destination.suffix.lower() != ".csv":
+            destination = destination.with_suffix(".csv")
+        self._write_csv(destination, [row], encoding=encoding)
+        return destination
+
+    @staticmethod
+    def _csv_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+    @staticmethod
+    def _write_csv(destination: Path, rows: Sequence[dict[str, Any]], *, encoding: str) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        if not fieldnames:
+            fieldnames = ["task_id"]
+        with destination.open("w", encoding=encoding, newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
 
     def split_dataset(
         self,
