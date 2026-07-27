@@ -815,13 +815,14 @@ class Planner:
         if observation is None:
             return []
 
-        if observation.screenshot is not None:
-            return [observation.screenshot]
-
         if observation.screenshot_path is not None:
             return [observation.screenshot_path]
 
+        if observation.screenshot is not None:
+            return [observation.screenshot]
+
         return []
+
 
     def call_vlm(
         self,

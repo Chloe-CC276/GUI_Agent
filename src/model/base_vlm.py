@@ -35,6 +35,7 @@ import random
 import re
 import time
 import uuid
+from io import BytesIO
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -333,7 +334,7 @@ class ImageInput:
         return result
 
 
-ImageLike = ImageInput | str | Path | bytes
+ImageLike = ImageInput | str | Path | bytes | Any
 
 
 def normalise_image(
@@ -378,6 +379,43 @@ def normalise_image(
             text,
             detail=detail,
         )
+
+    if type(image).__module__.startswith("numpy"):
+        try:
+            import cv2
+
+            if getattr(image, "size", 0) == 0:
+                raise ValueError("NumPy image is empty.")
+
+            success, encoded = cv2.imencode(".png", image)
+            if not success:
+                raise ValueError("OpenCV failed to encode image.")
+
+            return ImageInput.from_bytes(
+                encoded.tobytes(),
+                mime_type="image/png",
+                detail=detail,
+            )
+        except Exception as error:
+            raise TypeError(
+                f"Failed to convert NumPy image: {error}"
+            ) from error
+
+    # 支持 PIL.Image
+    if type(image).__module__.startswith("PIL."):
+        try:
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+
+            return ImageInput.from_bytes(
+                buffer.getvalue(),
+                mime_type="image/png",
+                detail=detail,
+            )
+        except Exception as error:
+            raise TypeError(
+                f"Failed to convert PIL image: {error}"
+            ) from error
 
     raise TypeError(
         "image must be ImageInput, str, pathlib.Path, or bytes."

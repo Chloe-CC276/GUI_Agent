@@ -466,7 +466,10 @@ class _PlannerVLMAdapter:
         images: list[Any] | None = None,
         **kwargs: Any,
     ) -> Any:
-        return self._vlm.generate(prompt=prompt, images=images, **kwargs)
+
+        kwargs.pop("messages", None)
+        kwargs.pop("image", None)
+        return self._vlm.generate(prompt=prompt, images=images or [], **kwargs)
 
 
 def _planner_action_factory(
