@@ -18,15 +18,10 @@ from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
 
-try:
-    from prompts import PromptBuilder, PromptKind
-    from prompts.schemas import REFLECTION_RESPONSE_SCHEMA, VERIFY_RESPONSE_SCHEMA
-except ImportError:
-    from ..prompts import PromptBuilder, PromptKind  # type: ignore
-    from ..prompts.schemas import (  # type: ignore
-        REFLECTION_RESPONSE_SCHEMA,
-        VERIFY_RESPONSE_SCHEMA,
-    )
+from .prompts import PromptBuilder, PromptKind
+from .prompts.schemas import REFLECTION_RESPONSE_SCHEMA, VERIFY_RESPONSE_SCHEMA
+
+
 
 try:
     from langchain_core.runnables import Runnable, RunnableLambda, RunnableSequence

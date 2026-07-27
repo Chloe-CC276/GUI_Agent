@@ -17,11 +17,9 @@ import importlib
 import json
 import os
 import shlex
-import sys
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Mapping
 
 
 class CLIError(RuntimeError):
@@ -88,7 +86,7 @@ class AgentRuntime:
                 "没有视觉证据时应重新感知，不得猜测坐标",
             ],
             success_criteria=["通过动作后界面证据确认用户指令已经完成"],
-            metadata={"entrypoint": "agent.cli", "dry_run": config.dry_run},
+            metadata={"entrypoint": "src.agent.cli", "dry_run": config.dry_run},
         )
 
 
@@ -99,30 +97,22 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
     before optional OCR, OpenCV, Qwen or LangChain dependencies are installed.
     """
 
-    AgentState = _import_symbol(("agent.state", "src.agent.state"), "AgentState")
-    AgentTools = _import_symbol(("agent.tools", "src.agent.tools"), "AgentTools")
-    AgentMemory = _import_symbol(("agent.memory", "src.agent.memory"), "AgentMemory")
-    chain_module = _import_module(("agent.agent_chain", "src.agent.agent_chain"))
-    Planner = _import_symbol(("agent.planner", "src.agent.planner"), "Planner")
-    PlannerConfig = _import_symbol(
-        ("agent.planner", "src.agent.planner"), "PlannerConfig"
-    )
-    PerceptionPipeline = _import_symbol(
-        (
-            "perception.perception_pipeline",
-            "src.perception.perception_pipeline",
-            "agent.perception_pipeline",
-        ),
-        "PerceptionPipeline",
-    )
-    Executor = _import_symbol(
-        ("executor.executor", "src.executor.executor", "agent.executor"),
-        "Executor",
-    )
-    QwenVLM = _import_symbol(
-        ("models.qwen_vlm", "src.models.qwen_vlm", "agent.qwen_vlm"),
-        "QwenVLM",
-    )
+    try:
+        from .agent_chain import AgentChainConfig, create_agent_chain
+        from .memory import AgentMemory
+        from .planner import Planner, PlannerConfig
+        from .state import AgentState
+        from .tools import AgentTools
+        from ..executor.executor import Executor
+        from ..model.qwen_vlm import QwenVLM
+        from ..perception.perception_pipeline import PerceptionPipeline
+    except ImportError as error:
+        raise CLIError(
+            "无法导入 src.agent 运行模块。请确认从项目根目录执行 "
+            "`python -m src.agent.cli`，并检查 src、src/agent、"
+            "src/agent/prompts 均包含 __init__.py。"
+            f"\n原始错误：{error}"
+        ) from error
 
     api_key = os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
@@ -169,13 +159,13 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
     )
     tools = AgentTools(perception=perception, executor=executor)
     memory = AgentMemory()
-    chain_config = chain_module.AgentChainConfig(
+    chain_config = AgentChainConfig(
         post_action_wait_seconds=config.post_action_wait,
         max_reflections=config.max_reflections,
         max_model_repairs=1,
         max_chain_iterations=max(50, config.max_steps * 12),
     )
-    chain = chain_module.create_agent_chain(
+    chain = create_agent_chain(
         planner=planner,
         tools=tools,
         vlm=vlm,
@@ -422,28 +412,6 @@ def _load_external_factory(spec: str) -> Callable[[CLIConfig], AgentRuntime]:
     if not callable(function):
         raise CLIError(f"{spec} 不是可调用的 Agent 工厂")
     return function
-
-
-def _import_module(candidates: Iterable[str]) -> Any:
-    errors: list[str] = []
-    for name in candidates:
-        try:
-            return importlib.import_module(name)
-        except ImportError as error:
-            errors.append(f"{name}: {error}")
-    raise CLIError("无法导入所需模块：\n  " + "\n  ".join(errors))
-
-
-def _import_symbol(candidates: Iterable[str], symbol: str) -> Any:
-    for module_name in candidates:
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        value = getattr(module, symbol, None)
-        if value is not None:
-            return value
-    raise CLIError(f"无法从候选模块中找到 {symbol}: {', '.join(candidates)}")
 
 
 def _parse_bool(value: str) -> bool:

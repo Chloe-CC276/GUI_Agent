@@ -28,8 +28,8 @@ from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
 
 try:
-    from prompts import PromptBuilder, PromptKind
-    from prompts.schemas import (
+    from .prompts import PromptBuilder, PromptKind
+    from .prompts.schemas import (
         REFLECTION_RESPONSE_SCHEMA,
         VERIFY_RESPONSE_SCHEMA,
     )

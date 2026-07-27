@@ -34,6 +34,7 @@ from .result import (
     UsageInfo,
 )
 from .state import AgentPhase, AgentState
+from .prompts import PromptBuilder, PromptKind
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -397,11 +398,11 @@ class Planner:
         *,
         config: PlannerConfig | None = None,
         action_factory: ActionFactoryProtocol | None = None,
-        prompt_builder: Callable[
-            [AgentState, PlannerConfig],
-            str,
-        ]
-        | None = None,
+        prompt_builder: (
+            PromptBuilder
+            | Callable[[AgentState, PlannerConfig], str]
+            | None
+        ) = None,
         response_parser: Callable[
             [Any],
             Mapping[str, Any],
@@ -419,7 +420,11 @@ class Planner:
         self.action_factory = (
             action_factory or dictionary_action_factory
         )
-        self.prompt_builder = prompt_builder
+        self.prompt_builder = (
+            prompt_builder
+            if prompt_builder is not None
+            else PromptBuilder(self.config)
+        )
         self.response_parser = response_parser
         self.logger = logger or logging.getLogger(
             f"{__name__}.{self.__class__.__name__}"
@@ -675,43 +680,24 @@ class Planner:
 
     def build_prompt(self, state: AgentState) -> str:
         """Build the planner prompt from AgentState."""
-        if self.prompt_builder is not None:
+        if isinstance(self.prompt_builder, PromptBuilder):
+            prompt = self.prompt_builder.build_text(
+                PromptKind.PLANNER,
+                state,
+            )
+        elif callable(self.prompt_builder):
             prompt = self.prompt_builder(state, self.config)
+        else:
+            raise PlannerConfigurationError(
+                "prompt_builder must be PromptBuilder or callable."
+            )
 
-            if not isinstance(prompt, str) or not prompt.strip():
-                raise PlannerConfigurationError(
-                    "Custom prompt_builder returned an empty prompt."
-                )
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise PlannerConfigurationError(
+                "prompt_builder returned an empty prompt."
+            )
 
-            return prompt.strip()
-
-        context = state.planner_context(
-            history_limit=self.config.history_limit,
-            max_ocr_chars=self.config.max_ocr_chars,
-            max_elements=self.config.max_elements,
-        )
-
-        system_prompt = (
-            self.config.system_prompt
-            or self._default_system_prompt()
-        )
-
-        response_schema = self._response_schema_text()
-
-        return (
-            f"{system_prompt}\n\n"
-            "## Current task\n"
-            f"{state.instruction}\n\n"
-            "## Current agent context\n"
-            f"{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
-            "## Allowed actions\n"
-            f"{', '.join(self.config.allowed_actions)}\n\n"
-            "## Required output schema\n"
-            f"{response_schema}\n\n"
-            "Return exactly one JSON object. Do not use Markdown fences. "
-            "Choose only the next single action. Do not invent GUI elements "
-            "that are absent from the observation."
-        )
+        return prompt.strip()
 
     def _default_system_prompt(self) -> str:
         thought_instruction = (
