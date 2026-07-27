@@ -15,15 +15,20 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import logging
 import os
 import shlex
 import time
+import traceback
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
 class CLIError(RuntimeError):
     """Raised for configuration or command-line integration failures."""
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -37,6 +42,7 @@ class CLIConfig:
     dry_run: bool = False
     language: str = "zh"
     verbose: bool = True
+    log_file: str = "logs/agent_debug.log"
 
     def update(self, name: str, raw_value: str) -> None:
         aliases = {
@@ -107,11 +113,14 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
         from ..model.qwen_vlm import QwenVLM
         from ..perception.perception_pipeline import PerceptionPipeline
     except ImportError as error:
+        diagnostic = _format_exception(error)
+        logger.error("Agent runtime import failed\n%s", diagnostic)
         raise CLIError(
             "无法导入 src.agent 运行模块。请确认从项目根目录执行 "
             "`python -m src.agent.cli`，并检查 src、src/agent、"
             "src/agent/prompts 均包含 __init__.py。"
-            f"\n原始错误：{error}"
+            f"\n原始错误：{type(error).__name__}: {error}"
+            f"\n完整导入堆栈已写入：{config.log_file}"
         ) from error
 
     api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -223,11 +232,10 @@ class AgentCLI:
             except KeyboardInterrupt:
                 print("\n当前任务已由用户中断。")
             except Exception as error:
+                logger.exception("Unhandled CLI task error")
                 print(f"[运行错误] {type(error).__name__}: {error}")
                 if self.config.verbose:
-                    import traceback
-
-                    traceback.print_exc()
+                    print(_format_exception(error), end="")
 
     def handle_command(self, line: str) -> bool:
         try:
@@ -273,36 +281,62 @@ class AgentCLI:
         task = task.strip()
         if not task:
             raise CLIError("任务指令不能为空")
+
         runtime = self._ensure_runtime()
         state = runtime.new_state(task, self.config)
         started = time.perf_counter()
+
         print(f"\n[任务] {task}")
         print("[状态] Agent 已启动")
+
         try:
             if hasattr(runtime.chain, "stream_steps"):
                 final_state = state
+
                 for context in runtime.chain.stream_steps(state):
-                    final_state = context["agent_state"]
+                    final_state = context.get("agent_state", final_state)
+
                     self._print_stage(context)
+                    self._log_stage_context(context)
+                    if (
+                        context.get("stage") == "fail"
+                        or context.get("chain_error")
+                    ):
+                        self._print_failure_diagnostic(context)
+
                 result = final_state.to_run_result()
             else:
                 result = runtime.chain.invoke(state)
+
         except Exception as error:
             elapsed = time.perf_counter() - started
+            diagnostic = _format_exception(error)
+            logger.exception("Task raised an uncaught exception: task=%r", task)
+
+            print("\n[异常] 执行任务时发生错误")
+            print("[异常类型]", type(error).__name__)
+            print("[异常信息]", error)
+            print("[异常堆栈]")
+            print(diagnostic, end="")
+
             self.history.append(
                 {
                     "task": task,
                     "status": "error",
                     "elapsed_seconds": round(elapsed, 3),
                     "error": f"{type(error).__name__}: {error}",
+                    "traceback": diagnostic,
                 }
             )
             raise
+
         elapsed = time.perf_counter() - started
         self.last_result = result
+
         data = _json_safe(result)
         status = str(data.get("status", "unknown"))
         message = data.get("final_message") or data.get("message") or ""
+
         self.history.append(
             {
                 "task": task,
@@ -311,12 +345,18 @@ class AgentCLI:
                 "message": message,
             }
         )
+
         print(f"\n[结果] {status}")
         if message:
             print(f"[说明] {message}")
+        if status.lower() not in {
+            "success", "succeeded", "finished", "completed"
+        }:
+            self._print_result_error(data)
         print(f"[耗时] {elapsed:.2f}s")
-        return status.lower() in {"success", "succeeded", "finished", "completed"}
 
+        return status.lower() in {"success", "succeeded", "finished", "completed"}
+    
     def _ensure_runtime(self) -> AgentRuntime:
         if self.runtime is None:
             print("[初始化] 正在连接感知、VLM、Planner、Executor 与 AgentChain...")
@@ -335,6 +375,48 @@ class AgentCLI:
         elif stage == "execute":
             details = "，准备执行已校验动作"
         print(f"[步骤 {step}] {stage}{details}")
+
+    def _log_stage_context(self, context: Mapping[str, Any]) -> None:
+        logger.debug(
+            "AgentChain context:\n%s",
+            json.dumps(_json_value(context), ensure_ascii=False, indent=2),
+        )
+
+    def _print_failure_diagnostic(
+        self,
+        context: Mapping[str, Any],
+    ) -> None:
+        stage = context.get("failed_stage") or context.get("stage") or "unknown"
+        error_type = context.get("error_type") or "AgentChainFailure"
+        message = context.get("chain_error") or "未提供失败原因"
+        print("\n" + "=" * 72)
+        print("[失败诊断]")
+        print(f"[失败阶段] {stage}")
+        print(f"[异常类型] {error_type}")
+        print(f"[异常信息] {message}")
+        details = context.get("error_details")
+        if details:
+            print("[错误详情]")
+            print(json.dumps(_json_value(details), ensure_ascii=False, indent=2))
+        raw = context.get("last_raw_response")
+        if raw is not None:
+            print("[VLM/Planner 原始输出]")
+            print(_json_value(raw))
+        stack = context.get("traceback")
+        if stack and self.config.verbose:
+            print("[完整异常堆栈]")
+            print(str(stack).rstrip())
+        print(f"[完整日志] {self.config.log_file}")
+        print("=" * 72)
+
+    def _print_result_error(self, data: Mapping[str, Any]) -> None:
+        error = data.get("error") or data.get("last_error")
+        reason = data.get("termination_reason") or data.get("reason")
+        if reason:
+            print(f"[终止原因] {_json_value(reason)}")
+        if error:
+            print("[最终错误]")
+            print(json.dumps(_json_value(error), ensure_ascii=False, indent=2))
 
     def _print_history(self) -> None:
         if not self.history:
@@ -449,6 +531,30 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
+def _format_exception(error: BaseException) -> str:
+    return "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+
+
+def _configure_logging(path_value: str, verbose: bool) -> Path:
+    path = Path(path_value).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format=(
+            "%(asctime)s | %(levelname)s | %(name)s | "
+            "%(filename)s:%(lineno)d | %(message)s"
+        ),
+        handlers=[
+            logging.FileHandler(path, encoding="utf-8"),
+        ],
+        force=True,
+    )
+    logger.info("GUI Agent CLI logging started")
+    return path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GUI Agent command-line interface")
     parser.add_argument("--task", help="执行一次任务后退出")
@@ -464,6 +570,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="自定义运行时工厂，格式为 module:function",
     )
     parser.add_argument("--quiet", action="store_true", help="关闭详细异常堆栈")
+    parser.add_argument(
+        "--log-file",
+        default=os.getenv("GUI_AGENT_LOG_FILE", "logs/agent_debug.log"),
+        help="详细日志文件路径",
+    )
     return parser
 
 
@@ -478,7 +589,9 @@ def main(argv: list[str] | None = None) -> int:
         post_action_wait=args.post_action_wait,
         dry_run=args.dry_run,
         verbose=not args.quiet,
+        log_file=args.log_file,
     )
+    _configure_logging(config.log_file, config.verbose)
     factory = _load_external_factory(args.factory) if args.factory else build_default_runtime
     return AgentCLI(config, factory).run(args.task)
 

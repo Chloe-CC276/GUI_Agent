@@ -21,6 +21,7 @@ import logging
 import math
 import re
 import time
+import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, Sequence, TYPE_CHECKING
@@ -447,12 +448,14 @@ class Planner:
         last_error: ErrorInfo | None = None
         prompt: str | None = None
         raw_response: Any = None
+        last_diagnostic: dict[str, Any] | None = None
 
         try:
             self._validate_state(state)
             prompt = self.build_prompt(state)
             images = self._collect_images(state)
         except Exception as error:
+            self.logger.exception("Planner input validation/prompt building failed")
             timing.finish()
             return PlannerResult.failed(
                 error=ErrorInfo.from_exception(
@@ -464,6 +467,7 @@ class Planner:
                 metadata={
                     "attempts": 0,
                     "planner_config": self._config_metadata(),
+                    "diagnostic": _exception_diagnostic(error, "planner_input"),
                 },
             )
 
@@ -495,6 +499,9 @@ class Planner:
                 return result
 
             except Exception as error:
+                last_diagnostic = _exception_diagnostic(
+                    error, f"planner_attempt_{attempt}"
+                )
                 retryable = self._is_retryable_local_error(error)
                 last_error = ErrorInfo.from_exception(
                     error,
@@ -505,7 +512,7 @@ class Planner:
                     },
                 )
 
-                self.logger.warning(
+                self.logger.exception(
                     "Planner attempt %s/%s failed: %s",
                     attempt,
                     self.config.max_attempts,
@@ -536,6 +543,7 @@ class Planner:
             timing=timing,
             raw_response=raw_response,
             prompt=prompt,
+            diagnostic=last_diagnostic,
         )
 
     async def aplan(self, state: AgentState) -> PlannerResult:
@@ -556,17 +564,26 @@ class Planner:
         prompt: str | None = None
         raw_response: Any = None
         last_error: ErrorInfo | None = None
+        last_diagnostic: dict[str, Any] | None = None
 
         try:
             self._validate_state(state)
             prompt = self.build_prompt(state)
             images = self._collect_images(state)
         except Exception as error:
+            self.logger.exception(
+                "Async planner input validation/prompt building failed"
+            )
             timing.finish()
             return PlannerResult.failed(
                 error=ErrorInfo.from_exception(error),
                 reason="Planner input state is invalid.",
                 timing=timing,
+                metadata={
+                    "attempts": 0,
+                    "planner_config": self._config_metadata(),
+                    "diagnostic": _exception_diagnostic(error, "planner_input"),
+                },
             )
 
         for attempt in range(1, self.config.max_attempts + 1):
@@ -594,6 +611,16 @@ class Planner:
                 return result
 
             except Exception as error:
+                last_diagnostic = _exception_diagnostic(
+                    error, f"planner_attempt_{attempt}"
+                )
+                self.logger.error(
+                    "Async planner attempt %s/%s failed: %s",
+                    attempt,
+                    self.config.max_attempts,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
                 retryable = self._is_retryable_local_error(error)
                 last_error = ErrorInfo.from_exception(
                     error,
@@ -627,6 +654,7 @@ class Planner:
             timing=timing,
             raw_response=raw_response,
             prompt=prompt,
+            diagnostic=last_diagnostic,
         )
 
     # --------------------------------------------------------
@@ -1993,10 +2021,12 @@ class Planner:
         timing: TimingInfo,
         raw_response: Any,
         prompt: str | None,
+        diagnostic: Mapping[str, Any] | None = None,
     ) -> PlannerResult:
         metadata = {
             "attempts": self.config.max_attempts,
             "planner_config": self._config_metadata(),
+            "diagnostic": dict(diagnostic or {}),
         }
 
         if self.config.include_prompt_in_metadata:
@@ -2227,6 +2257,34 @@ def build_executor_action_factory(
                 ) from first_error
 
     return factory
+
+
+def _exception_diagnostic(
+    error: BaseException,
+    stage: str,
+) -> dict[str, Any]:
+    """Capture the original stack and chained causes before returning failed."""
+    causes: list[dict[str, str]] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        causes.append(
+            {
+                "type": type(current).__name__,
+                "message": str(current),
+            }
+        )
+        current = current.__cause__ or current.__context__
+    return {
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "message": str(error),
+        "cause": causes,
+        "traceback": "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        ),
+    }
 
 
 __all__ = [

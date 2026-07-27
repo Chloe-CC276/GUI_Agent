@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
+import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterator, Mapping, Protocol, TypedDict
@@ -21,6 +23,7 @@ from .tools import AgentTools
 from .prompts import PromptBuilder, PromptKind
 from .prompts.schemas import REFLECTION_RESPONSE_SCHEMA, VERIFY_RESPONSE_SCHEMA
 
+logger = logging.getLogger(__name__)
 
 
 try:
@@ -74,6 +77,10 @@ class ChainState(TypedDict, total=False):
     last_prompt: str
     last_raw_response: Any
     chain_error: str
+    failed_stage: str
+    error_type: str
+    traceback: str
+    error_details: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -218,7 +225,13 @@ class AgentChain:
             return self._fail_update(
                 context["agent_state"], f"Unknown AgentChain stage: {stage!r}"
             )
-        return await handler(context)
+        try:
+            return await handler(context)
+        except Exception as error:
+            logger.exception("AgentChain stage failed unexpectedly: stage=%s", stage)
+            return self._exception_failure(
+                context["agent_state"], error, stage
+            )
 
     @staticmethod
     def _terminal(context: ChainState) -> bool:
@@ -253,7 +266,7 @@ class AgentChain:
         except Exception as error:
             return self._exception_failure(state, error, "planning")
         if state.is_terminal:
-            return {"agent_state": state, "stage": ChainStage.FAIL.value}
+            return self._planner_failure_update(state, result)
         if result.is_finished:
             return {"agent_state": state, "stage": ChainStage.FINISH.value}
         if result.should_execute:
@@ -532,7 +545,13 @@ class AgentChain:
                 "stage": ChainStage.REFLECT.value,
                 "chain_error": message,
             }
-        return self._fail_update(state, message, result.error)
+        update = self._fail_update(state, message, result.error)
+        update["failed_stage"] = stage
+        update["error_type"] = getattr(
+            result.error, "error_type", "ToolFailure"
+        )
+        update["error_details"] = _error_info_details(result.error)
+        return update
 
     def _exception_reflection(
         self, state: AgentState, error: BaseException, stage: str
@@ -542,20 +561,73 @@ class AgentChain:
             message=str(error),
             status=ResultStatus.RETRY,
         )
+        diagnostics = _exception_diagnostics(error, stage)
+        logger.error(
+            "%s failed and will enter reflection: %s",
+            stage,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
         return {
             "agent_state": state,
             "stage": ChainStage.REFLECT.value,
             "chain_error": str(error),
+            **diagnostics,
         }
 
     def _exception_failure(
         self, state: AgentState, error: BaseException, stage: str
     ) -> ChainState:
-        return self._fail_update(
+        diagnostics = _exception_diagnostics(error, stage)
+        logger.error(
+            "%s failed: %s",
+            stage,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        update = self._fail_update(
             state,
             f"{stage} failed: {error}",
             ErrorInfo.from_exception(error, retryable=False),
         )
+        update.update(diagnostics)
+        return update
+
+    def _planner_failure_update(
+        self,
+        state: AgentState,
+        result: Any,
+    ) -> ChainState:
+        error = getattr(result, "error", None)
+        message = (
+            getattr(error, "message", None)
+            or getattr(result, "reason", None)
+            or "Planner failed."
+        )
+        update: ChainState = {
+            "agent_state": state,
+            "stage": ChainStage.FAIL.value,
+            "chain_error": str(message),
+            "failed_stage": ChainStage.PLAN.value,
+            "error_type": str(
+                getattr(error, "error_type", "PlannerFailure")
+            ),
+            "error_details": _error_info_details(error),
+        }
+        metadata = getattr(result, "metadata", None)
+        if isinstance(metadata, Mapping):
+            diagnostic = metadata.get("diagnostic")
+            if isinstance(diagnostic, Mapping):
+                update["error_details"] = {
+                    **update["error_details"],
+                    **dict(diagnostic),
+                }
+                if diagnostic.get("traceback"):
+                    update["traceback"] = str(diagnostic["traceback"])
+        raw_output = getattr(result, "raw_output", None)
+        if raw_output is not None:
+            update["last_raw_response"] = raw_output
+        return update
 
     @staticmethod
     def _fail_update(
@@ -674,6 +746,52 @@ def _require_fields(data: Mapping[str, Any], fields: set[str], name: str) -> Non
         raise ModelResponseError(
             f"{name} response missing fields: {', '.join(missing)}"
         )
+
+
+def _exception_diagnostics(
+    error: BaseException,
+    stage: str,
+) -> dict[str, Any]:
+    """Preserve the complete exception chain before it is converted to state."""
+    return {
+        "failed_stage": stage,
+        "error_type": type(error).__name__,
+        "traceback": "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        ),
+        "error_details": {
+            "message": str(error),
+            "cause": _exception_chain(error),
+        },
+    }
+
+
+def _exception_chain(error: BaseException) -> list[dict[str, str]]:
+    chain: list[dict[str, str]] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(
+            {
+                "type": type(current).__name__,
+                "message": str(current),
+            }
+        )
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _error_info_details(error: Any) -> dict[str, Any]:
+    if error is None:
+        return {}
+    details = getattr(error, "details", None)
+    result = dict(details) if isinstance(details, Mapping) else {}
+    for name in ("error_type", "message", "retryable"):
+        value = getattr(error, name, None)
+        if value is not None:
+            result[name] = value
+    return result
 
 
 __all__ = [
