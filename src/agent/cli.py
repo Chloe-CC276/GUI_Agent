@@ -110,6 +110,7 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
         from .tools import AgentTools
         from ..executor.executor import Executor
         from ..model.qwen_vlm import QwenVLM
+        from ..model.base_vlm import VLMGenerationConfig
         from ..perception.perception_pipeline import PerceptionPipeline
     except ImportError as error:
         raise CLIError(
@@ -148,6 +149,14 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
         base_url=os.getenv("DASHSCOPE_BASE_URL"),
         keep_history=False,
         enable_thinking=False,
+        generation_config=VLMGenerationConfig(
+            timeout=90.0,
+            max_retries=1,
+            retry_base_delay=1.0,
+            retry_max_delay=3.0,
+            max_tokens=1200,
+            temperature=0.0,
+        ),
     )
     planner = Planner(
         vlm=_PlannerVLMAdapter(vlm),

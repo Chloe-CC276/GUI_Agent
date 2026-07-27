@@ -194,7 +194,7 @@ class PlannerConfig:
         InvalidResponsePolicy.RETRY
     )
 
-    max_attempts: int = 2
+    max_attempts: int = 1
     retry_on_empty_response: bool = True
     retry_on_parse_error: bool = True
     retry_on_validation_error: bool = True
@@ -1250,6 +1250,15 @@ class Planner:
     ) -> ParsedPlannerOutput:
         raw = dict(data)
         decision = self._normalize_decision(raw)
+        # 坐标诊断
+        action_type, parameters = self._normalize_action(raw)
+
+        print(
+            "[坐标诊断] VLM原始动作:",
+            action_type,
+            parameters,
+        )
+        #
 
         reason = self._optional_text(
             raw.get("reason")
@@ -1446,6 +1455,15 @@ class Planner:
                         "parameters",
                     }
                 }
+
+            x_value = result.get("x")
+            if (
+                isinstance(x_value, (list, tuple))
+                and len(x_value) == 2
+                and "y" not in result
+            ):
+                result["x"] = x_value[0]
+                result["y"] = x_value[1]
 
             if action_type is None:
                 raise PlannerValidationError(

@@ -271,12 +271,16 @@ class QwenVLM(BaseVLM):
             api_key=resolved_api_key,
             base_url=resolved_base_url,
             default_headers=dict(extra_headers or {}),
+            timeout=90.0,
+            max_retries=0,
         )
 
         self._async_client = async_client or AsyncOpenAI(
             api_key=resolved_api_key,
             base_url=resolved_base_url,
             default_headers=dict(extra_headers or {}),
+            timeout=30.0,
+            max_retries=0,
         )
 
     # ============================================================

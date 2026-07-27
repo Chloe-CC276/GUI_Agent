@@ -22,11 +22,42 @@ class ScreenCapture:
 
     # 捕获整个屏幕，返回ndarray
     def capture_screen(self) -> np.ndarray:
-        screenshot = self.sct.grab(self.monitors[0])    # 截取全屏
+        virtual = self.monitors[0]
+        primary = self.monitors[1]
 
+        screenshot = self.sct.grab(virtual)
         img = np.array(screenshot)
-        
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR) # 色彩转换
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        h, w = img.shape[:2]
+
+        print("\n[坐标诊断]")
+        print(f"MSS virtual monitor: {virtual}")
+        print(f"MSS primary monitor: {primary}")
+        print(f"Screenshot array: {w}x{h}")
+
+        try:
+            import pyautogui
+            size = pyautogui.size()
+            position = pyautogui.position()
+            print(f"PyAutoGUI screen: {size.width}x{size.height}")
+            print(f"PyAutoGUI cursor: ({position.x}, {position.y})")
+            print(
+                f"Scale screenshot/executor: "
+                f"x={w / size.width:.4f}, "
+                f"y={h / size.height:.4f}"
+            )
+        except Exception as error:
+            print(f"PyAutoGUI diagnosis failed: {error}")
+
+        try:
+            import ctypes
+
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+            print(f"Windows system DPI: {dpi}")
+            print(f"Windows DPI scale: {dpi / 96:.2f}")
+        except Exception as error:
+            print(f"DPI diagnosis failed: {error}")
 
         return img
     
