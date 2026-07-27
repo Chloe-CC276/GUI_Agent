@@ -116,8 +116,9 @@ def build_observation_context(
 
     if cfg.include_screenshot:
         path = _read(observation, "screenshot_path", "image_path")
+        image = _read(observation, "screenshot", "image")
         context["screenshot"] = {
-            "available": bool(path or _read(observation, "screenshot", "image")),
+            "available": path is not None or image is not None,
             "path": path,
         }
 

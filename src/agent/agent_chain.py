@@ -92,19 +92,30 @@ class AgentChainConfig:
     verify_confidence_threshold: float = 0.55
     max_reflections: int = 3
     max_model_repairs: int = 1
+    max_planner_retries: int = 2
     summarize_memory: bool = True
     fail_on_execution_error: bool = False
-    max_chain_iterations: int = 300
+    max_chain_iterations: int = 20
 
     def __post_init__(self) -> None:
         if not 0 <= self.post_action_wait_seconds <= 60:
             raise ValueError("post_action_wait_seconds must be between 0 and 60")
         if not 0 <= self.verify_confidence_threshold <= 1:
             raise ValueError("verify_confidence_threshold must be between 0 and 1")
-        if self.max_reflections < 0 or self.max_model_repairs < 0:
-            raise ValueError("reflection and repair limits must be non-negative")
+        if (
+            self.max_reflections < 0
+            or self.max_model_repairs < 0
+            or self.max_planner_retries < 0
+        ):
+            raise ValueError(
+                "reflection, repair and planner retry limits "
+                "must be non-negative"
+            )
+
         if self.max_chain_iterations <= 0:
-            raise ValueError("max_chain_iterations must be positive")
+            raise ValueError(
+                "max_chain_iterations must be positive"
+            )
 
 
 class AgentChain:
@@ -268,19 +279,60 @@ class AgentChain:
         if state.is_terminal:
             return self._planner_failure_update(state, result)
         if result.is_finished:
-            return {"agent_state": state, "stage": ChainStage.FINISH.value}
+            state.metadata["planner_retry_count"] = 0
+
+            return {
+                "agent_state": state,
+                "stage": ChainStage.FINISH.value,
+            }
         if result.should_execute:
-            return {"agent_state": state, "stage": ChainStage.EXECUTE.value}
+            state.metadata["planner_retry_count"] = 0
+
+            return {
+                "agent_state": state,
+                "stage": ChainStage.EXECUTE.value,
+            }
         if result.should_retry:
-            stage = (
-                ChainStage.REFLECT
-                if state.runtime.consecutive_failures
-                else ChainStage.OBSERVE
+            retry_count = int(
+                state.metadata.get("planner_retry_count", 0)
+            ) + 1
+
+            state.metadata["planner_retry_count"] = retry_count
+
+            retry_reason = (
+                result.reason
+                or "Planner requested another observation."
             )
-            return {"agent_state": state, "stage": stage.value}
-        return self._fail_update(
-            state, result.reason or "Planner returned no usable decision."
-        )
+
+            state.add_history(
+                event_type="planner_retry",
+                message=retry_reason,
+                status=ResultStatus.RETRY,
+                metadata={
+                    "retry_count": retry_count,
+                    "max_retries": self.config.max_planner_retries,
+                    "raw_output": getattr(result, "raw_output", None),
+                },
+            )
+
+            if retry_count > self.config.max_planner_retries:
+                return self._fail_update(
+                    state,
+                    (
+                        "Planner retry limit reached: "
+                        f"{retry_count - 1}/"
+                        f"{self.config.max_planner_retries}. "
+                        f"Last reason: {retry_reason}"
+                    ),
+                    getattr(result, "error", None),
+                )
+
+            return {
+                "agent_state": state,
+                "stage": ChainStage.OBSERVE.value,
+                "chain_error": retry_reason,
+                "planner_retry_count": retry_count,
+            }
 
     async def _execute(self, context: ChainState) -> ChainState:
         state = context["agent_state"]
