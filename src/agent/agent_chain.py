@@ -90,7 +90,7 @@ class AgentChainConfig:
     observe_options: dict[str, Any] = field(default_factory=dict)
     post_action_wait_seconds: float = 0.5
     verify_confidence_threshold: float = 0.55
-    max_reflections: int = 3
+    max_reflections: int = 2
     max_model_repairs: int = 1
     max_planner_retries: int = 2
     summarize_memory: bool = True
@@ -334,20 +334,175 @@ class AgentChain:
                 "planner_retry_count": retry_count,
             }
 
+    @staticmethod
+    def _point_in_bbox(
+        x: int,
+        y: int,
+        bbox: Any,
+    ) -> bool:
+        if (
+            not isinstance(bbox, (list, tuple))
+            or len(bbox) != 4
+        ):
+            return False
+        try:
+            left, top, right, bottom = (
+                float(value) for value in bbox
+            )
+        except (TypeError, ValueError):
+            return False
+        return left <= x <= right and top <= y <= bottom
+
+    @staticmethod
+    def _action_mapping(action: Any) -> dict[str, Any]:
+        if isinstance(action, Mapping):
+            return dict(action)
+        for method_name in ("to_dict", "model_dump", "dict"):
+            method = getattr(action, method_name, None)
+            if callable(method):
+                value = method()
+                if isinstance(value, Mapping):
+                    return dict(value)
+        result: dict[str, Any] = {}
+        for name in (
+            "type",
+            "action_type",
+            "x",
+            "y",
+            "metadata",
+            "parameters",
+        ):
+            value = getattr(action, name, None)
+            if value is not None:
+                result[name] = value
+        return result
+
+    def _validate_action_target(
+        self,
+        state: AgentState,
+    ) -> str | None:
+        action = state.latest_action
+        if action is None:
+            return "Action rejected: no action is available for execution."
+
+        data = self._action_mapping(action)
+        nested = data.get("parameters")
+        params = dict(nested) if isinstance(nested, Mapping) else data
+
+        raw_type = data.get("type") or data.get("action_type")
+        if hasattr(raw_type, "value"):
+            raw_type = raw_type.value
+        action_type = str(raw_type or "").strip().lower()
+        target_actions = {
+            "click",
+            "double_click",
+            "right_click",
+            "middle_click",
+            "mouse_down",
+            "mouse_up",
+        }
+        if action_type not in target_actions:
+            return None
+
+        metadata = params.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return (
+                f"{action_type} rejected: target validation metadata "
+                "is missing."
+            )
+        validation = metadata.get("target_validation")
+        if not isinstance(validation, Mapping):
+            return (
+                f"{action_type} rejected: no detected target was matched."
+            )
+
+        target_text = str(validation.get("target_text", "")).strip()
+        bbox = validation.get("matched_bbox")
+        x = params.get("x")
+        y = params.get("y")
+        if not target_text:
+            return f"{action_type} rejected: target_text is missing."
+        if x is None or y is None:
+            return f"{action_type} rejected: coordinates are missing."
+        try:
+            x_int, y_int = int(x), int(y)
+        except (TypeError, ValueError):
+            return (
+                f"{action_type} rejected: coordinates must be integers."
+            )
+        if not self._point_in_bbox(x_int, y_int, bbox):
+            return (
+                f"{action_type} rejected: ({x_int}, {y_int}) is outside "
+                f"target {target_text!r} bbox={bbox}."
+            )
+        return None
+
     async def _execute(self, context: ChainState) -> ChainState:
         state = context["agent_state"]
+        validation_error = self._validate_action_target(state)
+
+        if validation_error:
+            target_rejection_count = (
+                int(state.metadata.get("target_rejection_count", 0)) + 1
+            )
+            state.metadata["target_rejection_count"] = target_rejection_count
+
+            state.add_history(
+                event_type="action_rejected",
+                message=validation_error,
+                status=ResultStatus.RETRY,
+                metadata={
+                    "rejection_count": target_rejection_count,
+                    "max_rejections": 2,
+                },
+            )
+
+            if target_rejection_count > 2:
+                return self._fail_update(
+                    state,
+                    (
+                        "Target validation failed repeatedly: "
+                        f"{validation_error}"
+                    ),
+                )
+
+            return {
+                "agent_state": state,
+                "stage": ChainStage.OBSERVE.value,
+                "chain_error": validation_error,
+            }
+
+        # 目标校验成功，清零连续拒绝次数
+        state.metadata["target_rejection_count"] = 0
+
         result = await self.tools.acall(
-            "execute_action", {"action": state.latest_action}
+            "execute_action",
+            {"action": state.latest_action},
         )
+
         if not result.succeeded and not self.config.fail_on_execution_error:
             result.status = ResultStatus.RETRY
             if result.error is not None:
                 result.error.retryable = True
+
         state.update_execution_result(result)
+
         if state.is_terminal:
-            return {"agent_state": state, "stage": ChainStage.FAIL.value}
-        stage = ChainStage.OBSERVE_AFTER if result.succeeded else ChainStage.REFLECT
-        return {"agent_state": state, "stage": stage.value}
+            return {
+                "agent_state": state,
+                "stage": ChainStage.FAIL.value,
+            }
+
+        stage = (
+            ChainStage.OBSERVE_AFTER
+            if result.succeeded
+            else ChainStage.REFLECT
+        )
+
+        return {
+            "agent_state": state,
+            "stage": stage.value,
+        }
 
     async def _observe_after(self, context: ChainState) -> ChainState:
         state = context["agent_state"]

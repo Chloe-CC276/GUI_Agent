@@ -97,6 +97,34 @@ class PerceptionResult:
             "elapsed_time_seconds": self.elapsed_time,
             **self.metadata,
         }
+
+    def target_candidates(self) -> list[dict[str, Any]]:
+        """Return serializable element data used by Planner target matching."""
+        candidates: list[dict[str, Any]] = []
+        for index, element in enumerate(self.merged_elements):
+            candidates.append(
+                {
+                    "element_id": index,
+                    "text": str(getattr(element, "text", "") or ""),
+                    "label": str(getattr(element, "label", "") or ""),
+                    "name": str(getattr(element, "name", "") or ""),
+                    "element_type": str(
+                        getattr(element, "element_type", "") or ""
+                    ),
+                    "bbox": [
+                        int(round(float(value)))
+                        for value in element.bbox
+                    ],
+                    "center": [
+                        int(round(float(value)))
+                        for value in element.center
+                    ],
+                    "confidence": float(
+                        getattr(element, "confidence", 0.0) or 0.0
+                    ),
+                }
+            )
+        return candidates
     
 
 class PerceptionPipeline:
@@ -116,17 +144,8 @@ class PerceptionPipeline:
         self.screen_capture = screen_capture or ScreenCapture()
         self.image_processor = image_processor or ImageProcessor()
 
-        self.ocr_engine = ocr_engine or PaddleOCREngine(
-            lang="ch",
-            confidence_threshold=0.50,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            use_gpu=False,
-            sort_results=True,
-        )
-
-        self.ui_detector = ui_detector or UIDetector()
+        self.ocr_engine = ocr_engine
+        self.ui_detector = ui_detector
 
         self.enable_preprocessing = enable_preprocessing
         self.enable_ocr = enable_ocr
@@ -193,6 +212,16 @@ class PerceptionPipeline:
         ocr_elements: list[GUIElement] = []
 
         if use_ocr:
+            if self.ocr_engine is None:
+                self.ocr_engine = PaddleOCREngine(
+                    lang="ch",
+                    confidence_threshold=0.50,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    use_gpu=False,
+                    sort_results=True,
+                )
             ocr_elements = self.ocr_engine.detect(processed_image)
 
             if coordinate_offset != (0, 0):
@@ -205,6 +234,8 @@ class PerceptionPipeline:
         ui_elements: list[GUIElement] = []
 
         if use_ui_detection:
+            if self.ui_detector is None:
+                self.ui_detector = UIDetector()
             local_ocr_elements = ocr_elements
 
             if coordinate_offset != (0, 0):
@@ -257,6 +288,7 @@ class PerceptionPipeline:
             elapsed_time=elapsed_time,
             metadata=metadata,
         )
+        result.metadata["target_candidates"] = result.target_candidates()
 
         logger.info(
             "Perception pipeline completed: OCR=%d, UI=%d, merged=%d, "
@@ -313,12 +345,34 @@ class PerceptionPipeline:
         Find GUI elements by recognized text.
         """
 
-        return self.ui_detector.find_by_text(
-            elements=result.merged_elements,
-            query=query,
-            exact_match=exact_match,
-            case_sensitive=case_sensitive,
+        if not query or not query.strip():
+            return []
+        expected = (
+            query.strip()
+            if case_sensitive
+            else query.strip().casefold()
         )
+        matches: list[GUIElement] = []
+        for element in result.merged_elements:
+            labels = (
+                getattr(element, "text", ""),
+                getattr(element, "label", ""),
+                getattr(element, "name", ""),
+                getattr(element, "element_type", ""),
+            )
+            for label in labels:
+                candidate = str(label or "").strip()
+                if not case_sensitive:
+                    candidate = candidate.casefold()
+                matched = (
+                    candidate == expected
+                    if exact_match
+                    else expected in candidate or candidate in expected
+                )
+                if candidate and matched:
+                    matches.append(element)
+                    break
+        return matches
 
     def find_by_type(
         self,
@@ -335,10 +389,13 @@ class PerceptionPipeline:
             else result.merged_elements
         )
 
-        return self.ui_detector.find_by_type(
-            elements=source_elements,
-            element_type=element_type,
-        )
+        expected = element_type.strip().casefold()
+        return [
+            element
+            for element in source_elements
+            if str(getattr(element, "element_type", "")).casefold()
+            == expected
+        ]
 
     # 根据文本匹配与最高置信度寻找元素
     def find_best_text_match(

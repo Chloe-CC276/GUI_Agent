@@ -201,7 +201,7 @@ class PlannerConfig:
     retry_on_action_error: bool = False
 
     temperature: float = 0.0
-    max_tokens: int | None = 1200
+    max_tokens: int | None = 400
     timeout_seconds: float | None = None
 
     include_screenshot: bool = True
@@ -744,7 +744,12 @@ class Planner:
             "Your job is to inspect the current task, current GUI observation, "
             "and recent history, then select exactly one safe next action. "
             "Prefer visible evidence from OCR and GUI elements. "
-            "Use coordinates only when they are supported by the observation. "
+            "Every click-like coordinate action must include target_text. "
+            "Select target_text from detected OCR or GUI elements. "
+            "Never guess final click coordinates from the screenshot alone. "
+            "The planner will replace proposed coordinates with the center "
+            "of the matched detected element. "
+            "If the target is not detected, return retry. "
             "If the task is already complete, return a finish decision. "
             "If the observation is insufficient, request retry rather than "
             "guessing. "
@@ -757,8 +762,9 @@ class Planner:
             "action": {
                 "type": "required only when decision=act",
                 "parameters": {
-                    "x": "integer when required",
-                    "y": "integer when required",
+                    "target_text": "visible target text or detected element label",
+                    "x": "optional integer proposed by VLM",
+                    "y": "optional integer proposed by VLM",
                     "dx": "integer when required",
                     "dy": "integer when required",
                     "button": "left | right | middle",
@@ -1622,6 +1628,11 @@ class Planner:
                     params,
                     state,
                 )
+                params = self._resolve_target_coordinates(
+                    action_type=action_type,
+                    params=params,
+                    state=state,
+                )
 
         if action_type in relative_actions:
             params["dx"] = self._required_integer(
@@ -1814,6 +1825,117 @@ class Planner:
             raise PlannerValidationError(
                 f"y={y} is outside screen height {height}."
             )
+
+        return params
+
+    CLICK_ACTIONS = {
+        "click",
+        "double_click",
+        "right_click",
+        "middle_click",
+        "mouse_down",
+        "mouse_up",
+    }
+
+
+    @staticmethod
+    def _point_in_bbox(
+        x: int,
+        y: int,
+        bbox: tuple[int, int, int, int],
+    ) -> bool:
+        left, top, right, bottom = bbox
+        return left <= x <= right and top <= y <= bottom
+
+
+    def _resolve_target_coordinates(
+        self,
+        action_type: str,
+        params: dict[str, Any],
+        state: AgentState,
+    ) -> dict[str, Any]:
+        if action_type not in self.CLICK_ACTIONS:
+            return params
+
+        target_text = str(params.get("target_text", "")).strip()
+        if not target_text:
+            raise PlannerValidationError(
+                "Click action requires target_text; refusing free coordinate guess."
+            )
+
+        observation = state.observation
+        if observation is None:
+            raise PlannerValidationError(
+                "Cannot validate click without an observation."
+            )
+
+        # 请按 ObservationState 的实际字段名调整。
+        elements = getattr(observation, "elements", None)
+        if elements is None:
+            elements = getattr(observation, "gui_elements", None)
+
+        if not elements:
+            raise PlannerValidationError(
+                "No detected GUI elements are available for click validation."
+            )
+
+        target_lower = target_text.casefold()
+
+        matches = [
+            element
+            for element in elements
+            if target_lower in str(getattr(element, "text", "")).casefold()
+        ]
+
+        if not matches:
+            raise PlannerValidationError(
+                f"Target element was not detected: {target_text!r}."
+            )
+
+        # 优先选择置信度最高的匹配框。
+        target = max(
+            matches,
+            key=lambda element: float(
+                getattr(element, "confidence", 0.0)
+            ),
+        )
+
+        left, top, right, bottom = target.bbox
+        original_x = params.get("x")
+        original_y = params.get("y")
+
+        metadata["target_validation"]["proposed_coordinate"] = [
+            original_x,
+            original_y,
+        ]
+
+        metadata["target_validation"]["proposed_coordinate_in_bbox"] = (
+            original_x is not None
+            and original_y is not None
+            and self._point_in_bbox(
+                int(original_x),
+                int(original_y),
+                target.bbox,
+            )
+        )
+        # 无论模型坐标是什么，最终都使用检测框中心点。
+        params["x"] = int((left + right) // 2)
+        params["y"] = int((top + bottom) // 2)
+
+        metadata = params.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        metadata["target_validation"] = {
+            "target_text": target_text,
+            "matched_bbox": [left, top, right, bottom],
+            "coordinate_source": "detected_element_center",
+        }
+
+        params["metadata"] = metadata
+        params.pop("target_text", None)
+        params.pop("matched_bbox", None)
+        params.pop("matched_target", None)
 
         return params
 

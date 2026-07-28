@@ -33,8 +33,8 @@ class CLIError(RuntimeError):
 class CLIConfig:
     model: str = "qwen3-vl-plus"
     region: str = "beijing"
-    max_steps: int = 20
-    max_retries: int = 3
+    max_steps: int = 12
+    max_retries: int = 2
     max_reflections: int = 3
     post_action_wait: float = 0.5
     dry_run: bool = False
@@ -110,7 +110,6 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
         from .tools import AgentTools
         from ..executor.executor import Executor
         from ..model.qwen_vlm import QwenVLM
-        from ..model.base_vlm import VLMGenerationConfig
         from ..perception.perception_pipeline import PerceptionPipeline
     except ImportError as error:
         raise CLIError(
@@ -128,11 +127,16 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
         )
 
     perception = PerceptionPipeline(
-        enable_preprocessing=False,
+        enable_preprocessing=True,
         enable_ocr=True,
         enable_ui_detection=True,
         merge_results=True,
         include_unmatched_ocr=True,
+        preprocess_options={
+            "resize_width": 1280,
+            "resize_height": None,
+            "use_gray": False,
+        },
     )
     executor = Executor(
         dry_run=config.dry_run,
@@ -149,21 +153,13 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
         base_url=os.getenv("DASHSCOPE_BASE_URL"),
         keep_history=False,
         enable_thinking=False,
-        generation_config=VLMGenerationConfig(
-            timeout=90.0,
-            max_retries=1,
-            retry_base_delay=1.0,
-            retry_max_delay=3.0,
-            max_tokens=1200,
-            temperature=0.0,
-        ),
     )
     planner = Planner(
         vlm=_PlannerVLMAdapter(vlm),
         config=PlannerConfig(
             max_attempts=2,
             temperature=0.0,
-            max_tokens=1200,
+            max_tokens=400,
             include_screenshot=True,
             include_previous_observation=True,
             history_limit=10,
@@ -488,11 +484,18 @@ def _planner_action_factory(
     params = dict(parameters)
     if action_type == "wait" and "duration" in params:
         params["seconds"] = params.pop("duration")
+    planner_metadata = params.pop("metadata", {})
+    metadata = (
+        dict(planner_metadata)
+        if isinstance(planner_metadata, Mapping)
+        else {}
+    )
+    metadata["source"] = "agent_cli"
     return {
         "type": action_type,
         **params,
         "description": f"VLM planned action: {action_type}",
-        "metadata": {"source": "agent_cli"},
+        "metadata": metadata,
     }
 
 
