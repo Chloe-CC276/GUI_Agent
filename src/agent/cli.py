@@ -31,8 +31,8 @@ class CLIError(RuntimeError):
 
 @dataclass(slots=True)
 class CLIConfig:
-    model: str = "qwen3-vl-plus"
-    region: str = "beijing"
+    model: str = "qwen3-vl-8b-instruct"
+    region: str = "frankfurt"
     max_steps: int = 12
     max_retries: int = 2
     max_reflections: int = 3
@@ -89,6 +89,14 @@ class AgentRuntime:
                 "每次只规划并执行一个动作",
                 "只能操作当前任务相关的可见界面",
                 "没有视觉证据时应重新感知，不得猜测坐标",
+                (
+                    "点击类动作必须提供检测结果中的 target_text 或 "
+                    "element_id，禁止只提供 x/y"
+                ),
+                (
+                    "打开桌面快捷方式、文件或文件夹使用 double_click；"
+                    "按钮、菜单、标签页和任务栏图标使用 click"
+                ),
             ],
             success_criteria=["通过动作后界面证据确认用户指令已经完成"],
             metadata={"entrypoint": "src.agent.cli", "dry_run": config.dry_run},
@@ -481,8 +489,16 @@ def _planner_action_factory(
     action_type: str,
     parameters: Mapping[str, Any],
 ) -> dict[str, Any]:
+    normalized_type = (
+        str(action_type).strip().lower().replace("-", "_").replace(" ", "_")
+    )
+    normalized_type = {
+        "doubleclick": "double_click",
+        "dblclick": "double_click",
+        "dbl_click": "double_click",
+    }.get(normalized_type, normalized_type)
     params = dict(parameters)
-    if action_type == "wait" and "duration" in params:
+    if normalized_type == "wait" and "duration" in params:
         params["seconds"] = params.pop("duration")
     planner_metadata = params.pop("metadata", {})
     metadata = (
@@ -492,9 +508,9 @@ def _planner_action_factory(
     )
     metadata["source"] = "agent_cli"
     return {
-        "type": action_type,
+        "type": normalized_type,
         **params,
-        "description": f"VLM planned action: {action_type}",
+        "description": f"VLM planned action: {normalized_type}",
         "metadata": metadata,
     }
 
@@ -592,8 +608,8 @@ def _build_file_logger(log_file: str) -> logging.Logger:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GUI Agent command-line interface")
     parser.add_argument("--task", help="执行一次任务后退出")
-    parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen3-vl-plus"))
-    parser.add_argument("--region", default=os.getenv("QWEN_REGION", "beijing"))
+    parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen3-vl-8b-instruct"))
+    parser.add_argument("--region", default=os.getenv("QWEN_REGION", "frankfurt"))
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--max-reflections", type=int, default=3)

@@ -194,14 +194,14 @@ class PlannerConfig:
         InvalidResponsePolicy.RETRY
     )
 
-    max_attempts: int = 1
+    max_attempts: int = 2
     retry_on_empty_response: bool = True
     retry_on_parse_error: bool = True
     retry_on_validation_error: bool = True
     retry_on_action_error: bool = False
 
     temperature: float = 0.0
-    max_tokens: int | None = 400
+    max_tokens: int | None = 1200
     timeout_seconds: float | None = None
 
     include_screenshot: bool = True
@@ -744,11 +744,13 @@ class Planner:
             "Your job is to inspect the current task, current GUI observation, "
             "and recent history, then select exactly one safe next action. "
             "Prefer visible evidence from OCR and GUI elements. "
-            "Every click-like coordinate action must include target_text. "
-            "Select target_text from detected OCR or GUI elements. "
-            "Never guess final click coordinates from the screenshot alone. "
-            "The planner will replace proposed coordinates with the center "
-            "of the matched detected element. "
+            "For click, double_click, right_click and middle_click, provide "
+            "either target_text or element_id from the detected elements; "
+            "providing both is preferred when both are known. "
+            "Never return x/y alone for a click-like action. "
+            "Use double_click to open a desktop shortcut, file or folder; "
+            "use click for buttons, menus, tabs, taskbar icons and focus. "
+            "The planner resolves the selected element to its detected center. "
             "If the target is not detected, return retry. "
             "If the task is already complete, return a finish decision. "
             "If the observation is insufficient, request retry rather than "
@@ -762,9 +764,16 @@ class Planner:
             "action": {
                 "type": "required only when decision=act",
                 "parameters": {
-                    "target_text": "visible target text or detected element label",
-                    "x": "optional integer proposed by VLM",
-                    "y": "optional integer proposed by VLM",
+                    "target_text": (
+                        "visible OCR text or GUI label; accepted together "
+                        "with or instead of element_id"
+                    ),
+                    "element_id": (
+                        "integer id copied from detected elements; accepted "
+                        "together with or instead of target_text"
+                    ),
+                    "x": "do not use alone for click-like actions",
+                    "y": "do not use alone for click-like actions",
                     "dx": "integer when required",
                     "dy": "integer when required",
                     "button": "left | right | middle",
@@ -806,6 +815,13 @@ class Planner:
             f"Validation error: {type(error).__name__}: {error}\n"
             f"Previous response: {raw_text or '<empty>'}\n\n"
             "Return a corrected JSON object only. Do not add commentary."
+            "\nFor click-like actions use target_text or element_id, never "
+            "x/y alone. Use double_click for desktop shortcuts, files and "
+            "folders. Example: "
+            '{"decision":"act","action":{"type":"double_click",'
+            '"parameters":{"target_text":"Microsoft Edge",'
+            '"element_id":41}},"reason":"open desktop shortcut",'
+            '"confidence":0.95}'
         )
 
     # --------------------------------------------------------
@@ -1256,15 +1272,6 @@ class Planner:
     ) -> ParsedPlannerOutput:
         raw = dict(data)
         decision = self._normalize_decision(raw)
-        # 坐标诊断
-        action_type, parameters = self._normalize_action(raw)
-
-        print(
-            "[坐标诊断] VLM原始动作:",
-            action_type,
-            parameters,
-        )
-        #
 
         reason = self._optional_text(
             raw.get("reason")
@@ -1462,15 +1469,6 @@ class Planner:
                     }
                 }
 
-            x_value = result.get("x")
-            if (
-                isinstance(x_value, (list, tuple))
-                and len(x_value) == 2
-                and "y" not in result
-            ):
-                result["x"] = x_value[0]
-                result["y"] = x_value[1]
-
             if action_type is None:
                 raise PlannerValidationError(
                     "Action object requires type."
@@ -1550,6 +1548,9 @@ class Planner:
             "tap": "click",
             "left_click": "click",
             "doubleclick": "double_click",
+            "double-click": "double_click",
+            "dblclick": "double_click",
+            "dbl_click": "double_click",
             "rightclick": "right_click",
             "middleclick": "middle_click",
             "move": "move_to",
@@ -1628,11 +1629,12 @@ class Planner:
                     params,
                     state,
                 )
-                params = self._resolve_target_coordinates(
-                    action_type=action_type,
-                    params=params,
-                    state=state,
-                )
+
+        params = self._resolve_action_target(
+            action_type=action_type,
+            params=params,
+            state=state,
+        )
 
         if action_type in relative_actions:
             params["dx"] = self._required_integer(
@@ -1789,6 +1791,249 @@ class Planner:
 
         return params
 
+    @staticmethod
+    def _point_in_bbox(
+        x: int,
+        y: int,
+        bbox: Sequence[int | float],
+    ) -> bool:
+        if len(bbox) != 4:
+            return False
+        left, top, right, bottom = bbox
+        return left <= x <= right and top <= y <= bottom
+
+    @staticmethod
+    def _element_value(element: Any, name: str, default: Any = None) -> Any:
+        if isinstance(element, Mapping):
+            return element.get(name, default)
+        return getattr(element, name, default)
+
+    @classmethod
+    def _observation_elements(cls, observation: Any) -> list[Any]:
+        for name in (
+            "elements",
+            "merged_elements",
+            "gui_elements",
+            "ocr_elements",
+        ):
+            value = getattr(observation, name, None)
+            if isinstance(value, Sequence) and not isinstance(
+                value, (str, bytes, bytearray)
+            ):
+                return list(value)
+
+        metadata = getattr(observation, "metadata", None)
+        if isinstance(metadata, Mapping):
+            for name in (
+                "target_candidates",
+                "elements",
+                "merged_elements",
+                "gui_elements",
+                "ocr_elements",
+            ):
+                value = metadata.get(name)
+                if isinstance(value, Sequence) and not isinstance(
+                    value, (str, bytes, bytearray)
+                ):
+                    return list(value)
+        return []
+
+    @staticmethod
+    def _normalize_target_text(value: Any) -> str:
+        return " ".join(str(value or "").casefold().split())
+
+    def _resolve_action_target(
+        self,
+        *,
+        action_type: str,
+        params: dict[str, Any],
+        state: AgentState,
+    ) -> dict[str, Any]:
+        target_actions = {
+            "click",
+            "double_click",
+            "right_click",
+            "middle_click",
+            "mouse_down",
+            "mouse_up",
+        }
+        if action_type not in target_actions:
+            return params
+
+        target_text = str(params.get("target_text", "")).strip()
+        raw_element_id = params.get("element_id")
+        element_id: int | None = None
+        if raw_element_id is not None:
+            element_id = self._coerce_integer(raw_element_id, "element_id")
+            if element_id < 0:
+                raise PlannerValidationError(
+                    "element_id must be a non-negative integer."
+                )
+
+        if not target_text and element_id is None:
+            raise PlannerValidationError(
+                f"{action_type} requires target_text or element_id; "
+                "free coordinate guessing is not allowed."
+            )
+
+        observation = state.observation
+        if observation is None:
+            raise PlannerValidationError(
+                "Cannot validate a target without an observation."
+            )
+
+        elements = self._observation_elements(observation)
+        if not elements:
+            raise PlannerValidationError(
+                "Observation contains no detected target elements."
+            )
+
+        target: Any | None = None
+        resolved_element_id: int | None = None
+
+        if element_id is not None:
+            for index, element in enumerate(elements):
+                candidate_id = self._element_value(
+                    element, "element_id", index
+                )
+                try:
+                    candidate_id = self._coerce_integer(
+                        candidate_id, "detected element_id"
+                    )
+                except PlannerValidationError:
+                    continue
+                if candidate_id == element_id:
+                    target = element
+                    resolved_element_id = candidate_id
+                    break
+            if target is None:
+                raise PlannerValidationError(
+                    f"element_id={element_id} is not present in the "
+                    "current detected elements."
+                )
+
+        if target is None and target_text:
+            expected = self._normalize_target_text(target_text)
+            matches: list[tuple[int, float, int, Any]] = []
+            for index, element in enumerate(elements):
+                labels = [
+                    self._element_value(element, "text", ""),
+                    self._element_value(element, "label", ""),
+                    self._element_value(element, "name", ""),
+                    self._element_value(element, "element_type", ""),
+                ]
+                normalized_labels = [
+                    self._normalize_target_text(label)
+                    for label in labels
+                    if self._normalize_target_text(label)
+                ]
+                score = 0
+                if expected in normalized_labels:
+                    score = 3
+                elif any(
+                    expected in label or label in expected
+                    for label in normalized_labels
+                ):
+                    score = 2
+                elif any(
+                    set(expected.split()) <= set(label.split())
+                    for label in normalized_labels
+                ):
+                    score = 1
+                if score:
+                    confidence = float(
+                        self._element_value(
+                            element, "confidence", 0.0
+                        ) or 0.0
+                    )
+                    candidate_id = self._element_value(
+                        element, "element_id", index
+                    )
+                    try:
+                        candidate_id = self._coerce_integer(
+                            candidate_id, "detected element_id"
+                        )
+                    except PlannerValidationError:
+                        candidate_id = index
+                    matches.append(
+                        (score, confidence, candidate_id, element)
+                    )
+
+            if not matches:
+                raise PlannerValidationError(
+                    f"Target element was not detected: {target_text!r}."
+                )
+            _, _, resolved_element_id, target = max(
+                matches, key=lambda item: (item[0], item[1])
+            )
+
+        if target is None:
+            raise PlannerValidationError("No detected target was resolved.")
+
+        target_labels = [
+            self._element_value(target, "text", ""),
+            self._element_value(target, "label", ""),
+            self._element_value(target, "name", ""),
+        ]
+        detected_text = next(
+            (str(value).strip() for value in target_labels if str(value).strip()),
+            "",
+        )
+        if not target_text:
+            target_text = detected_text or f"element_{resolved_element_id}"
+        elif element_id is not None and detected_text:
+            expected = self._normalize_target_text(target_text)
+            actual = self._normalize_target_text(detected_text)
+            if expected not in actual and actual not in expected:
+                raise PlannerValidationError(
+                    f"target_text={target_text!r} does not match "
+                    f"element_id={element_id} text={detected_text!r}."
+                )
+        bbox_value = self._element_value(target, "bbox")
+        if not isinstance(bbox_value, Sequence) or len(bbox_value) != 4:
+            raise PlannerValidationError(
+                f"Detected target {target_text!r} has no valid bbox."
+            )
+
+        try:
+            bbox = tuple(int(round(float(value))) for value in bbox_value)
+        except (TypeError, ValueError) as error:
+            raise PlannerValidationError(
+                f"Detected target {target_text!r} has an invalid bbox."
+            ) from error
+
+        left, top, right, bottom = bbox
+        if right < left or bottom < top:
+            raise PlannerValidationError(
+                f"Detected target {target_text!r} has an inverted bbox={bbox}."
+            )
+
+        params["x"] = (left + right) // 2
+        params["y"] = (top + bottom) // 2
+        params.pop("target_text", None)
+        params.pop("element_id", None)
+        validation = {
+            "target_text": target_text,
+            "element_id": resolved_element_id,
+            "matched_bbox": list(bbox),
+            "coordinate_source": "detected_element_center",
+        }
+        existing_metadata = params.get("metadata")
+        metadata = (
+            dict(existing_metadata)
+            if isinstance(existing_metadata, Mapping)
+            else {}
+        )
+        metadata["target_validation"] = validation
+        params["metadata"] = metadata
+
+        params = self._validate_absolute_coordinates(params, state)
+        if not self._point_in_bbox(params["x"], params["y"], bbox):
+            raise PlannerValidationError(
+                "Resolved center is outside the matched target bbox."
+            )
+        return params
+
     def _validate_absolute_coordinates(
         self,
         params: dict[str, Any],
@@ -1825,117 +2070,6 @@ class Planner:
             raise PlannerValidationError(
                 f"y={y} is outside screen height {height}."
             )
-
-        return params
-
-    CLICK_ACTIONS = {
-        "click",
-        "double_click",
-        "right_click",
-        "middle_click",
-        "mouse_down",
-        "mouse_up",
-    }
-
-
-    @staticmethod
-    def _point_in_bbox(
-        x: int,
-        y: int,
-        bbox: tuple[int, int, int, int],
-    ) -> bool:
-        left, top, right, bottom = bbox
-        return left <= x <= right and top <= y <= bottom
-
-
-    def _resolve_target_coordinates(
-        self,
-        action_type: str,
-        params: dict[str, Any],
-        state: AgentState,
-    ) -> dict[str, Any]:
-        if action_type not in self.CLICK_ACTIONS:
-            return params
-
-        target_text = str(params.get("target_text", "")).strip()
-        if not target_text:
-            raise PlannerValidationError(
-                "Click action requires target_text; refusing free coordinate guess."
-            )
-
-        observation = state.observation
-        if observation is None:
-            raise PlannerValidationError(
-                "Cannot validate click without an observation."
-            )
-
-        # 请按 ObservationState 的实际字段名调整。
-        elements = getattr(observation, "elements", None)
-        if elements is None:
-            elements = getattr(observation, "gui_elements", None)
-
-        if not elements:
-            raise PlannerValidationError(
-                "No detected GUI elements are available for click validation."
-            )
-
-        target_lower = target_text.casefold()
-
-        matches = [
-            element
-            for element in elements
-            if target_lower in str(getattr(element, "text", "")).casefold()
-        ]
-
-        if not matches:
-            raise PlannerValidationError(
-                f"Target element was not detected: {target_text!r}."
-            )
-
-        # 优先选择置信度最高的匹配框。
-        target = max(
-            matches,
-            key=lambda element: float(
-                getattr(element, "confidence", 0.0)
-            ),
-        )
-
-        left, top, right, bottom = target.bbox
-        original_x = params.get("x")
-        original_y = params.get("y")
-
-        metadata["target_validation"]["proposed_coordinate"] = [
-            original_x,
-            original_y,
-        ]
-
-        metadata["target_validation"]["proposed_coordinate_in_bbox"] = (
-            original_x is not None
-            and original_y is not None
-            and self._point_in_bbox(
-                int(original_x),
-                int(original_y),
-                target.bbox,
-            )
-        )
-        # 无论模型坐标是什么，最终都使用检测框中心点。
-        params["x"] = int((left + right) // 2)
-        params["y"] = int((top + bottom) // 2)
-
-        metadata = params.get("metadata", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-
-        metadata["target_validation"] = {
-            "target_text": target_text,
-            "matched_bbox": [left, top, right, bottom],
-            "coordinate_source": "detected_element_center",
-        }
-
-        params["metadata"] = metadata
-        params.pop("target_text", None)
-        params.pop("matched_bbox", None)
-        params.pop("matched_target", None)
 
         return params
 

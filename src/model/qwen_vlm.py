@@ -187,11 +187,11 @@ class QwenVLM(BaseVLM):
 
     def __init__(
         self,
-        model: str = "qwen3-vl-plus",
+        model: str = "qwen3-vl-8b-instruct",
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        region: str = "beijing",
+        region: str = "frankfurt",
         workspace_id: str | None = None,
         default_system_prompt: str | None = None,
         generation_config: VLMGenerationConfig | None = None,
