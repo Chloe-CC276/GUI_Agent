@@ -33,7 +33,7 @@ class CLIError(RuntimeError):
 
 @dataclass(slots=True)
 class CLIConfig:
-    model: str = "qwen3-vl-8b-instruct"
+    model: str = "qwen3-vl-plus"
     region: str = "frankfurt"
     max_steps: int = 12
     max_retries: int = 2
@@ -143,9 +143,15 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
         merge_results=True,
         include_unmatched_ocr=True,
         preprocess_options={
-            "resize_width": 1280,
+            "resize_width": None,
             "resize_height": None,
             "use_gray": False,
+            "use_gaussian": False,
+            "use_median": False,
+            "use_binary": False,
+            "use_adaptive": False,
+            "use_clahe": False,
+            "use_sharpen": False,
         },
     )
     executor = Executor(
@@ -351,16 +357,20 @@ class AgentCLI:
                             ),
                         )
                         self.logger.info(
-                            "task=%r attempt=%d stage=%s step=%s "
-                            "elapsed=%.3fs usage=%s detail=%s context=%s",
+                            "task=%r | attempt=%d/%d | step=%s | "
+                            "completed=%s | current=%s | elapsed=%.3fs | "
+                            "tokens=%d/%d/%d | %s",
                             task,
                             attempt,
-                            stage,
+                            attempts,
                             step,
+                            stage,
+                            next_stage,
                             stage_elapsed,
-                            usage,
-                            detail,
-                            json.dumps(_json_value(context), ensure_ascii=False),
+                            usage["input_tokens"],
+                            usage["output_tokens"],
+                            usage["total_tokens"],
+                            detail or "无附加信息",
                         )
                         _flush_logs()
                     result = final_state.to_run_result()
@@ -838,7 +848,7 @@ def _flush_logs() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GUI Agent command-line interface")
     parser.add_argument("--task", help="执行一次任务后退出")
-    parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen3-vl-8b-instruct"))
+    parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen3-vl-plus"))
     parser.add_argument("--region", default=os.getenv("QWEN_REGION", "frankfurt"))
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--max-retries", type=int, default=3)

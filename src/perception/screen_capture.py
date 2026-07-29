@@ -5,67 +5,50 @@ screen_capture.py
 
 """
 
+import logging
 from pathlib import Path
+from typing import Any
 
 import cv2
 import mss
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
+
 class ScreenCapture:
-    def __init__(self):
+    def __init__(self, monitor_id: int = 1):
         self.sct = mss.mss()    # 初始化显示系统
         # self.monitors[0] 拼接显示器大屏
         # self.monitors[1] 主显示器
         # self.monitors[2] 副显示器
         self.monitors = self.sct.monitors   # 监测显示器数量
+        self.monitor_id = self._validate_monitor_id(monitor_id)
 
 
     # 捕获整个屏幕，返回ndarray
     def capture_screen(self) -> np.ndarray:
-        virtual = self.monitors[0]
-        primary = self.monitors[1]
+        monitor = self.monitors[self.monitor_id]
+        screenshot = self.sct.grab(monitor)
 
-        screenshot = self.sct.grab(virtual)
         img = np.array(screenshot)
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR) # 色彩转换
 
-        h, w = img.shape[:2]
-
-        print("\n[坐标诊断]")
-        print(f"MSS virtual monitor: {virtual}")
-        print(f"MSS primary monitor: {primary}")
-        print(f"Screenshot array: {w}x{h}")
-
-        try:
-            import pyautogui
-            size = pyautogui.size()
-            position = pyautogui.position()
-            print(f"PyAutoGUI screen: {size.width}x{size.height}")
-            print(f"PyAutoGUI cursor: ({position.x}, {position.y})")
-            print(
-                f"Scale screenshot/executor: "
-                f"x={w / size.width:.4f}, "
-                f"y={h / size.height:.4f}"
-            )
-        except Exception as error:
-            print(f"PyAutoGUI diagnosis failed: {error}")
-
-        try:
-            import ctypes
-
-            dpi = ctypes.windll.user32.GetDpiForSystem()
-            print(f"Windows system DPI: {dpi}")
-            print(f"Windows DPI scale: {dpi / 96:.2f}")
-        except Exception as error:
-            print(f"DPI diagnosis failed: {error}")
-
+        logger.info(
+            "Screen captured: monitor_id=%s origin=(%s,%s) size=%sx%s",
+            self.monitor_id,
+            monitor["left"],
+            monitor["top"],
+            monitor["width"],
+            monitor["height"],
+        )
         return img
     
 
     # 捕获指定监视器
     def capture_monitor(self, monitor_id: int = 1) -> np.ndarray:
-        if monitor_id >= len(self.monitors):
-            raise ValueError("Monitor ID does not exist.")
+        monitor_id = self._validate_monitor_id(monitor_id)
 
         screenshot = self.sct.grab(self.monitors[monitor_id])
 
@@ -133,6 +116,36 @@ class ScreenCapture:
     # 获取屏幕分辨率
     def get_screen_size(self):
 
-        monitor = self.monitors[1]
+        monitor = self.monitors[self.monitor_id]
 
         return monitor["width"], monitor["height"]
+
+    def get_monitor_geometry(self) -> dict[str, int]:
+        monitor = self.monitors[self.monitor_id]
+        return {
+            "left": int(monitor["left"]),
+            "top": int(monitor["top"]),
+            "width": int(monitor["width"]),
+            "height": int(monitor["height"]),
+        }
+
+    def screenshot_to_screen(
+        self,
+        x: int | float,
+        y: int | float,
+    ) -> tuple[int, int]:
+        monitor = self.monitors[self.monitor_id]
+        return (
+            int(round(float(x) + monitor["left"])),
+            int(round(float(y) + monitor["top"])),
+        )
+
+    def _validate_monitor_id(self, monitor_id: Any) -> int:
+        if isinstance(monitor_id, bool) or not isinstance(monitor_id, int):
+            raise TypeError("monitor_id must be an integer.")
+        if monitor_id <= 0 or monitor_id >= len(self.monitors):
+            raise ValueError(
+                f"Monitor ID {monitor_id} does not exist; valid IDs are "
+                f"1..{len(self.monitors) - 1}."
+            )
+        return monitor_id

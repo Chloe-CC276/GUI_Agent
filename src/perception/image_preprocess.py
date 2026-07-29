@@ -159,7 +159,7 @@ class ImageProcessor(BaseImageProcessor):
         image: np.ndarray,
         resize_width=None,
         resize_height=None,
-        use_gray=True,
+        use_gray=False,
         use_gaussian=False,
         use_median=False,
         use_binary=False,
@@ -168,6 +168,9 @@ class ImageProcessor(BaseImageProcessor):
         use_sharpen=False,
     ) -> np.ndarray:
         
+        if not isinstance(image, np.ndarray) or image.size == 0:
+            raise ValueError("image must be a non-empty numpy array.")
+
         result = image.copy()
 
         # Resize

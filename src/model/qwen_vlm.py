@@ -187,7 +187,7 @@ class QwenVLM(BaseVLM):
 
     def __init__(
         self,
-        model: str = "qwen3-vl-8b-instruct",
+        model: str = "qwen3-vl-plus",
         *,
         api_key: str | None = None,
         base_url: str | None = None,

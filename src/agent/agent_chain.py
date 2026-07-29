@@ -422,11 +422,44 @@ class AgentChain:
             )
 
         target_text = str(validation.get("target_text", "")).strip()
+        matched_text = str(
+            validation.get("matched_text")
+            or validation.get("detected_text")
+            or ""
+        ).strip()
         bbox = validation.get("matched_bbox")
         x = params.get("x")
         y = params.get("y")
         if not target_text:
             return f"{action_type} rejected: target_text is missing."
+        if target_text.casefold().startswith("element_"):
+            return (
+                f"{action_type} rejected: placeholder target "
+                f"{target_text!r} is not a semantic GUI label."
+            )
+
+        if matched_text:
+            def normalize_text(value: str) -> str:
+                return re.sub(
+                    r"[^0-9a-z\u4e00-\u9fff]+",
+                    "",
+                    value.casefold(),
+                )
+
+            expected_text = normalize_text(target_text)
+            actual_text = normalize_text(matched_text)
+
+            text_matches = (
+                expected_text == actual_text
+                or expected_text in actual_text
+                or actual_text in expected_text
+            )
+
+            if not text_matches:
+                return (
+                    f"{action_type} rejected: target_text={target_text!r} "
+                    f"does not match detected_text={matched_text!r}."
+                )
         if x is None or y is None:
             return f"{action_type} rejected: coordinates are missing."
         try:
@@ -447,6 +480,12 @@ class AgentChain:
         validation_error = self._validate_action_target(state)
 
         if validation_error:
+            logger.warning(
+                "Executor未调用：目标校验失败 | error=%s | action=%r",
+                validation_error,
+                state.latest_action,
+            )
+
             target_rejection_count = (
                 int(state.metadata.get("target_rejection_count", 0)) + 1
             )
@@ -459,16 +498,15 @@ class AgentChain:
                 metadata={
                     "rejection_count": target_rejection_count,
                     "max_rejections": 2,
+                    "action": self._action_mapping(state.latest_action),
                 },
             )
 
             if target_rejection_count > 2:
                 return self._fail_update(
                     state,
-                    (
-                        "Target validation failed repeatedly: "
-                        f"{validation_error}"
-                    ),
+                    "Target validation failed repeatedly: "
+                    f"{validation_error}",
                 )
 
             return {

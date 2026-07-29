@@ -273,7 +273,55 @@ class Executor:
             Action object, action dictionary or JSON string.
         """
 
-        resolved_action = self._resolve_action(action)
+        try:
+            resolved_action = self._resolve_action(action)
+            logger.debug(
+                "Action resolved: type=%s, id=%s",
+                resolved_action.type.value if hasattr(resolved_action, 'type') else 'unknown',
+                resolved_action.action_id if hasattr(resolved_action, 'action_id') else 'unknown',
+            )
+        except Exception as error:
+            logger.error(
+                "Failed to resolve action: %s | action=%r",
+                error,
+                action,
+                exc_info=True,
+            )
+            # 创建一个临时action用于返回错误结果
+            temp_action = action if isinstance(action, Action) else Action(
+                type=ActionType.FAIL,
+                description=f"Failed to resolve action: {error}",
+            )
+            return ExecutionResult(
+                action=temp_action,
+                success=False,
+                status=ActionStatus.FAILED,
+                elapsed_time=0.0,
+                message=f"Failed to resolve action: {error}",
+                error=str(error),
+            )
+
+        try:
+            self._validate_target_before_click(resolved_action)
+            logger.debug(
+                "Target validation passed for action: type=%s",
+                resolved_action.type.value,
+            )
+        except Exception as error:
+            logger.error(
+                "Target validation failed: %s | action=%r",
+                error,
+                resolved_action,
+                exc_info=True,
+            )
+            return ExecutionResult(
+                action=resolved_action,
+                success=False,
+                status=ActionStatus.FAILED,
+                elapsed_time=0.0,
+                message=f"Target validation failed: {error}",
+                error=str(error),
+            )
 
         with self._lock:
             if self._stop_requested:
@@ -294,16 +342,12 @@ class Executor:
                 return result
 
             logger.info(
-                "Executing action: type=%s, id=%s, x=%s, y=%s, "
-                "normalised=(%s,%s), screen=%sx%s, description=%s",
+                "Executing action: type=%s, id=%s, coordinate=(%s,%s), "
+                "description=%s",
                 resolved_action.type.value,
                 resolved_action.action_id,
                 resolved_action.x,
                 resolved_action.y,
-                resolved_action.normalised_x,
-                resolved_action.normalised_y,
-                getattr(self.mouse, "screen_width", None),
-                getattr(self.mouse, "screen_height", None),
                 resolved_action.description,
             )
 
@@ -342,15 +386,6 @@ class Executor:
                     )
 
                 self._record_result(result)
-                logger.info(
-                    "Action completed: type=%s success=%s elapsed=%.3fs "
-                    "requested_xy=(%s,%s)",
-                    resolved_action.type.value,
-                    result.success,
-                    result.elapsed_time,
-                    resolved_action.x,
-                    resolved_action.y,
-                )
                 return result
 
             except Exception as error:
@@ -1142,6 +1177,75 @@ class Executor:
             )
 
         return action.x, action.y
+
+    @staticmethod
+    def _validate_target_before_click(action: Action) -> None:
+        """
+        Executor最终安全检查：确认坐标、bbox及必要字段存在。
+        不重复实施语义校验（已由AgentChain完成）。
+        """
+        click_types = {
+            ActionType.CLICK,
+            ActionType.DOUBLE_CLICK,
+            ActionType.RIGHT_CLICK,
+            ActionType.MIDDLE_CLICK,
+        }
+        if action.type not in click_types:
+            return
+
+        metadata = getattr(action, "metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        validation = metadata.get("target_validation")
+        if not isinstance(validation, dict):
+            return
+
+        target_text = str(validation.get("target_text", "")).strip()
+        # 统一使用matched_text，兼容旧的detected_text
+        matched_text = str(
+            validation.get("matched_text")
+            or validation.get("detected_text")
+            or ""
+        ).strip()
+        element_id = validation.get("element_id")
+        bbox = validation.get("matched_bbox")
+
+        # 基本结构检查
+        if element_id is not None and not matched_text:
+            raise ValueError(
+                f"Refusing {action.type.value}: element_id={element_id} has "
+                "no semantic label and cannot be verified."
+            )
+        if target_text.casefold().startswith("element_"):
+            raise ValueError(
+                f"Refusing {action.type.value}: placeholder target "
+                f"{target_text!r} is not a semantic label."
+            )
+        if bbox is None or action.x is None or action.y is None:
+            return
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            raise ValueError("matched_bbox must contain four coordinates.")
+
+        # 坐标安全检查
+        left, top, right, bottom = (int(value) for value in bbox)
+        x, y = int(action.x), int(action.y)
+        if not (left <= x <= right and top <= y <= bottom):
+            raise ValueError(
+                f"Refusing {action.type.value}: coordinate=({x},{y}) is outside "
+                f"matched_bbox={[left, top, right, bottom]}."
+            )
+
+        logger.info(
+            "Executor final validation passed: action=%s target=%r matched=%r "
+            "element_id=%s coordinate=(%s,%s) bbox=%s",
+            action.type.value,
+            target_text,
+            matched_text,
+            element_id,
+            x,
+            y,
+            [left, top, right, bottom],
+        )
 
     # ------------------------------------------------------------------
     # History and control
