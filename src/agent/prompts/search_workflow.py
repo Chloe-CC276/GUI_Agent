@@ -54,8 +54,10 @@ def search_workflow_rules(
             "Google search、结果页链接或其它无关 Google 文本。"
         )
         verify_paste = (
-            "paste_text 以及用于聚焦地址栏的 hotkey（Ctrl+L / Command+L）由编排层跳过验证；"
-            "若仍收到该类动作，只要执行器成功就将 action_effective 设为 true，并推荐 continue。"
+            "paste_text 写入搜索查询词的步骤由编排层跳过验证；若仍收到该类动作，"
+            "只要执行器成功就将 action_effective 设为 true，并推荐 continue。"
+            "Ctrl+L 聚焦后必须依据动作后观察判定：搜索框存在且下方出现历史/建议下拉"
+            "（空间关联），或框内高亮/光标，即视为聚焦成功。"
         )
         verify_home = (
             "当任务目标包含打开或进入 Google 时，动作后观察若同时出现 Google logo "
@@ -115,9 +117,11 @@ def search_workflow_rules(
         "or unrelated Google text while already on the homepage."
     )
     verify_paste = (
-        "paste_text and address-bar focus hotkeys (Ctrl+L / Command+L) are skipped by "
-        "the orchestrator; if you still see such an action, set action_effective=true on "
-        "executor success and recommend continue."
+        "paste_text of a search query is skipped by the orchestrator; if you still see "
+        "such an action, set action_effective=true on executor success and recommend continue. "
+        "After Ctrl+L, judge focus from the after observation: success when the search box "
+        "exists with a history/suggestion dropdown spatially below it, or when the box shows "
+        "caret/border/background focus chrome."
     )
     verify_home = (
         "When the task involves opening Google, if the after observation shows both the "

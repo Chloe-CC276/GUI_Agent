@@ -143,6 +143,14 @@ def build_observation_context(
         context["element_count"] = total
         context["elements_truncated"] = total > len(formatted)
 
+    metadata = _read(observation, "metadata", default={}) or {}
+    if isinstance(metadata, Mapping) and metadata.get("search_focus_detected"):
+        context["search_focus_detected"] = True
+        context["search_focus_evidence"] = metadata.get("search_focus_evidence")
+        context["focus_next_action_hint"] = (
+            "Address/search box is focused; next action should be paste_text then press enter."
+        )
+
     return _clean_mapping(context)
 
 

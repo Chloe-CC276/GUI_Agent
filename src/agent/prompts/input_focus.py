@@ -3,8 +3,9 @@ prompts/input_focus
 Shared visual-state rules for recognizing a focused search or input box.
 
 Desktop browsers often show a search-history dropdown after a successful focus
-click, while OCR may miss the caret.  Treat the control as focused when at
-least two of the listed visual signals are present together.
+action, while OCR may miss the caret. Treat focus as successful when the
+search/address box exists together with a spatially attached history dropdown,
+or when the box itself shows caret / border / background focus chrome.
 """
 
 from __future__ import annotations
@@ -13,16 +14,16 @@ from .config import PromptLanguage
 
 
 INPUT_FOCUS_SIGNALS_EN: tuple[str, ...] = (
-    "The search or input box is still visible at the expected location.",
+    "The search or address box is visible.",
     "A search-history, suggestion or autocomplete dropdown is visible.",
-    "That dropdown sits directly below the box and is visually attached to it.",
+    "That dropdown sits directly below the box and is horizontally associated with it.",
     "The box shows a caret/cursor, border highlight or background change.",
 )
 
 INPUT_FOCUS_SIGNALS_ZH: tuple[str, ...] = (
-    "搜索框或输入框仍出现在预期位置。",
+    "搜索框或地址栏仍然可见。",
     "出现了搜索历史、建议词或自动补全下拉列表。",
-    "该下拉列表位于搜索框正下方，并与搜索框视觉关联。",
+    "该下拉列表位于搜索框正下方，并与搜索框水平空间关联。",
     "搜索框内出现光标、边框高亮或背景变化。",
 )
 
@@ -33,70 +34,72 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
     """Return bilingual rules that encode the combined focus heuristic."""
 
     if language is PromptLanguage.ZH:
-        signals = INPUT_FOCUS_SIGNALS_ZH
         intro = (
-            "判断搜索框、地址栏或文本输入框是否已被选中/获得焦点时，使用组合视觉状态，"
-            f"不要只依赖能否看到光标。同时检查下列信号，满足任意 "
-            f"{INPUT_FOCUS_MIN_SIGNALS} 项及以上即判定为已选中："
+            "判断搜索框/地址栏是否已获得焦点时，不要只依赖能否看到光标。"
+            "判定成功的标准（满足其一即可）："
+            "（A）搜索框存在，并且出现搜索历史/建议下拉列表，且下拉列表在搜索框下方、"
+            "与搜索框存在空间关联；"
+            "（B）搜索框内出现光标、边框高亮或背景变化。"
+            "辅助信号包括："
             + "；".join(
                 f"（{index}）{signal.rstrip('。')}"
-                for index, signal in enumerate(signals, start=1)
+                for index, signal in enumerate(INPUT_FOCUS_SIGNALS_ZH, start=1)
             )
             + "。"
         )
         verify = (
             "若计划动作是点击搜索框/地址栏/输入框，或 hotkey Ctrl+L / Command+L 聚焦地址栏，"
-            "且动作后观察按上述规则判定为已选中，则将 action_effective 设为 true、status=success；"
-            "不得因为缺少单独光标证据而判定失败。出现历史/建议下拉，或检测元素数量明显增加，"
-            "就是焦点成功的充分证据。"
+            "动作后观察只要满足上述（A）或（B），必须将 action_effective=true、status=success、"
+            "recommended_next=continue；禁止因为缺少单独光标证据而判定失败。"
+            "Edge 地址栏聚焦后常见现象就是历史下拉贴在地址栏下方——这就是成功证据。"
         )
         planner = (
             "浏览器内打开网站或发起搜索时，优先用 hotkey Ctrl+L（macOS 用 Command+L）"
             "聚焦地址栏，不要点击地址栏占位文案，也不要点击历史/建议下拉项；"
-            "若当前观察已按上述规则判定搜索框/地址栏/输入框已选中，下一步应使用 "
-            "paste_text 粘贴完整文本（不要 type_text），然后 press enter 提交；"
-            "不要仅为确认焦点而重复点击同一控件。"
+            "若当前观察已满足焦点成功标准（搜索框+下方历史下拉，或框内高亮/光标），"
+            "下一步必须 paste_text 粘贴完整文本（不要 type_text），然后 press enter；"
+            "不要仅为确认焦点而重复 Ctrl+L 或重复点击同一控件。"
         )
         reflection = (
-            "诊断点击搜索框/输入框是否失败时，必须应用上述组合视觉状态规则；"
-            "出现与搜索框关联的历史下拉列表通常是焦点成功证据，不得单独当作失败或未选中，"
-            "也不得建议去点击下拉列表中的 OCR 噪声行。"
+            "诊断聚焦搜索框/地址栏是否失败时，必须应用上述（A）/（B）标准；"
+            "出现贴在搜索框下方的历史下拉列表是焦点成功证据，不得判为 no_effect，"
+            "也不得建议去点击下拉列表中的 OCR 噪声行；下一策略应是 paste_text。"
         )
         return (intro, verify, planner, reflection)
 
-    signals = INPUT_FOCUS_SIGNALS_EN
     intro = (
-        "When judging whether a search box, address bar or text input is focused, "
-        "use a combined visual state instead of relying on a visible caret alone. "
-        f"Check the following signals and treat the control as focused when at least "
-        f"{INPUT_FOCUS_MIN_SIGNALS} are present together: "
+        "When judging whether a search box or address bar is focused, do not rely on a "
+        "visible caret alone. Treat focus as successful when either "
+        "(A) the search/address box is present and a history/suggestion dropdown appears "
+        "directly below it with horizontal spatial association, or "
+        "(B) the box shows a caret/cursor, border highlight or background change. "
+        "Supporting signals: "
         + "; ".join(
             f"({index}) {signal}"
-            for index, signal in enumerate(signals, start=1)
+            for index, signal in enumerate(INPUT_FOCUS_SIGNALS_EN, start=1)
         )
         + "."
     )
     verify = (
-        "If the planned action was clicking a search box, address bar or input field, "
-        "or hotkey Ctrl+L / Command+L to focus the address bar, and the after observation "
-        "satisfies the combined focus rule above, set action_effective=true and "
-        "status=success; do not mark failure solely because a caret is missing. A "
-        "history/suggestion dropdown or a clear rise in detected element count is "
-        "sufficient evidence of successful focus."
+        "If the planned action was clicking a search/address/input field or hotkey "
+        "Ctrl+L / Command+L, and the after observation satisfies (A) or (B) above, you "
+        "MUST set action_effective=true, status=success and recommended_next=continue. "
+        "Never fail solely because a caret is missing. An Edge history dropdown attached "
+        "under the address bar is success evidence."
     )
     planner = (
         "When opening a site or starting a search in the browser, prefer hotkey Ctrl+L "
         "(Command+L on macOS) to focus the address bar — do not click address-bar "
         "placeholder text or history/suggestion dropdown rows; if the current observation "
-        "already satisfies the combined focus rule for a search box, address bar or input "
-        "field, the next step should be paste_text with the full text (never type_text), "
-        "then press enter; do not re-click the same control only to reconfirm focus."
+        "already satisfies the focus success rule (box + dropdown below, or caret/highlight), "
+        "the next step MUST be paste_text with the full text (never type_text), then press "
+        "enter; do not repeat Ctrl+L or re-click only to reconfirm focus."
     )
     reflection = (
-        "When diagnosing whether a click on a search or input box failed, apply the "
-        "combined focus rule above; a history dropdown attached under the box is usually "
-        "evidence of successful focus, not of failure, and must not be treated as a "
-        "click target for OCR noise rows."
+        "When diagnosing whether address/search focus failed, apply rules (A)/(B) above; "
+        "a history dropdown attached under the box is evidence of successful focus, not "
+        "no_effect, and must not be treated as a click target. The next strategy should "
+        "be paste_text."
     )
     return (intro, verify, planner, reflection)
 

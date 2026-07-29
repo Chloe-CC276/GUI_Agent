@@ -27,7 +27,12 @@ from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
 from .verify_policy import latest_action_type, should_skip_verification
-from .browser_search import apply_focus_verify_override
+from .browser_search import (
+    apply_focus_verify_override,
+    build_focus_success_verify,
+    detect_search_box_focus,
+    is_address_bar_focus_action,
+)
 
 try:
     from .prompts import PromptBuilder, PromptKind
@@ -350,28 +355,68 @@ class AgentGraph:
 
     async def verify_node(self, graph: GraphState) -> GraphState:
         state = graph["agent_state"]
+        prompt = ""
+        raw: Any = None
         try:
-            prompt = self.prompts.build_text(PromptKind.VERIFY, state)
-            data, raw = await self._call_structured(
-                prompt, VERIFY_RESPONSE_SCHEMA, target_kind=PromptKind.VERIFY
-            )
-            self._validate_verify(data)
+            if is_address_bar_focus_action(state.latest_action):
+                detected, evidence = detect_search_box_focus(state.observation)
+                if detected:
+                    data = build_focus_success_verify(
+                        evidence=evidence,
+                        before=state.previous_observation,
+                        after=state.observation,
+                    )
+                    state.add_history(
+                        event_type="verify_focus_detected",
+                        message=str(data["reason"]),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data, "evidence": evidence},
+                    )
+                    if state.observation is not None:
+                        metadata = dict(getattr(state.observation, "metadata", None) or {})
+                        metadata["search_focus_detected"] = True
+                        metadata["search_focus_evidence"] = list(evidence)
+                        state.observation.metadata = metadata
+                else:
+                    prompt = self.prompts.build_text(PromptKind.VERIFY, state)
+                    data, raw = await self._call_structured(
+                        prompt, VERIFY_RESPONSE_SCHEMA, target_kind=PromptKind.VERIFY
+                    )
+                    self._validate_verify(data)
+                    data, overridden = apply_focus_verify_override(
+                        data,
+                        action=state.latest_action,
+                        before=state.previous_observation,
+                        after=state.observation,
+                    )
+                    if overridden:
+                        state.add_history(
+                            event_type="verify_focus_override",
+                            message=str(data.get("reason") or "Focus verify override"),
+                            status=ResultStatus.SUCCESS,
+                            metadata={"verify": data},
+                        )
+            else:
+                prompt = self.prompts.build_text(PromptKind.VERIFY, state)
+                data, raw = await self._call_structured(
+                    prompt, VERIFY_RESPONSE_SCHEMA, target_kind=PromptKind.VERIFY
+                )
+                self._validate_verify(data)
+                data, overridden = apply_focus_verify_override(
+                    data,
+                    action=state.latest_action,
+                    before=state.previous_observation,
+                    after=state.observation,
+                )
+                if overridden:
+                    state.add_history(
+                        event_type="verify_focus_override",
+                        message=str(data.get("reason") or "Focus verify override"),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data},
+                    )
         except Exception as error:
             return self._exception_reflection(state, error, "verification")
-
-        data, overridden = apply_focus_verify_override(
-            data,
-            action=state.latest_action,
-            before=state.previous_observation,
-            after=state.observation,
-        )
-        if overridden:
-            state.add_history(
-                event_type="verify_focus_override",
-                message=str(data.get("reason") or "Focus verify override"),
-                status=ResultStatus.SUCCESS,
-                metadata={"verify": data},
-            )
 
         succeeded = bool(data["action_effective"]) and data["status"] == "success"
         task_complete = bool(data["task_complete"])

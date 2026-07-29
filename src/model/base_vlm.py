@@ -342,56 +342,72 @@ def normalise_image(
     *,
     mime_type: str = "image/png",
     detail: str | None = None,
+    prepare_for_vlm: bool = True,
 ) -> ImageInput:
-    """Convert a supported image value into ``ImageInput``."""
-    if isinstance(image, ImageInput):
-        return image
+    """Convert a supported image value into ``ImageInput``.
 
-    if isinstance(image, bytes):
-        return ImageInput.from_bytes(
+    When ``prepare_for_vlm`` is true (default), large screenshots are downscaled
+    and JPEG-compressed before they become multimodal tokens. OCR/click code
+    should keep using the original capture; only the model-facing payload is
+    prepared here.
+    """
+
+    if isinstance(image, ImageInput):
+        result = image
+    elif isinstance(image, bytes):
+        result = ImageInput.from_bytes(
             image,
             mime_type=mime_type,
             detail=detail,
         )
-
-    if isinstance(image, Path):
-        return ImageInput.from_path(
+    elif isinstance(image, Path):
+        result = ImageInput.from_path(
             image,
             detail=detail,
         )
-
-    if isinstance(image, str):
+    elif isinstance(image, str):
         text = image.strip()
 
         if text.startswith("data:"):
-            return ImageInput.from_data_url(
+            result = ImageInput.from_data_url(
                 text,
                 detail=detail,
             )
-
-        if re.match(r"^https?://", text, flags=re.IGNORECASE):
-            return ImageInput.from_url(
+        elif re.match(r"^https?://", text, flags=re.IGNORECASE):
+            result = ImageInput.from_url(
                 text,
                 detail=detail,
             )
-
-        return ImageInput.from_path(
-            text,
-            detail=detail,
-        )
-
-    if type(image).__module__.startswith("numpy"):
+        else:
+            result = ImageInput.from_path(
+                text,
+                detail=detail,
+            )
+    elif type(image).__module__.startswith("numpy"):
         try:
-            import cv2
-
             if getattr(image, "size", 0) == 0:
                 raise ValueError("NumPy image is empty.")
+
+            if prepare_for_vlm:
+                from .vlm_image_prep import prepare_numpy_image_for_vlm
+
+                prepared = prepare_numpy_image_for_vlm(image)
+                if prepared is not None:
+                    payload, prepared_mime = prepared
+                    return ImageInput.from_bytes(
+                        payload,
+                        mime_type=prepared_mime,
+                        detail=detail or "low",
+                        metadata={"vlm_prepared": True},
+                    )
+
+            import cv2
 
             success, encoded = cv2.imencode(".png", image)
             if not success:
                 raise ValueError("OpenCV failed to encode image.")
 
-            return ImageInput.from_bytes(
+            result = ImageInput.from_bytes(
                 encoded.tobytes(),
                 mime_type="image/png",
                 detail=detail,
@@ -400,14 +416,12 @@ def normalise_image(
             raise TypeError(
                 f"Failed to convert NumPy image: {error}"
             ) from error
-
-    # 支持 PIL.Image
-    if type(image).__module__.startswith("PIL."):
+    elif type(image).__module__.startswith("PIL."):
         try:
             buffer = BytesIO()
             image.save(buffer, format="PNG")
 
-            return ImageInput.from_bytes(
+            result = ImageInput.from_bytes(
                 buffer.getvalue(),
                 mime_type="image/png",
                 detail=detail,
@@ -416,9 +430,45 @@ def normalise_image(
             raise TypeError(
                 f"Failed to convert PIL image: {error}"
             ) from error
+    else:
+        raise TypeError(
+            "image must be ImageInput, str, pathlib.Path, or bytes."
+        )
 
-    raise TypeError(
-        "image must be ImageInput, str, pathlib.Path, or bytes."
+    if prepare_for_vlm:
+        return _prepare_image_input_for_vlm(result, detail=detail)
+    return result
+
+
+def _prepare_image_input_for_vlm(
+    image: ImageInput,
+    *,
+    detail: str | None = None,
+) -> ImageInput:
+    if image.metadata.get("vlm_prepared") or image.metadata.get("skip_vlm_prep"):
+        return image
+    if image.source_type == ImageSourceType.URL:
+        return image
+    try:
+        from .vlm_image_prep import prepare_image_bytes_for_vlm
+
+        raw = image.read_bytes()
+        prepared, prepared_mime = prepare_image_bytes_for_vlm(
+            raw,
+            mime_type=image.mime_type,
+        )
+    except Exception:
+        return image
+
+    metadata = dict(image.metadata)
+    metadata["vlm_prepared"] = True
+    metadata["original_bytes"] = len(raw)
+    metadata["prepared_bytes"] = len(prepared)
+    return ImageInput.from_bytes(
+        prepared,
+        mime_type=prepared_mime,
+        detail=detail or image.detail or "low",
+        metadata=metadata,
     )
 
 

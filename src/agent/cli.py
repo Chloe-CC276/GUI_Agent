@@ -103,7 +103,9 @@ class AgentRuntime:
                     "浏览器搜索按方案 B：先 hotkey Ctrl+L 聚焦地址栏"
                     "（不要点占位文案或下拉建议），paste_text 粘贴 google 后 press enter；"
                     "进入 Google 首页后点击中央搜索框，paste_text 粘贴查询词后 press enter；"
-                    "禁止 type_text，禁止点击地址栏/搜索框下拉列表中的 OCR 噪声行"
+                    "禁止 type_text，禁止点击地址栏/搜索框下拉列表中的 OCR 噪声行；"
+                    "焦点成功标准：搜索框存在且下方出现历史/建议下拉（空间关联），"
+                    "或框内出现光标/边框高亮/背景变化——满足即继续 paste，不要重复聚焦"
                 ),
                 (
                     "Google 首页判定：同时看到 Google logo 与中央搜索框即已进入首页，"
