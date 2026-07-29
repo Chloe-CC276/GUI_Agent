@@ -55,6 +55,14 @@ from .formatters import (
     truncate_text,
 )
 
+from .input_focus import (
+    INPUT_FOCUS_MIN_SIGNALS,
+    INPUT_FOCUS_SIGNALS_EN,
+    INPUT_FOCUS_SIGNALS_ZH,
+    input_focus_rules,
+    input_focus_rules_for,
+)
+
 from .planner_prompt import (
     PlannerPrompt,
     build_planner_messages,
@@ -154,4 +162,10 @@ __all__ = [
     "format_list",
     "format_history_item",
     "format_history",
+    # Input-focus visual-state heuristic.
+    "INPUT_FOCUS_MIN_SIGNALS",
+    "INPUT_FOCUS_SIGNALS_EN",
+    "INPUT_FOCUS_SIGNALS_ZH",
+    "input_focus_rules",
+    "input_focus_rules_for",
 ]

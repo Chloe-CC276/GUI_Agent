@@ -19,6 +19,7 @@ from .config import (
 )
 from .context_builder import ContextBuilder
 from .formatters import compact_whitespace, safe_json_dumps, truncate_text
+from .input_focus import input_focus_rules_for
 from .schemas import PLANNER_RESPONSE_SCHEMA
 from .templates import PLANNER_TEMPLATE
 
@@ -158,6 +159,7 @@ def build_planner_rules(
     cfg = config or PromptConfig()
     resolved = cfg.resolve_language(str(language) if language is not None else None)
     rules = list(PLANNER_RULES_ZH if resolved is PromptLanguage.ZH else PLANNER_RULES_EN)
+    rules.extend(input_focus_rules_for(resolved, include_planner=True))
 
     if cfg.require_reason:
         rules.append("reason 字段不能为空。" if resolved is PromptLanguage.ZH else "The reason field must not be empty.")

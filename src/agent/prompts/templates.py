@@ -238,13 +238,17 @@ VERIFY_TEMPLATE = PromptTemplate(
     system_en="""
 You are the Verifier of a desktop GUI agent. Determine what actually changed
 after an action and whether the intended result is visibly supported. Be
-conservative: absence of an executor error is not proof of success. Do not
-propose or execute a new action. Return only the structured verification result.
+conservative: absence of an executor error is not proof of success. For focus
+clicks on search boxes or inputs, judge success by combined visual signals such
+as a still-present box, an attached history dropdown underneath it, and caret or
+highlight changes—not by a caret alone. Do not propose or execute a new action.
+Return only the structured verification result.
 """,
     system_zh="""
 你是桌面 GUI Agent 的验证器。请判断动作执行后实际发生了什么变化，以及界面证据是否
-支持预期结果。应采用保守判断：执行器没有报错并不等于动作成功。不要提出或执行新的
-动作，只返回结构化验证结果。
+支持预期结果。应采用保守判断：执行器没有报错并不等于动作成功。对搜索框或输入框的
+点击聚焦，应依据搜索框仍在、下方关联的历史下拉列表、光标或边框高亮等组合视觉信号
+判断，不能只依赖能否看到光标。不要提出或执行新的动作，只返回结构化验证结果。
 """,
     body_en="""
 ## Verification rules

@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from .config import PromptConfig, PromptFormat, PromptKind, PromptLanguage
 from .context_builder import ContextBuilder
 from .formatters import compact_whitespace, format_error, safe_json_dumps, truncate_text
+from .input_focus import input_focus_rules_for
 from .planner_prompt import prompt_config_from_planner_config
 from .schemas import VERIFY_RESPONSE_SCHEMA
 from .templates import VERIFY_TEMPLATE
@@ -167,6 +168,7 @@ def build_verify_rules(
     hint = language.value if isinstance(language, PromptLanguage) else language
     resolved = cfg.resolve_language(str(hint) if hint is not None else None)
     rules = list(VERIFY_RULES_ZH if resolved is PromptLanguage.ZH else VERIFY_RULES_EN)
+    rules.extend(input_focus_rules_for(resolved, include_verify=True))
     if cfg.require_reason:
         rules.append("reason 字段不能为空。" if resolved is PromptLanguage.ZH else "The reason field must not be empty.")
     if cfg.require_confidence:
