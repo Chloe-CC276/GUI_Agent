@@ -13,6 +13,8 @@ verification, reflection and memory are delegated to ``AgentChain``.
 from __future__ import annotations
 
 import argparse
+import atexit
+from datetime import datetime
 import importlib
 import json
 import logging
@@ -41,7 +43,7 @@ class CLIConfig:
     language: str = "zh"
     verbose: bool = True
     task_retry_count: int = 1
-    log_file: str = "logs/agent_debug.log"
+    log_file: str = "logs"
 
     def update(self, name: str, raw_value: str) -> None:
         aliases = {
@@ -217,7 +219,11 @@ class AgentCLI:
         self.runtime: AgentRuntime | None = None
         self.history: list[dict[str, Any]] = []
         self.last_result: Any = None
-        self.logger = _build_file_logger(config.log_file)
+        self.logger, self.log_path = _build_file_logger(config.log_file)
+        self.config.log_file = str(self.log_path)
+        atexit.register(self._close_log)
+        self.logger.info("CLI session started; log=%s", self.log_path)
+        _flush_logs()
 
     def run(self, initial_task: str | None = None) -> int:
         self._print_banner()
@@ -293,39 +299,70 @@ class AgentCLI:
         if not task:
             raise CLIError("任务指令不能为空")
 
-        runtime = self._ensure_runtime()
         started = time.perf_counter()
-        print(f"\n[任务] {task}")
-        print("[状态] Agent 已启动")
+        self._emit("TASK", f"任务={task}")
+        self._emit("STATUS", "Agent 已启动")
 
         attempts = 1 + max(0, int(self.config.task_retry_count))
         result: Any = None
         final_context: Mapping[str, Any] = {}
         captured_exception: BaseException | None = None
         captured_traceback = ""
+        interrupted = False
+        total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-        for attempt in range(1, attempts + 1):
-            state = runtime.new_state(task, self.config)
-            captured_exception = None
-            captured_traceback = ""
-            final_context = {}
-            self.logger.info("task=%r attempt=%d/%d started", task, attempt, attempts)
+        try:
+            runtime = self._ensure_runtime()
+            for attempt in range(1, attempts + 1):
+                state = runtime.new_state(task, self.config)
+                captured_exception = None
+                captured_traceback = ""
+                final_context = {}
+                self.logger.info("task=%r attempt=%d/%d started", task, attempt, attempts)
+                previous_stage_at = time.perf_counter()
 
-            try:
                 if hasattr(runtime.chain, "stream_steps"):
                     final_state = state
                     for context in runtime.chain.stream_steps(state):
+                        now = time.perf_counter()
+                        stage_elapsed = now - previous_stage_at
+                        previous_stage_at = now
                         final_context = context
                         final_state = context.get("agent_state", final_state)
-                        stage = str(context.get("stage", "unknown"))
+                        next_stage = str(context.get("stage", "unknown"))
+                        stage = str(context.get("completed_stage", next_stage))
+                        stage_elapsed = float(
+                            context.get("stage_elapsed_seconds", stage_elapsed)
+                        )
                         step = getattr(final_state, "step_index", "?")
-                        print(f"[尝试 {attempt}/{attempts}][步骤 {step}] {stage}")
+                        usage = _stage_usage(context, stage, next_stage)
+                        for key in total_usage:
+                            total_usage[key] += usage[key]
+                        detail = _stage_detail(context, stage)
+                        self._emit(
+                            "STEP",
+                            (
+                                f"尝试={attempt}/{attempts} | 步骤={step} | "
+                                f"完成={stage} → 当前={next_stage} | "
+                                f"耗时={stage_elapsed:.3f}s | "
+                                f"Token={usage['input_tokens']}/"
+                                f"{usage['output_tokens']}/{usage['total_tokens']}"
+                                + (f" | {detail}" if detail else "")
+                            ),
+                        )
                         self.logger.info(
-                            "task=%r attempt=%d context=%s",
+                            "task=%r attempt=%d stage=%s step=%s "
+                            "elapsed=%.3fs usage=%s detail=%s context=%s",
                             task,
                             attempt,
+                            stage,
+                            step,
+                            stage_elapsed,
+                            usage,
+                            detail,
                             json.dumps(_json_value(context), ensure_ascii=False),
                         )
+                        _flush_logs()
                     result = final_state.to_run_result()
                 else:
                     result = runtime.chain.invoke(state)
@@ -337,29 +374,41 @@ class AgentCLI:
                 }
                 if succeeded:
                     break
-            except Exception as error:
-                captured_exception = error
-                captured_traceback = traceback.format_exc()
-                status = "error"
-                self.logger.exception(
-                    "task=%r attempt=%d/%d raised an exception",
-                    task,
-                    attempt,
-                    attempts,
-                )
 
-            if attempt < attempts:
-                reason = _failure_reason(
-                    result, final_context, captured_exception
-                )
-                print(f"[重试] 第一次执行未成功：{reason}")
-                print("[重试] 正在使用全新状态重试一次...")
+                if attempt < attempts:
+                    reason = _failure_reason(
+                        result, final_context, captured_exception
+                    )
+                    self._emit("RETRY", f"本次执行未成功：{reason}")
+                    self._emit("RETRY", "使用全新状态重新执行")
+        except KeyboardInterrupt as error:
+            interrupted = True
+            captured_exception = error
+            captured_traceback = traceback.format_exc()
+            status = "interrupted"
+            self._emit("INTERRUPT", "用户中断运行，正在保存当前日志")
+            self.logger.warning(
+                "task=%r interrupted by user; context=%s",
+                task,
+                json.dumps(_json_value(final_context), ensure_ascii=False),
+            )
+        except BaseException as error:
+            captured_exception = error
+            captured_traceback = traceback.format_exc()
+            status = "error"
+            self.logger.exception("task=%r terminated by %s", task, type(error).__name__)
+        finally:
+            _flush_logs()
 
         elapsed = time.perf_counter() - started
         self.last_result = result
 
         data = _json_safe(result) if result is not None else {}
-        status = str(data.get("status", "error" if captured_exception else "unknown"))
+        status = (
+            "interrupted"
+            if interrupted
+            else str(data.get("status", "error" if captured_exception else "unknown"))
+        )
         message = data.get("final_message") or data.get("message") or ""
         succeeded = status.lower() in {
             "success", "succeeded", "finished", "completed"
@@ -367,24 +416,24 @@ class AgentCLI:
 
         if not succeeded:
             reason = _failure_reason(result, final_context, captured_exception)
-            print("\n[失败诊断]")
-            print(f"[失败阶段] {final_context.get('stage', 'unknown')}")
-            print(f"[失败原因] {reason}")
+            self._emit("FAIL", f"阶段={final_context.get('stage', 'unknown')}")
+            self._emit("FAIL", f"原因={reason}")
             error_data = (
                 data.get("error")
                 or final_context.get("error_details")
                 or final_context.get("error")
             )
             if error_data:
-                print("[错误详情]")
-                print(json.dumps(_json_value(error_data), ensure_ascii=False, indent=2))
+                self._emit(
+                    "ERROR",
+                    json.dumps(_json_value(error_data), ensure_ascii=False),
+                )
             chain_error = final_context.get("chain_error")
             if chain_error and str(chain_error) != reason:
-                print(f"[链路错误] {chain_error}")
+                self._emit("ERROR", f"链路错误={chain_error}")
             if captured_traceback:
-                print("[完整异常堆栈]")
-                print(captured_traceback.rstrip())
-            print(f"[完整日志] {Path(self.config.log_file)}")
+                self.logger.error("traceback:\n%s", captured_traceback.rstrip())
+            self._emit("LOG", str(self.log_path))
             self.logger.error(
                 "task=%r failed after %d attempts; reason=%s; result=%s; context=%s",
                 task,
@@ -403,18 +452,38 @@ class AgentCLI:
             }
         )
 
-        print(f"\n[结果] {status}")
+        self._emit("RESULT", status)
         if message:
-            print(f"[说明] {message}")
-        print(f"[耗时] {elapsed:.2f}s")
+            self._emit("MESSAGE", str(message))
+        self._emit(
+            "SUMMARY",
+            (
+                f"总耗时={elapsed:.2f}s | Token="
+                f"{total_usage['input_tokens']}/{total_usage['output_tokens']}/"
+                f"{total_usage['total_tokens']} (输入/输出/总计)"
+            ),
+        )
+        _flush_logs()
 
         return succeeded
     
     def _ensure_runtime(self) -> AgentRuntime:
         if self.runtime is None:
-            print("[初始化] 正在连接感知、VLM、Planner、Executor 与 AgentChain...")
+            self._emit("INIT", "连接 Perception/VLM/Planner/Executor/AgentChain")
             self.runtime = self.runtime_factory(self.config)
         return self.runtime
+
+    def _emit(self, category: str, message: str) -> None:
+        line = f"[{category:<9}] {message}"
+        print(line, flush=True)
+        self.logger.info(line)
+        _flush_logs()
+
+    def _close_log(self) -> None:
+        if getattr(self, "logger", None) is None:
+            return
+        self.logger.info("CLI session closing")
+        _flush_logs()
 
     def _print_stage(self, context: Mapping[str, Any]) -> None:
         stage = str(context.get("stage", "unknown"))
@@ -560,6 +629,155 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
+def _value(source: Any, name: str, default: Any = None) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    for method_name in ("to_dict", "model_dump", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                data = method()
+            except Exception:
+                continue
+            if isinstance(data, Mapping):
+                return dict(data)
+    result: dict[str, Any] = {}
+    for name in (
+        "type", "action_type", "x", "y", "target_text", "element_id",
+        "metadata", "input_tokens", "output_tokens", "total_tokens",
+    ):
+        item = getattr(value, name, None)
+        if item is not None:
+            result[name] = item
+    return result
+
+
+def _usage_dict(value: Any) -> dict[str, int]:
+    data = _as_mapping(value)
+    aliases = {
+        "input_tokens": ("input_tokens", "prompt_tokens"),
+        "output_tokens": ("output_tokens", "completion_tokens"),
+        "total_tokens": ("total_tokens",),
+    }
+    result: dict[str, int] = {}
+    for target, names in aliases.items():
+        raw = next((data.get(name) for name in names if data.get(name) is not None), 0)
+        try:
+            result[target] = max(0, int(raw))
+        except (TypeError, ValueError):
+            result[target] = 0
+    if not result["total_tokens"]:
+        result["total_tokens"] = result["input_tokens"] + result["output_tokens"]
+    return result
+
+
+def _stage_usage(
+    context: Mapping[str, Any],
+    completed_stage: str,
+    next_stage: str,
+) -> dict[str, int]:
+    empty = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    if completed_stage not in {"plan", "verify", "reflect", "memory"}:
+        return empty
+    state = context.get("agent_state")
+    candidates = [
+        context.get("usage"),
+        _value(context.get("last_raw_response"), "usage"),
+    ]
+    if completed_stage == "plan":
+        planner_result = _value(state, "last_planner_result")
+        candidates.extend(
+            [
+                _value(planner_result, "usage"),
+                _value(_value(planner_result, "metadata", {}), "usage"),
+            ]
+        )
+    for candidate in candidates:
+        usage = _usage_dict(candidate)
+        if usage["total_tokens"]:
+            return usage
+    return empty
+
+
+def _action_detail(action: Any) -> str:
+    data = _as_mapping(action)
+    metadata = _as_mapping(data.get("metadata"))
+    validation = _as_mapping(metadata.get("target_validation"))
+    action_type = data.get("type") or data.get("action_type") or "unknown"
+    if hasattr(action_type, "value"):
+        action_type = action_type.value
+    x = data.get("x", validation.get("center_x"))
+    y = data.get("y", validation.get("center_y"))
+    target = (
+        data.get("target_text")
+        or validation.get("target_text")
+        or validation.get("matched_text")
+    )
+    element_id = data.get("element_id", validation.get("element_id"))
+    bbox = validation.get("matched_bbox") or metadata.get("matched_bbox")
+    fields = [f"动作={action_type}"]
+    if target:
+        fields.append(f"目标={target!r}")
+    if element_id is not None:
+        fields.append(f"element_id={element_id}")
+    if x is not None or y is not None:
+        fields.append(f"坐标=({x},{y})")
+    if bbox:
+        fields.append(f"bbox={bbox}")
+    return " | ".join(fields)
+
+
+def _stage_detail(context: Mapping[str, Any], stage: str) -> str:
+    state = context.get("agent_state")
+    observation = _value(state, "observation")
+    if stage in {"observe", "observe_after"}:
+        width = _value(observation, "screen_width")
+        height = _value(observation, "screen_height")
+        elements = (
+            _value(observation, "elements")
+            or _value(observation, "merged_elements")
+            or _value(_value(observation, "metadata", {}), "target_candidates")
+            or []
+        )
+        elapsed = _value(observation, "elapsed_time")
+        parts = []
+        if width and height:
+            parts.append(f"屏幕={width}x{height}")
+        try:
+            parts.append(f"元素={len(elements)}")
+        except TypeError:
+            pass
+        if elapsed is not None:
+            try:
+                parts.append(f"感知耗时={float(elapsed):.3f}s")
+            except (TypeError, ValueError):
+                pass
+        return " | ".join(parts)
+    if stage in {"plan", "execute"}:
+        action = _value(state, "latest_action")
+        if action is None:
+            action = _value(_value(state, "last_planner_result"), "action")
+        return _action_detail(action) if action is not None else "未生成动作"
+    if stage == "verify":
+        data = _as_mapping(context.get("verify_data"))
+        return (
+            f"验证成功={data.get('success', data.get('completed', 'unknown'))}"
+            f" | 置信度={data.get('confidence', 'unknown')}"
+        )
+    if stage == "reflect":
+        data = _as_mapping(context.get("reflection_data"))
+        return f"反思={data.get('reason') or data.get('analysis') or '重新规划'}"
+    return ""
+
+
 def _failure_reason(
     result: Any,
     context: Mapping[str, Any],
@@ -584,25 +802,37 @@ def _failure_reason(
     )
 
 
-def _build_file_logger(log_file: str) -> logging.Logger:
-    path = Path(log_file)
+def _timestamped_log_path(log_file: str) -> Path:
+    requested = Path(log_file)
+    directory = requested if not requested.suffix else requested.parent
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return directory / f"log_{stamp}.log"
+
+
+def _build_file_logger(log_file: str) -> tuple[logging.Logger, Path]:
+    path = _timestamped_log_path(log_file)
     path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8", delay=False)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
     logger = logging.getLogger("src.agent.cli")
     logger.setLevel(logging.INFO)
-    resolved = str(path.resolve())
-    if not any(
-        isinstance(handler, logging.FileHandler)
-        and getattr(handler, "baseFilename", None) == resolved
-        for handler in logger.handlers
-    ):
-        handler = logging.FileHandler(path, encoding="utf-8")
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-            )
-        )
-        logger.addHandler(handler)
-    return logger
+    return logger, path.resolve()
+
+
+def _flush_logs() -> None:
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -620,7 +850,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(0, 1),
         help="整条任务失败后是否使用全新状态重试一次",
     )
-    parser.add_argument("--log-file", default="logs/agent_debug.log")
+    parser.add_argument(
+        "--log-file",
+        default="logs",
+        help="日志目录（或任意旧式日志路径）；实际文件名自动生成为 log_当前时间.log",
+    )
     parser.add_argument("--post-action-wait", type=float, default=0.5)
     parser.add_argument("--dry-run", action="store_true", help="禁止真实鼠标键盘操作")
     parser.add_argument(

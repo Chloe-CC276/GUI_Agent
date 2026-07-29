@@ -2032,6 +2032,19 @@ class Planner:
             raise PlannerValidationError(
                 "Resolved center is outside the matched target bbox."
             )
+        self.logger.info(
+            "Target resolved: action=%s target_text=%r element_id=%s "
+            "detected_text=%r bbox=%s center=(%d,%d) screen=%sx%s",
+            action_type,
+            target_text,
+            resolved_element_id,
+            detected_text,
+            list(bbox),
+            params["x"],
+            params["y"],
+            getattr(observation, "screen_width", None),
+            getattr(observation, "screen_height", None),
+        )
         return params
 
     def _validate_absolute_coordinates(

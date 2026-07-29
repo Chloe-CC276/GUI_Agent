@@ -294,9 +294,16 @@ class Executor:
                 return result
 
             logger.info(
-                "Executing action: type=%s, id=%s, description=%s",
+                "Executing action: type=%s, id=%s, x=%s, y=%s, "
+                "normalised=(%s,%s), screen=%sx%s, description=%s",
                 resolved_action.type.value,
                 resolved_action.action_id,
+                resolved_action.x,
+                resolved_action.y,
+                resolved_action.normalised_x,
+                resolved_action.normalised_y,
+                getattr(self.mouse, "screen_width", None),
+                getattr(self.mouse, "screen_height", None),
                 resolved_action.description,
             )
 
@@ -335,6 +342,15 @@ class Executor:
                     )
 
                 self._record_result(result)
+                logger.info(
+                    "Action completed: type=%s success=%s elapsed=%.3fs "
+                    "requested_xy=(%s,%s)",
+                    resolved_action.type.value,
+                    result.success,
+                    result.elapsed_time,
+                    resolved_action.x,
+                    resolved_action.y,
+                )
                 return result
 
             except Exception as error:

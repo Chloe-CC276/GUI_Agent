@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import re
+import time
 import traceback
 from dataclasses import dataclass, field
 from enum import Enum
@@ -187,7 +188,11 @@ class AgentChain:
         for _ in range(self.config.max_chain_iterations):
             if self._terminal(context):
                 break
+            completed_stage = str(context.get("stage", ChainStage.FAIL.value))
+            stage_started = time.perf_counter()
             context = asyncio.run(self._dispatch(context))
+            context["completed_stage"] = completed_stage
+            context["stage_elapsed_seconds"] = time.perf_counter() - stage_started
             yield context
         else:
             yield self._iteration_limit_failure(context)
