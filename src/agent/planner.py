@@ -144,6 +144,7 @@ class ActionName(str, Enum):
     PRESS = "press"
     HOTKEY = "hotkey"
     TYPE_TEXT = "type_text"
+    PASTE_TEXT = "paste_text"
     WAIT = "wait"
     SCREENSHOT = "screenshot"
     FINISH = "finish"
@@ -1505,6 +1506,9 @@ class Planner:
             "input": "type_text",
             "write": "type_text",
             "keyboard_input": "type_text",
+            "paste": "paste_text",
+            "paste_text": "paste_text",
+            "clipboard_paste": "paste_text",
             "key_press": "press",
             "shortcut": "hotkey",
             "vertical_scroll": "scroll",
@@ -1617,7 +1621,7 @@ class Planner:
                 if alias != "amount":
                     params.pop(alias, None)
 
-        if action_type == "type_text":
+        if action_type in {"type_text", "paste_text"}:
             text = params.get("text")
 
             if text is None:
@@ -1625,19 +1629,19 @@ class Planner:
 
             if text is None:
                 raise PlannerValidationError(
-                    "type_text requires text."
+                    f"{action_type} requires text."
                 )
 
             text = str(text)
 
             if not text and not self.config.allow_empty_text:
                 raise PlannerValidationError(
-                    "type_text text must not be empty."
+                    f"{action_type} text must not be empty."
                 )
 
             if len(text) > self.config.max_text_length:
                 raise PlannerValidationError(
-                    "type_text exceeds max_text_length."
+                    f"{action_type} exceeds max_text_length."
                 )
 
             params["text"] = text

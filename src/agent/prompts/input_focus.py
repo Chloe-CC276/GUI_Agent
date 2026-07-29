@@ -49,8 +49,9 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
             "则将 action_effective 设为 true，不得因为缺少单独光标证据而判定失败。"
         )
         planner = (
-            "若当前观察已按上述规则判定搜索框/地址栏/输入框已选中，下一步应直接 "
-            "type_text 或 paste_text 输入内容，不要仅为确认焦点而重复点击同一控件。"
+            "若当前观察已按上述规则判定搜索框/地址栏/输入框已选中，下一步应使用 "
+            "paste_text 粘贴完整查询词（不要 type_text，不要用中文输入法选词），"
+            "然后 press enter 提交；不要仅为确认焦点而重复点击同一控件。"
         )
         reflection = (
             "诊断点击搜索框/输入框是否失败时，必须应用上述组合视觉状态规则；"
@@ -77,8 +78,9 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
     )
     planner = (
         "If the current observation already satisfies the combined focus rule for a "
-        "search box, address bar or input field, the next step should be type_text or "
-        "paste_text; do not re-click the same control only to reconfirm focus."
+        "search box, address bar or input field, the next step should be paste_text "
+        "with the full query (never type_text / IME selection), then press enter; "
+        "do not re-click the same control only to reconfirm focus."
     )
     reflection = (
         "When diagnosing whether a click on a search or input box failed, apply the "

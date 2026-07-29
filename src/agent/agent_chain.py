@@ -31,6 +31,11 @@ from .prompts.schemas import REFLECTION_RESPONSE_SCHEMA, VERIFY_RESPONSE_SCHEMA
 logger = logging.getLogger(__name__)
 
 
+# paste_text is used to inject search queries without IME. Skip the expensive
+# verify loop so the planner can immediately press Enter.
+_SKIP_VERIFY_ACTION_TYPES: frozenset[str] = frozenset({"paste_text"})
+
+
 try:
     from langchain_core.runnables import Runnable, RunnableLambda, RunnableSequence
 except ImportError:
@@ -419,6 +424,36 @@ class AgentChain:
                 "stage": ChainStage.FAIL.value,
             }
 
+        if result.succeeded and self._should_skip_verification(state.latest_action):
+            action_type = self._latest_action_type(state.latest_action)
+            state.add_history(
+                event_type="verify_skipped",
+                message=(
+                    f"Skipped verification after {action_type}; "
+                    "continuing to plan Enter/submit."
+                ),
+                status=ResultStatus.SUCCESS,
+                metadata={"action_type": action_type},
+            )
+            self._commit_current_step(state)
+            if state.is_terminal:
+                return {
+                    "agent_state": state,
+                    "stage": ChainStage.FAIL.value,
+                }
+            # Keep the pre-paste observation so the planner can submit immediately.
+            state.set_phase(
+                AgentPhase.PLANNING if state.observation is not None else AgentPhase.OBSERVING
+            )
+            return {
+                "agent_state": state,
+                "stage": (
+                    ChainStage.PLAN.value
+                    if state.observation is not None
+                    else ChainStage.OBSERVE.value
+                ),
+            }
+
         stage = (
             ChainStage.OBSERVE_AFTER
             if result.succeeded
@@ -429,6 +464,21 @@ class AgentChain:
             "agent_state": state,
             "stage": stage.value,
         }
+
+    @staticmethod
+    def _latest_action_type(action: Any) -> str:
+        data = coerce_action_mapping(action)
+        nested = data.get("parameters")
+        if isinstance(nested, Mapping):
+            data = {**data, **dict(nested)}
+        raw = data.get("type") or data.get("action_type")
+        if hasattr(raw, "value"):
+            raw = raw.value
+        return str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+    @classmethod
+    def _should_skip_verification(cls, action: Any) -> bool:
+        return cls._latest_action_type(action) in _SKIP_VERIFY_ACTION_TYPES
 
     async def _observe_after(self, context: ChainState) -> ChainState:
         state = context["agent_state"]

@@ -63,6 +63,8 @@ from .input_focus import (
     input_focus_rules_for,
 )
 
+from .search_workflow import search_workflow_rules
+
 from .planner_prompt import (
     PlannerPrompt,
     build_planner_messages,
@@ -168,4 +170,5 @@ __all__ = [
     "INPUT_FOCUS_SIGNALS_ZH",
     "input_focus_rules",
     "input_focus_rules_for",
+    "search_workflow_rules",
 ]

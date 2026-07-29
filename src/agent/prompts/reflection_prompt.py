@@ -16,6 +16,7 @@ from .formatters import compact_whitespace, format_error, safe_json_dumps, trunc
 from .input_focus import input_focus_rules_for
 from .planner_prompt import prompt_config_from_planner_config
 from .schemas import REFLECTION_RESPONSE_SCHEMA
+from .search_workflow import search_workflow_rules
 from .templates import REFLECTION_TEMPLATE
 
 
@@ -187,6 +188,7 @@ def build_reflection_rules(
         REFLECTION_RULES_ZH if resolved is PromptLanguage.ZH else REFLECTION_RULES_EN
     )
     rules.extend(input_focus_rules_for(resolved, include_reflection=True))
+    rules.extend(search_workflow_rules(resolved, include_reflection=True))
     if cfg.require_confidence:
         rules.append(
             "必须返回 0 到 1 之间的 confidence。"

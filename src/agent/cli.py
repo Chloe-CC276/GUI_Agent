@@ -99,6 +99,14 @@ class AgentRuntime:
                     "打开桌面快捷方式、文件或文件夹使用 double_click；"
                     "按钮、菜单、标签页和任务栏图标使用 click"
                 ),
+                (
+                    "向搜索框填入查询词必须使用 paste_text 粘贴完整文本，"
+                    "禁止 type_text 和中文输入法选词；粘贴后下一步 press enter 提交"
+                ),
+                (
+                    "Google 首页判定：同时看到 Google logo 与中央搜索框即已进入首页，"
+                    "不要反复点击 Google search"
+                ),
             ],
             success_criteria=["通过动作后界面证据确认用户指令已经完成"],
             metadata={"entrypoint": "src.agent.cli", "dry_run": config.dry_run},

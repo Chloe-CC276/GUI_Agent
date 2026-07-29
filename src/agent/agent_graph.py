@@ -27,6 +27,9 @@ from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
 
+# Keep in sync with AgentChain: paste_text injects search queries and skips verify.
+_SKIP_VERIFY_ACTION_TYPES: frozenset[str] = frozenset({"paste_text"})
+
 try:
     from .prompts import PromptBuilder, PromptKind
     from .prompts.schemas import (
@@ -303,8 +306,62 @@ class AgentGraph:
         state.update_execution_result(result)
         if state.is_terminal:
             return {"agent_state": state, "route": GraphRoute.FAIL.value}
+        if result.succeeded and self._should_skip_verification(state.latest_action):
+            action_type = self._latest_action_type(state.latest_action)
+            state.add_history(
+                event_type="verify_skipped",
+                message=(
+                    f"Skipped verification after {action_type}; "
+                    "continuing to plan Enter/submit."
+                ),
+                status=ResultStatus.SUCCESS,
+                metadata={"action_type": action_type},
+            )
+            self._commit_current_step(state)
+            if state.is_terminal:
+                return {"agent_state": state, "route": GraphRoute.FAIL.value}
+            if state.observation is not None:
+                state.set_phase(AgentPhase.PLANNING)
+                return {"agent_state": state, "route": GraphRoute.PLAN.value}
+            state.set_phase(AgentPhase.OBSERVING)
+            return {"agent_state": state, "route": GraphRoute.OBSERVE.value}
         route = GraphRoute.OBSERVE_AFTER if result.succeeded else GraphRoute.REFLECT
         return {"agent_state": state, "route": route.value}
+
+    @staticmethod
+    def _latest_action_type(action: Any) -> str:
+        if action is None:
+            return ""
+        if isinstance(action, Mapping):
+            data = dict(action)
+        else:
+            data = {}
+            for method_name in ("to_dict", "model_dump", "dict"):
+                method = getattr(action, method_name, None)
+                if callable(method):
+                    try:
+                        value = method()
+                    except Exception:
+                        continue
+                    if isinstance(value, Mapping):
+                        data = dict(value)
+                        break
+            if not data:
+                for name in ("type", "action_type"):
+                    value = getattr(action, name, None)
+                    if value is not None:
+                        data[name] = value
+        nested = data.get("parameters")
+        if isinstance(nested, Mapping):
+            data = {**data, **dict(nested)}
+        raw = data.get("type") or data.get("action_type")
+        if hasattr(raw, "value"):
+            raw = raw.value
+        return str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+    @classmethod
+    def _should_skip_verification(cls, action: Any) -> bool:
+        return cls._latest_action_type(action) in _SKIP_VERIFY_ACTION_TYPES
 
     async def observe_after_node(self, graph: GraphState) -> GraphState:
         state = graph["agent_state"]
