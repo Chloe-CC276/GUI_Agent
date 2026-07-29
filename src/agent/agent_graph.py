@@ -26,9 +26,7 @@ from .memory import AgentMemory, MemoryImportance, MemoryKind
 from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
-
-# Keep in sync with AgentChain: paste_text injects search queries and skips verify.
-_SKIP_VERIFY_ACTION_TYPES: frozenset[str] = frozenset({"paste_text"})
+from .verify_policy import latest_action_type, should_skip_verification
 
 try:
     from .prompts import PromptBuilder, PromptKind
@@ -312,7 +310,7 @@ class AgentGraph:
                 event_type="verify_skipped",
                 message=(
                     f"Skipped verification after {action_type}; "
-                    "continuing to plan Enter/submit."
+                    "continuing to plan the next search step."
                 ),
                 status=ResultStatus.SUCCESS,
                 metadata={"action_type": action_type},
@@ -330,38 +328,11 @@ class AgentGraph:
 
     @staticmethod
     def _latest_action_type(action: Any) -> str:
-        if action is None:
-            return ""
-        if isinstance(action, Mapping):
-            data = dict(action)
-        else:
-            data = {}
-            for method_name in ("to_dict", "model_dump", "dict"):
-                method = getattr(action, method_name, None)
-                if callable(method):
-                    try:
-                        value = method()
-                    except Exception:
-                        continue
-                    if isinstance(value, Mapping):
-                        data = dict(value)
-                        break
-            if not data:
-                for name in ("type", "action_type"):
-                    value = getattr(action, name, None)
-                    if value is not None:
-                        data[name] = value
-        nested = data.get("parameters")
-        if isinstance(nested, Mapping):
-            data = {**data, **dict(nested)}
-        raw = data.get("type") or data.get("action_type")
-        if hasattr(raw, "value"):
-            raw = raw.value
-        return str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return latest_action_type(action)
 
     @classmethod
     def _should_skip_verification(cls, action: Any) -> bool:
-        return cls._latest_action_type(action) in _SKIP_VERIFY_ACTION_TYPES
+        return should_skip_verification(action)
 
     async def observe_after_node(self, graph: GraphState) -> GraphState:
         state = graph["agent_state"]

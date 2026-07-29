@@ -24,16 +24,12 @@ from .memory import AgentMemory, MemoryImportance, MemoryKind
 from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
+from .verify_policy import latest_action_type, should_skip_verification
 
 from .prompts import PromptBuilder, PromptKind
 from .prompts.schemas import REFLECTION_RESPONSE_SCHEMA, VERIFY_RESPONSE_SCHEMA
 
 logger = logging.getLogger(__name__)
-
-
-# paste_text is used to inject search queries without IME. Skip the expensive
-# verify loop so the planner can immediately press Enter.
-_SKIP_VERIFY_ACTION_TYPES: frozenset[str] = frozenset({"paste_text"})
 
 
 try:
@@ -430,7 +426,7 @@ class AgentChain:
                 event_type="verify_skipped",
                 message=(
                     f"Skipped verification after {action_type}; "
-                    "continuing to plan Enter/submit."
+                    "continuing to plan the next search step."
                 ),
                 status=ResultStatus.SUCCESS,
                 metadata={"action_type": action_type},
@@ -467,18 +463,11 @@ class AgentChain:
 
     @staticmethod
     def _latest_action_type(action: Any) -> str:
-        data = coerce_action_mapping(action)
-        nested = data.get("parameters")
-        if isinstance(nested, Mapping):
-            data = {**data, **dict(nested)}
-        raw = data.get("type") or data.get("action_type")
-        if hasattr(raw, "value"):
-            raw = raw.value
-        return str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return latest_action_type(action)
 
     @classmethod
     def _should_skip_verification(cls, action: Any) -> bool:
-        return cls._latest_action_type(action) in _SKIP_VERIFY_ACTION_TYPES
+        return should_skip_verification(action)
 
     async def _observe_after(self, context: ChainState) -> ChainState:
         state = context["agent_state"]

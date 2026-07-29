@@ -49,13 +49,16 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
             "则将 action_effective 设为 true，不得因为缺少单独光标证据而判定失败。"
         )
         planner = (
+            "浏览器内打开网站或发起搜索时，优先用 hotkey Ctrl+L（macOS 用 Command+L）"
+            "聚焦地址栏，不要点击地址栏占位文案，也不要点击历史/建议下拉项；"
             "若当前观察已按上述规则判定搜索框/地址栏/输入框已选中，下一步应使用 "
-            "paste_text 粘贴完整查询词（不要 type_text，不要用中文输入法选词），"
-            "然后 press enter 提交；不要仅为确认焦点而重复点击同一控件。"
+            "paste_text 粘贴完整文本（不要 type_text），然后 press enter 提交；"
+            "不要仅为确认焦点而重复点击同一控件。"
         )
         reflection = (
             "诊断点击搜索框/输入框是否失败时，必须应用上述组合视觉状态规则；"
-            "出现与搜索框关联的历史下拉列表通常是焦点成功证据，不得单独当作失败或未选中。"
+            "出现与搜索框关联的历史下拉列表通常是焦点成功证据，不得单独当作失败或未选中，"
+            "也不得建议去点击下拉列表中的 OCR 噪声行。"
         )
         return (intro, verify, planner, reflection)
 
@@ -77,15 +80,18 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
         "action_effective=true; do not mark failure solely because a caret is missing."
     )
     planner = (
-        "If the current observation already satisfies the combined focus rule for a "
-        "search box, address bar or input field, the next step should be paste_text "
-        "with the full query (never type_text / IME selection), then press enter; "
-        "do not re-click the same control only to reconfirm focus."
+        "When opening a site or starting a search in the browser, prefer hotkey Ctrl+L "
+        "(Command+L on macOS) to focus the address bar — do not click address-bar "
+        "placeholder text or history/suggestion dropdown rows; if the current observation "
+        "already satisfies the combined focus rule for a search box, address bar or input "
+        "field, the next step should be paste_text with the full text (never type_text), "
+        "then press enter; do not re-click the same control only to reconfirm focus."
     )
     reflection = (
         "When diagnosing whether a click on a search or input box failed, apply the "
         "combined focus rule above; a history dropdown attached under the box is usually "
-        "evidence of successful focus, not of failure."
+        "evidence of successful focus, not of failure, and must not be treated as a "
+        "click target for OCR noise rows."
     )
     return (intro, verify, planner, reflection)
 
