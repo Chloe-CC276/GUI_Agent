@@ -16,6 +16,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterator, Mapping, Protocol, TypedDict
 
+from ..common.target_validation import (
+    coerce_action_mapping,
+    validate_click_target,
+)
 from .memory import AgentMemory, MemoryImportance, MemoryKind
 from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
 from .state import AgentPhase, AgentState, ObservationState
@@ -339,141 +343,20 @@ class AgentChain:
                 "planner_retry_count": retry_count,
             }
 
-    @staticmethod
-    def _point_in_bbox(
-        x: int,
-        y: int,
-        bbox: Any,
-    ) -> bool:
-        if (
-            not isinstance(bbox, (list, tuple))
-            or len(bbox) != 4
-        ):
-            return False
-        try:
-            left, top, right, bottom = (
-                float(value) for value in bbox
-            )
-        except (TypeError, ValueError):
-            return False
-        return left <= x <= right and top <= y <= bottom
+        return self._fail_update(
+            state,
+            getattr(result, "reason", None)
+            or "Planner returned no usable decision.",
+            getattr(result, "error", None),
+        )
 
     @staticmethod
     def _action_mapping(action: Any) -> dict[str, Any]:
-        if isinstance(action, Mapping):
-            return dict(action)
-        for method_name in ("to_dict", "model_dump", "dict"):
-            method = getattr(action, method_name, None)
-            if callable(method):
-                value = method()
-                if isinstance(value, Mapping):
-                    return dict(value)
-        result: dict[str, Any] = {}
-        for name in (
-            "type",
-            "action_type",
-            "x",
-            "y",
-            "metadata",
-            "parameters",
-        ):
-            value = getattr(action, name, None)
-            if value is not None:
-                result[name] = value
-        return result
+        return coerce_action_mapping(action)
 
-    def _validate_action_target(
-        self,
-        state: AgentState,
-    ) -> str | None:
-        action = state.latest_action
-        if action is None:
-            return "Action rejected: no action is available for execution."
-
-        data = self._action_mapping(action)
-        nested = data.get("parameters")
-        params = dict(nested) if isinstance(nested, Mapping) else data
-
-        raw_type = data.get("type") or data.get("action_type")
-        if hasattr(raw_type, "value"):
-            raw_type = raw_type.value
-        action_type = str(raw_type or "").strip().lower()
-        target_actions = {
-            "click",
-            "double_click",
-            "right_click",
-            "middle_click",
-            "mouse_down",
-            "mouse_up",
-        }
-        if action_type not in target_actions:
-            return None
-
-        metadata = params.get("metadata")
-        if not isinstance(metadata, Mapping):
-            return (
-                f"{action_type} rejected: target validation metadata "
-                "is missing."
-            )
-        validation = metadata.get("target_validation")
-        if not isinstance(validation, Mapping):
-            return (
-                f"{action_type} rejected: no detected target was matched."
-            )
-
-        target_text = str(validation.get("target_text", "")).strip()
-        matched_text = str(
-            validation.get("matched_text")
-            or validation.get("detected_text")
-            or ""
-        ).strip()
-        bbox = validation.get("matched_bbox")
-        x = params.get("x")
-        y = params.get("y")
-        if not target_text:
-            return f"{action_type} rejected: target_text is missing."
-        if target_text.casefold().startswith("element_"):
-            return (
-                f"{action_type} rejected: placeholder target "
-                f"{target_text!r} is not a semantic GUI label."
-            )
-
-        if matched_text:
-            def normalize_text(value: str) -> str:
-                return re.sub(
-                    r"[^0-9a-z\u4e00-\u9fff]+",
-                    "",
-                    value.casefold(),
-                )
-
-            expected_text = normalize_text(target_text)
-            actual_text = normalize_text(matched_text)
-
-            text_matches = (
-                expected_text == actual_text
-                or expected_text in actual_text
-                or actual_text in expected_text
-            )
-
-            if not text_matches:
-                return (
-                    f"{action_type} rejected: target_text={target_text!r} "
-                    f"does not match detected_text={matched_text!r}."
-                )
-        if x is None or y is None:
-            return f"{action_type} rejected: coordinates are missing."
-        try:
-            x_int, y_int = int(x), int(y)
-        except (TypeError, ValueError):
-            return (
-                f"{action_type} rejected: coordinates must be integers."
-            )
-        if not self._point_in_bbox(x_int, y_int, bbox):
-            return (
-                f"{action_type} rejected: ({x_int}, {y_int}) is outside "
-                f"target {target_text!r} bbox={bbox}."
-            )
-        return None
+    @staticmethod
+    def _validate_action_target(state: AgentState) -> str | None:
+        return validate_click_target(state.latest_action, require_evidence=True)
 
     async def _execute(self, context: ChainState) -> ChainState:
         state = context["agent_state"]

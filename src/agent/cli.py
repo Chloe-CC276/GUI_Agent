@@ -689,6 +689,13 @@ def _usage_dict(value: Any) -> dict[str, int]:
     return result
 
 
+def _unwrap_response(value: Any) -> Any:
+    """Return the provider response from ``generate_json``'s (parsed, response)."""
+    if isinstance(value, tuple) and len(value) == 2:
+        return value[1]
+    return value
+
+
 def _stage_usage(
     context: Mapping[str, Any],
     completed_stage: str,
@@ -698,9 +705,10 @@ def _stage_usage(
     if completed_stage not in {"plan", "verify", "reflect", "memory"}:
         return empty
     state = context.get("agent_state")
+    raw_response = _unwrap_response(context.get("last_raw_response"))
     candidates = [
         context.get("usage"),
-        _value(context.get("last_raw_response"), "usage"),
+        _value(raw_response, "usage"),
     ]
     if completed_stage == "plan":
         planner_result = _value(state, "last_planner_result")
@@ -779,12 +787,18 @@ def _stage_detail(context: Mapping[str, Any], stage: str) -> str:
     if stage == "verify":
         data = _as_mapping(context.get("verify_data"))
         return (
-            f"验证成功={data.get('success', data.get('completed', 'unknown'))}"
+            f"动作生效={data.get('action_effective', 'unknown')}"
+            f" | 任务完成={data.get('task_complete', 'unknown')}"
             f" | 置信度={data.get('confidence', 'unknown')}"
+            f" | 下一步={data.get('recommended_next', 'unknown')}"
         )
     if stage == "reflect":
         data = _as_mapping(context.get("reflection_data"))
-        return f"反思={data.get('reason') or data.get('analysis') or '重新规划'}"
+        return (
+            f"失败类型={data.get('failure_type', 'unknown')}"
+            f" | 反思={data.get('summary') or data.get('likely_cause') or '重新规划'}"
+            f" | 重新规划={data.get('should_replan', 'unknown')}"
+        )
     return ""
 
 

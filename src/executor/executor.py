@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
+from ..common.target_validation import validate_click_target
 from .action import (
     Action,
     ActionSequence,
@@ -1181,70 +1182,34 @@ class Executor:
     @staticmethod
     def _validate_target_before_click(action: Action) -> None:
         """
-        Executor最终安全检查：确认坐标、bbox及必要字段存在。
-        不重复实施语义校验（已由AgentChain完成）。
+        Executor最终安全检查：复用共享校验规则。
+
+        require_evidence=False 使直接构造的动作（脚本、测试）仍可执行；
+        但只要动作带有 target_validation 证据，就按同一规则严格核对。
         """
-        click_types = {
-            ActionType.CLICK,
-            ActionType.DOUBLE_CLICK,
-            ActionType.RIGHT_CLICK,
-            ActionType.MIDDLE_CLICK,
-        }
-        if action.type not in click_types:
-            return
+        error = validate_click_target(action, require_evidence=False)
+        if error is not None:
+            raise ValueError(f"Refusing action: {error}")
 
         metadata = getattr(action, "metadata", None)
-        if not isinstance(metadata, dict):
-            return
-        validation = metadata.get("target_validation")
+        validation = (
+            metadata.get("target_validation")
+            if isinstance(metadata, dict)
+            else None
+        )
         if not isinstance(validation, dict):
             return
-
-        target_text = str(validation.get("target_text", "")).strip()
-        # 统一使用matched_text，兼容旧的detected_text
-        matched_text = str(
-            validation.get("matched_text")
-            or validation.get("detected_text")
-            or ""
-        ).strip()
-        element_id = validation.get("element_id")
-        bbox = validation.get("matched_bbox")
-
-        # 基本结构检查
-        if element_id is not None and not matched_text:
-            raise ValueError(
-                f"Refusing {action.type.value}: element_id={element_id} has "
-                "no semantic label and cannot be verified."
-            )
-        if target_text.casefold().startswith("element_"):
-            raise ValueError(
-                f"Refusing {action.type.value}: placeholder target "
-                f"{target_text!r} is not a semantic label."
-            )
-        if bbox is None or action.x is None or action.y is None:
-            return
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            raise ValueError("matched_bbox must contain four coordinates.")
-
-        # 坐标安全检查
-        left, top, right, bottom = (int(value) for value in bbox)
-        x, y = int(action.x), int(action.y)
-        if not (left <= x <= right and top <= y <= bottom):
-            raise ValueError(
-                f"Refusing {action.type.value}: coordinate=({x},{y}) is outside "
-                f"matched_bbox={[left, top, right, bottom]}."
-            )
 
         logger.info(
             "Executor final validation passed: action=%s target=%r matched=%r "
             "element_id=%s coordinate=(%s,%s) bbox=%s",
             action.type.value,
-            target_text,
-            matched_text,
-            element_id,
-            x,
-            y,
-            [left, top, right, bottom],
+            validation.get("target_text"),
+            validation.get("matched_text") or validation.get("detected_text"),
+            validation.get("element_id"),
+            action.x,
+            action.y,
+            validation.get("matched_bbox"),
         )
 
     # ------------------------------------------------------------------

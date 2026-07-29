@@ -102,12 +102,12 @@ class PerceptionResult:
         """Return serializable element data used by Planner target matching."""
         candidates: list[dict[str, Any]] = []
         for index, element in enumerate(self.merged_elements):
+            element_id = getattr(element, "element_id", None)
             candidates.append(
                 {
-                    "element_id": index,
+                    "element_id": index if element_id is None else int(element_id),
                     "text": str(getattr(element, "text", "") or ""),
-                    "label": str(getattr(element, "label", "") or ""),
-                    "name": str(getattr(element, "name", "") or ""),
+                    "source": str(getattr(element, "source", "") or ""),
                     "element_type": str(
                         getattr(element, "element_type", "") or ""
                     ),
@@ -223,6 +223,7 @@ class PerceptionPipeline:
                     sort_results=True,
                 )
             ocr_elements = self.ocr_engine.detect(processed_image)
+            self._tag_source(ocr_elements, "ocr")
 
             if coordinate_offset != (0, 0):
                 ocr_elements = self._offset_elements(
@@ -249,6 +250,7 @@ class PerceptionPipeline:
                 image=processed_image,
                 ocr_elements=local_ocr_elements,
             )
+            self._tag_source(ui_elements, "ui")
 
             if coordinate_offset != (0, 0):
                 ui_elements = self._offset_elements(
@@ -605,6 +607,23 @@ class PerceptionPipeline:
         Construct the final GUIElement result.
         """
 
+        merged_elements = self._select_merge_sources(
+            ocr_elements=ocr_elements,
+            ui_elements=ui_elements,
+            use_ocr=use_ocr,
+            use_ui_detection=use_ui_detection,
+            use_merge=use_merge,
+        )
+        return self._assign_element_ids(merged_elements)
+
+    def _select_merge_sources(
+        self,
+        ocr_elements: Sequence[GUIElement],
+        ui_elements: Sequence[GUIElement],
+        use_ocr: bool,
+        use_ui_detection: bool,
+        use_merge: bool,
+    ) -> list[GUIElement]:
         if not use_merge:
             if use_ui_detection:
                 return list(ui_elements)
@@ -640,6 +659,25 @@ class PerceptionPipeline:
             return list(ui_elements)
 
         return []
+
+    @staticmethod
+    def _tag_source(
+        elements: Sequence[GUIElement],
+        source: str,
+    ) -> None:
+        for element in elements:
+            element.source = source
+
+    @staticmethod
+    def _assign_element_ids(
+        elements: list[GUIElement],
+    ) -> list[GUIElement]:
+        """Number the final elements so Planner and prompt agree on the ids."""
+
+        for index, element in enumerate(elements):
+            element.element_id = index
+
+        return elements
     
 
     # ------------------------------------------------------------------
@@ -680,6 +718,8 @@ class PerceptionPipeline:
                     confidence=element.confidence,
                     element_type=element.element_type,
                     center=shifted_center,
+                    element_id=element.element_id,
+                    source=element.source,
                 )
             )
 

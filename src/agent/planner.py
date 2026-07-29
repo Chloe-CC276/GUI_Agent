@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, Sequence, TYPE_CHECKING
 
+from ..common.target_validation import normalise_target_text, texts_match
 from .result import (
     ErrorInfo,
     PlannerDecision,
@@ -727,89 +728,6 @@ class Planner:
 
         return prompt.strip()
 
-    def _default_system_prompt(self) -> str:
-        thought_instruction = (
-            "Do not expose hidden chain-of-thought. Provide only a short, "
-            "task-relevant reason."
-        )
-
-        if self.config.send_thought_field:
-            thought_instruction = (
-                "The optional thought field must contain only a brief "
-                "operational note, not private chain-of-thought."
-            )
-
-        return (
-            "You are the Planner of a desktop GUI Agent. "
-            "Your job is to inspect the current task, current GUI observation, "
-            "and recent history, then select exactly one safe next action. "
-            "Prefer visible evidence from OCR and GUI elements. "
-            "\n\n"
-            "**CRITICAL: Desktop Application Selection Rules**\n"
-            "When opening desktop applications (like Microsoft Edge, Chrome, etc.):\n"
-            "1. ONLY select elements from the DESKTOP area (typically y > screen_height * 0.5)\n"
-            "2. IGNORE text from code editors, terminals, browser tabs, or window titles\n"
-            "3. Desktop icons usually have small, simple labels like 'Microsoft Edge', 'Chrome'\n"
-            "4. Desktop icon bboxes are typically small (width < 100, height < 100)\n"
-            "5. If multiple 'Microsoft Edge' texts exist, choose the one with smallest bbox in lower screen area\n"
-            "\n"
-            "For click, double_click, right_click and middle_click, always "
-            "provide target_text copied from visible OCR text or a GUI label. "
-            "element_id is optional and may only be included together with "
-            "target_text. Never use element_id alone. "
-            "Do not select hexadecimal addresses, stack traces, DLL names, "
-            "terminal output or unrelated text as GUI targets. "
-            "If the requested target text is not detected, return retry. "
-            "Never return x/y alone for a click-like action. "
-            "Use double_click to open a desktop shortcut, file or folder; "
-            "use click for buttons, menus, tabs, taskbar icons and focus. "
-            "The planner resolves the selected element to its detected center. "
-            "If the target is not detected, return retry. "
-            "If the task is already complete, return a finish decision. "
-            "If the observation is insufficient, request retry rather than "
-            "guessing. "
-            f"{thought_instruction}"
-        )
-
-    def _response_schema_text(self) -> str:
-        schema = {
-            "decision": "act | finish | retry | fail",
-            "action": {
-                "type": "required only when decision=act",
-                "parameters": {
-                    "target_text": (
-                        "required visible OCR text or GUI label for every "
-                        "click-like action"
-                    ),
-                    "element_id": (
-                        "optional integer id copied from detected elements; "
-                        "may only be used together with target_text"
-                    ),
-                    "x": "do not use alone for click-like actions",
-                    "y": "do not use alone for click-like actions",
-                    "dx": "integer when required",
-                    "dy": "integer when required",
-                    "button": "left | right | middle",
-                    "clicks": "positive integer",
-                    "text": "string",
-                    "key": "string",
-                    "keys": ["string"],
-                    "amount": "integer",
-                    "duration": "non-negative number",
-                },
-            },
-            "reason": "short explanation",
-            "observation_summary": "optional short summary",
-            "goal_progress": "optional progress summary",
-            "finish_message": "required when decision=finish",
-            "confidence": "number from 0 to 1",
-        }
-
-        if self.config.send_thought_field:
-            schema["thought"] = "optional brief operational note"
-
-        return json.dumps(schema, ensure_ascii=False, indent=2)
-
     def _build_repair_prompt(
         self,
         *,
@@ -822,29 +740,33 @@ class Planner:
         if len(raw_text) > 3000:
             raw_text = raw_text[:3000] + "...<truncated>"
 
+        example = json.dumps(
+            {
+                "decision": "act",
+                "action": {
+                    "type": "double_click",
+                    "parameters": {"target_text": "Microsoft Edge"},
+                },
+                "reason": "open desktop shortcut",
+                "confidence": 0.95,
+            },
+            ensure_ascii=False,
+        )
+
         return (
             f"{original_prompt}\n\n"
             "## Previous response was invalid\n"
             f"Validation error: {type(error).__name__}: {error}\n"
             f"Previous response: {raw_text or '<empty>'}\n\n"
-            "Return a corrected JSON object only. Do not add commentary."
-            "\nFor click-like actions prefer target_text from OCR or a visible "
-            "element label. Use element_id only when the candidate has a "
-            "non-empty semantic label, and include target_text with it. Never "
-            "use x/y alone and never guess an element_id. Use double_click for "
-            "desktop shortcuts, files and folders. Example: "
-            '{"decision":"act","action":{"type":"double_click",'
-            '"parameters":{"target_text":"Microsoft Edge"},'
-            '"reason":"open desktop shortcut",'
-            '"confidence":0.95}'"\nFor every click-like action, target_text is required. "
-            "element_id is optional but must never be used alone. "
-            "Never return x/y alone and never guess an element_id. "
-            "Use double_click for desktop shortcuts, files and folders. "
-            "If the requested target is not visible, return retry. Example: "
-            '{"decision":"act","action":{"type":"double_click",'
-            '"parameters":{"target_text":"Microsoft Edge"},'
-            '"reason":"open desktop shortcut",'
-            '"confidence":0.95}'
+            "Return a corrected JSON object only. Do not add commentary.\n"
+            "For every click-like action target_text is required and must be "
+            "copied from visible OCR text or a GUI label. element_id is "
+            "optional and must never be used alone. Never return x/y alone "
+            "and never guess an element_id. Use double_click for desktop "
+            "shortcuts, files and folders; use click for buttons, menus, tabs "
+            "and taskbar icons. If the requested target is not visible, "
+            "return retry.\n"
+            f"Example: {example}"
         )
 
     # --------------------------------------------------------
@@ -1861,10 +1783,6 @@ class Planner:
                     return list(value)
         return []
 
-    @staticmethod
-    def _normalize_target_text(value: Any) -> str:
-        return " ".join(str(value or "").casefold().split())
-
     def _resolve_action_target(
         self,
         *,
@@ -1938,37 +1856,26 @@ class Planner:
                 )
 
         if target is None and target_text:
-            expected = self._normalize_target_text(target_text)
+            expected = normalise_target_text(target_text)
             matches: list[tuple[int, float, int, int, Any]] = []  # 添加bbox_size
             
             # 获取屏幕高度用于桌面区域判断
             screen_height = observation.screen_height if observation else 1080
             
             for index, element in enumerate(elements):
+                # element_type 只是启发式类别，不能作为语义证据，因此不参与匹配：
+                # 否则选中的元素会缺少 matched_text，动作在执行前必然被拒绝。
                 labels = [
                     self._element_value(element, "text", ""),
                     self._element_value(element, "label", ""),
                     self._element_value(element, "name", ""),
-                    self._element_value(element, "element_type", ""),
                 ]
-                normalized_labels = [
-                    self._normalize_target_text(label)
-                    for label in labels
-                    if self._normalize_target_text(label)
-                ]
+                labels = [label for label in labels if normalise_target_text(label)]
                 score = 0
-                if expected in normalized_labels:
+                if any(normalise_target_text(label) == expected for label in labels):
                     score = 3
-                elif any(
-                    expected in label or label in expected
-                    for label in normalized_labels
-                ):
+                elif any(texts_match(target_text, label) for label in labels):
                     score = 2
-                elif any(
-                    set(expected.split()) <= set(label.split())
-                    for label in normalized_labels
-                ):
-                    score = 1
                 if score:
                     confidence = float(
                         self._element_value(
@@ -2039,31 +1946,18 @@ class Planner:
                 "element_id alone is not accepted."
             )
 
-        if element_id is not None:
-            if not detected_text:
-                raise PlannerValidationError(
-                    f"element_id={element_id} has no text, label or name, "
-                    f"so it cannot be verified as target_text={target_text!r}."
-                )
-
-            expected = self._normalize_target_text(target_text)
-            actual = self._normalize_target_text(detected_text)
-
-            expected_tokens = set(expected.split())
-            actual_tokens = set(actual.split())
-
-            text_matches = (
-                expected == actual
-                or expected in actual
-                or actual in expected
-                or bool(expected_tokens & actual_tokens)
+        if not detected_text:
+            raise PlannerValidationError(
+                f"Resolved element (element_id={resolved_element_id}) has no "
+                "text, label or name, so it cannot be verified as "
+                f"target_text={target_text!r}."
             )
 
-            if not text_matches:
-                raise PlannerValidationError(
-                    f"target_text={target_text!r} does not match "
-                    f"element_id={element_id} text={detected_text!r}."
-                )
+        if not texts_match(target_text, detected_text):
+            raise PlannerValidationError(
+                f"target_text={target_text!r} is not supported by detected "
+                f"text={detected_text!r} (element_id={resolved_element_id})."
+            )
         bbox_value = self._element_value(target, "bbox")
         if not isinstance(bbox_value, Sequence) or len(bbox_value) != 4:
             raise PlannerValidationError(

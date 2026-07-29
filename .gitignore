@@ -1,0 +1,47 @@
+# Python 字节码与缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 运行产物：日志与输出（截图、感知可视化、agent 状态快照）
+logs/
+outputs/
+output/
+test_output/
+screenshots/
+*.log
+
+# 数据集与外部仓库（体积大，均来自公开渠道，不入库）
+data/
+external/
+*.jsonl
+# Mind2Web 数据集样本（2.8 MB），预处理脚本可重新生成
+/sample.json
+
+# 项目资料与文档（含实习项目大纲 PDF）
+*.pdf
+*.docx
+*.doc
+*.pptx
+*.ppt
+*.xlsx
+*.xls
+
+# 编辑器与操作系统
+.idea/
+.DS_Store
+Thumbs.db
+
+# 密钥与本地配置（DASHSCOPE_API_KEY 等严禁入库）
+.env
+.env.*
+*.key
+secrets.json
