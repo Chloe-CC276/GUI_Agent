@@ -27,6 +27,7 @@ from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
 from .verify_policy import latest_action_type, should_skip_verification
+from .browser_search import apply_focus_verify_override
 
 try:
     from .prompts import PromptBuilder, PromptKind
@@ -357,6 +358,20 @@ class AgentGraph:
             self._validate_verify(data)
         except Exception as error:
             return self._exception_reflection(state, error, "verification")
+
+        data, overridden = apply_focus_verify_override(
+            data,
+            action=state.latest_action,
+            before=state.previous_observation,
+            after=state.observation,
+        )
+        if overridden:
+            state.add_history(
+                event_type="verify_focus_override",
+                message=str(data.get("reason") or "Focus verify override"),
+                status=ResultStatus.SUCCESS,
+                metadata={"verify": data},
+            )
 
         succeeded = bool(data["action_effective"]) and data["status"] == "success"
         task_complete = bool(data["task_complete"])

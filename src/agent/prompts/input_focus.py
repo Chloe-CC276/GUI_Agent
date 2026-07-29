@@ -45,8 +45,10 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
             + "。"
         )
         verify = (
-            "若计划动作是点击搜索框/地址栏/输入框，且动作后观察按上述规则判定为已选中，"
-            "则将 action_effective 设为 true，不得因为缺少单独光标证据而判定失败。"
+            "若计划动作是点击搜索框/地址栏/输入框，或 hotkey Ctrl+L / Command+L 聚焦地址栏，"
+            "且动作后观察按上述规则判定为已选中，则将 action_effective 设为 true、status=success；"
+            "不得因为缺少单独光标证据而判定失败。出现历史/建议下拉，或检测元素数量明显增加，"
+            "就是焦点成功的充分证据。"
         )
         planner = (
             "浏览器内打开网站或发起搜索时，优先用 hotkey Ctrl+L（macOS 用 Command+L）"
@@ -75,9 +77,12 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
         + "."
     )
     verify = (
-        "If the planned action was clicking a search box, address bar or input field "
-        "and the after observation satisfies the combined focus rule above, set "
-        "action_effective=true; do not mark failure solely because a caret is missing."
+        "If the planned action was clicking a search box, address bar or input field, "
+        "or hotkey Ctrl+L / Command+L to focus the address bar, and the after observation "
+        "satisfies the combined focus rule above, set action_effective=true and "
+        "status=success; do not mark failure solely because a caret is missing. A "
+        "history/suggestion dropdown or a clear rise in detected element count is "
+        "sufficient evidence of successful focus."
     )
     planner = (
         "When opening a site or starting a search in the browser, prefer hotkey Ctrl+L "

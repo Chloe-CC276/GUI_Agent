@@ -27,6 +27,10 @@ from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, Sequence, TYPE_CHECKING
 
 from ..common.target_validation import normalise_target_text, texts_match
+from .browser_search import (
+    is_forbidden_suggestion_target,
+    maybe_rewrite_address_bar_click,
+)
 from .result import (
     ErrorInfo,
     PlannerDecision,
@@ -1276,6 +1280,14 @@ class Planner:
             action_type = self._normalize_action_type(
                 action_type
             )
+            action_type, parameters, rewritten = maybe_rewrite_address_bar_click(
+                action_type,
+                parameters,
+            )
+            if rewritten:
+                logger.info(
+                    "Rewrote address-bar click to hotkey Ctrl+L for browser search focus."
+                )
             parameters = self._validate_action_parameters(
                 action_type,
                 parameters,
@@ -1821,6 +1833,13 @@ class Planner:
                 "element_id alone cannot prove that the selected element "
                 "matches the task target. Return the visible OCR text or GUI "
                 "label and optionally include element_id."
+            )
+
+        if is_forbidden_suggestion_target(target_text):
+            raise PlannerValidationError(
+                f"Refusing to click suggestion/OCR junk target {target_text!r}. "
+                "For browser search use hotkey Ctrl+L to focus the address bar, "
+                "then paste_text and press enter."
             )
 
         observation = state.observation

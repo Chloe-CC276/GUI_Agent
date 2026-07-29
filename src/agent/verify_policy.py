@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from src.common.target_validation import coerce_action_mapping
+from src.agent.browser_search import is_address_bar_focus_action
 
 _SKIP_VERIFY_ACTION_TYPES: frozenset[str] = frozenset({"paste_text"})
 
@@ -62,6 +63,10 @@ def should_skip_verification(action: Any) -> bool:
         return True
     if action_type == "hotkey":
         return _normalized_hotkey_keys(action) in _ADDRESS_BAR_FOCUS_KEY_SETS
+    # Address-bar placeholder clicks are rewritten to Ctrl+L when possible; if a
+    # click still lands here, skip verify so paste can proceed without caret OCR.
+    if is_address_bar_focus_action(action):
+        return True
     return False
 
 
