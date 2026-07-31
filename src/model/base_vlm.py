@@ -391,14 +391,21 @@ def normalise_image(
             if prepare_for_vlm:
                 from .vlm_image_prep import prepare_numpy_image_for_vlm
 
-                prepared = prepare_numpy_image_for_vlm(image)
+                prep_info: dict[str, Any] = {}
+                prepared = prepare_numpy_image_for_vlm(image, info=prep_info)
                 if prepared is not None:
                     payload, prepared_mime = prepared
+                    prepared_metadata: dict[str, Any] = {"vlm_prepared": True}
+                    if "vlm_scale" in prep_info:
+                        prepared_metadata["vlm_scale"] = prep_info["vlm_scale"]
+                        prepared_metadata["original_size"] = prep_info[
+                            "original_size"
+                        ]
                     return ImageInput.from_bytes(
                         payload,
                         mime_type=prepared_mime,
                         detail=detail or "low",
-                        metadata={"vlm_prepared": True},
+                        metadata=prepared_metadata,
                     )
 
             import cv2
@@ -452,10 +459,12 @@ def _prepare_image_input_for_vlm(
     try:
         from .vlm_image_prep import prepare_image_bytes_for_vlm
 
+        prep_info: dict[str, Any] = {}
         raw = image.read_bytes()
         prepared, prepared_mime = prepare_image_bytes_for_vlm(
             raw,
             mime_type=image.mime_type,
+            info=prep_info,
         )
     except Exception:
         return image
@@ -464,6 +473,9 @@ def _prepare_image_input_for_vlm(
     metadata["vlm_prepared"] = True
     metadata["original_bytes"] = len(raw)
     metadata["prepared_bytes"] = len(prepared)
+    if "vlm_scale" in prep_info:
+        metadata["vlm_scale"] = prep_info["vlm_scale"]
+        metadata["original_size"] = prep_info["original_size"]
     return ImageInput.from_bytes(
         prepared,
         mime_type=prepared_mime,
@@ -848,18 +860,14 @@ class VLMUsage:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def normalise_total(self) -> None:
-        if self.total_tokens is None:
-            values = [
-                value
-                for value in (
-                    self.input_tokens,
-                    self.output_tokens,
-                )
-                if value is not None
-            ]
-
-            if values:
-                self.total_tokens = sum(values)
+        # Only derive a total when both counts are known; a lone input or
+        # output count is not a valid total.
+        if (
+            self.total_tokens is None
+            and self.input_tokens is not None
+            and self.output_tokens is not None
+        ):
+            self.total_tokens = self.input_tokens + self.output_tokens
 
     def to_dict(self) -> dict[str, Any]:
         self.normalise_total()
@@ -1587,15 +1595,20 @@ class BaseVLM(ABC):
         self._history.clear()
         self._response_history.clear()
 
+    _MAX_RESPONSE_HISTORY = 50
+
     def _record_success(
         self,
         request: VLMRequest,
         response: VLMResponse,
     ) -> None:
-        self._response_history.append(response)
-
         if not self.keep_history:
             return
+
+        self._response_history.append(response)
+
+        if len(self._response_history) > self._MAX_RESPONSE_HISTORY:
+            del self._response_history[: -self._MAX_RESPONSE_HISTORY]
 
         # Do not duplicate default/system/history messages. Only append the
         # newest user-side messages plus the assistant response.

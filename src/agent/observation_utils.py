@@ -154,6 +154,23 @@ def mark_post_action_observation(state: Any, observation: Any) -> None:
         )
 
 
+def is_partial_observation(observation: Any) -> bool:
+    """True for narrow-band / Win32-only captures that must never seed a plan.
+
+    Such observations only cover a small region (chat composer band) or carry
+    window titles without OCR; planning on them poisons screen size and hides
+    every element outside the band.
+    """
+
+    metadata = getattr(observation, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return False
+    if str(metadata.get("observation_kind") or "") == "win32_windows":
+        return True
+    region = metadata.get("capture_region")
+    return isinstance(region, Sequence) and not isinstance(region, str) and len(region) == 4
+
+
 def consume_post_action_observation(state: Any, observation: Any) -> bool:
     """Report whether *observation* is still the untouched post-action capture.
 
@@ -174,6 +191,7 @@ __all__ = [
     "POST_ACTION_OBSERVATION_KEY",
     "bbox_of",
     "consume_post_action_observation",
+    "is_partial_observation",
     "mark_post_action_observation",
     "iter_items",
     "iter_labeled_boxes",

@@ -48,6 +48,7 @@ from .launch_wait import needs_additional_observation, resolve_post_action_wait
 from .memory import AgentMemory, MemoryImportance, MemoryKind
 from .observation_utils import (
     consume_post_action_observation,
+    is_partial_observation,
     mark_post_action_observation,
 )
 from .result import (
@@ -70,6 +71,7 @@ from .browser_search import (
     is_address_bar_focus_action,
     record_phase_for_executed_action,
     record_search_phase,
+    search_progress,
 )
 
 from .prompts import PromptBuilder, PromptKind
@@ -651,15 +653,19 @@ class AgentChain:
                     "agent_state": state,
                     "stage": ChainStage.FAIL.value,
                 }
-            # Keep the pre-paste observation so the planner can submit immediately.
+            # Keep the pre-paste observation so the planner can submit
+            # immediately — unless it is a narrow/Win32 partial capture.
+            plan_ready = state.observation is not None and not (
+                is_partial_observation(state.observation)
+            )
             state.set_phase(
-                AgentPhase.PLANNING if state.observation is not None else AgentPhase.OBSERVING
+                AgentPhase.PLANNING if plan_ready else AgentPhase.OBSERVING
             )
             return {
                 "agent_state": state,
                 "stage": (
                     ChainStage.PLAN.value
-                    if state.observation is not None
+                    if plan_ready
                     else ChainStage.OBSERVE.value
                 ),
             }
@@ -776,6 +782,12 @@ class AgentChain:
         state: AgentState,
         data: dict[str, Any],
     ) -> dict[str, Any]:
+        # Focus evidence only means something inside a browser-search flow;
+        # on other tasks it would overturn a legitimate VLM verdict.
+        if search_progress(state) is None and not is_address_bar_focus_action(
+            state.latest_action
+        ):
+            return data
         data, overridden = apply_focus_verify_override(
             data,
             action=state.latest_action,
@@ -838,7 +850,16 @@ class AgentChain:
             elif is_chat_send_task(instruction) and (
                 is_chat_paste_action(state.latest_action)
                 or is_chat_submit_action(state.latest_action)
-                or self._latest_action_type(state.latest_action) == "wait"
+                or (
+                    # Only submitted-phase waits belong to the chat flow; a
+                    # generic wait earlier must go through normal VLM verify.
+                    self._latest_action_type(state.latest_action) == "wait"
+                    and str(
+                        (state.metadata.get("chat_progress") or {}).get("phase")
+                        or ""
+                    )
+                    == "submitted"
+                )
             ):
                 ensure_chat_progress(state)
                 data = {
@@ -1017,9 +1038,14 @@ class AgentChain:
             "last_raw_response": raw,
         }
         if complete and confidence >= self.config.verify_confidence_threshold:
-            self._commit_current_step(state)
+            # final=True: completing on the last step is success, not MAX_STEPS.
+            self._commit_current_step(state, final=True)
             shared["stage"] = ChainStage.FINISH.value
-        elif succeeded and str(data["recommended_next"]) in {"continue", "replan"}:
+        elif succeeded and str(data["recommended_next"]) in {
+            "continue",
+            "replan",
+            "finish",
+        }:
             self._commit_current_step(state)
             shared["stage"] = ChainStage.MEMORY.value
         else:
@@ -1062,7 +1088,10 @@ class AgentChain:
         if state.is_terminal or self._limit_reached(state):
             return self._fail_update(state, "Agent reached its step/time limit.")
         stage = ChainStage.PLAN if bool(data["should_replan"]) else ChainStage.OBSERVE
-        if stage is ChainStage.PLAN and state.observation is None:
+        if stage is ChainStage.PLAN and (
+            state.observation is None
+            or is_partial_observation(state.observation)
+        ):
             stage = ChainStage.OBSERVE
         state.set_phase(
             AgentPhase.PLANNING if stage is ChainStage.PLAN else AgentPhase.OBSERVING
@@ -1109,6 +1138,10 @@ class AgentChain:
         twice: nothing touched the GUI between the two observations."""
 
         if not self.config.reuse_post_action_observation:
+            return False
+        # Narrow-band / Win32-only captures cover a sliver of the screen and
+        # must never seed the next plan (they poison screen size and targets).
+        if is_partial_observation(state.observation):
             return False
         if not consume_post_action_observation(state, state.observation):
             return False
@@ -1216,11 +1249,11 @@ class AgentChain:
             raise ModelResponseError("should_replan must be boolean")
 
     @staticmethod
-    def _commit_current_step(state: AgentState) -> None:
+    def _commit_current_step(state: AgentState, *, final: bool = False) -> None:
         if state.last_planner_result is None:
             return
         try:
-            state.commit_step()
+            state.commit_step(final=final)
         except Exception:
             if not state.last_planner_result.is_finished:
                 raise

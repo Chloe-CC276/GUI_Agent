@@ -21,6 +21,8 @@ SM_CYSCREEN = 1
 SW_RESTORE = 9
 GW_OWNER = 4
 
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
 # Microsoft Office main windows.
 _WORD_CLASS_NAMES: frozenset[str] = frozenset({"opusapp"})
 _WORD_TITLE_HINTS: tuple[str, ...] = ("word", "microsoft word")
@@ -65,10 +67,52 @@ def is_supported() -> bool:
     return platform.system().lower() == "windows"
 
 
+_USER32: ctypes.WinDLL | None = None
+
+
 def _user32() -> ctypes.WinDLL:
+    """Return the cached user32 DLL with explicit function signatures.
+
+    Explicit ``argtypes``/``restype`` matter on 64-bit Python: without them
+    ctypes assumes 32-bit ``int`` and truncates HWND handles.
+    """
+
+    global _USER32
+    if _USER32 is not None:
+        return _USER32
     if not is_supported():
         raise Win32WindowError("Win32 window helpers are only available on Windows.")
-    return ctypes.WinDLL("user32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+    user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+
+    _USER32 = user32
+    return user32
 
 
 def screen_size() -> tuple[int, int]:
@@ -126,7 +170,7 @@ def list_top_level_windows(*, visible_only: bool = True) -> list[WindowInfo]:
     user32 = _user32()
     windows: list[WindowInfo] = []
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    @_WNDENUMPROC
     def _callback(hwnd: wintypes.HWND, _lparam: wintypes.LPARAM) -> bool:
         if visible_only and not user32.IsWindowVisible(hwnd):
             return True
@@ -238,7 +282,10 @@ def activate_window(hwnd: int) -> bool:
         return False
     user32 = _user32()
     handle = wintypes.HWND(int(hwnd))
-    user32.ShowWindow(handle, SW_RESTORE)
+    # Restore only minimized windows; SW_RESTORE on a maximized window would
+    # knock it back to its normal (smaller) size.
+    if user32.IsIconic(handle):
+        user32.ShowWindow(handle, SW_RESTORE)
     return bool(user32.SetForegroundWindow(handle))
 
 

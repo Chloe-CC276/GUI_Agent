@@ -169,7 +169,8 @@ def build_planner_rules(
     """Build numbered Planner rules, including relevant config constraints."""
 
     cfg = config or PromptConfig()
-    resolved = cfg.resolve_language(str(language) if language is not None else None)
+    hint = language.value if isinstance(language, PromptLanguage) else language
+    resolved = cfg.resolve_language(str(hint) if hint is not None else None)
     rules = list(PLANNER_RULES_ZH if resolved is PromptLanguage.ZH else PLANNER_RULES_EN)
     rules.extend(input_focus_rules_for(resolved, include_planner=True))
     rules.extend(search_workflow_rules(resolved, include_planner=True))

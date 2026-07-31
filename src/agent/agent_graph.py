@@ -46,10 +46,13 @@ from .chat_send import (
     record_chat_phase_for_executed_action,
     should_finish_chat_task,
 )
+from src.common.target_validation import validate_click_target
+
 from .launch_wait import needs_additional_observation, resolve_post_action_wait
 from .memory import AgentMemory, MemoryImportance, MemoryKind
 from .observation_utils import (
     consume_post_action_observation,
+    is_partial_observation,
     mark_post_action_observation,
 )
 from .result import (
@@ -72,6 +75,7 @@ from .browser_search import (
     is_address_bar_focus_action,
     record_phase_for_executed_action,
     record_search_phase,
+    search_progress,
 )
 
 try:
@@ -228,7 +232,8 @@ class AgentGraph:
         graph.add_edge(START, GraphRoute.OBSERVE.value)
         graph.add_conditional_edges(
             GraphRoute.OBSERVE.value, self._route,
-            self._route_map(GraphRoute.PLAN, GraphRoute.FAIL),
+            # REFLECT: retryable perception failures route to reflection.
+            self._route_map(GraphRoute.PLAN, GraphRoute.REFLECT, GraphRoute.FAIL),
         )
         graph.add_conditional_edges(
             GraphRoute.PLAN.value, self._route,
@@ -239,7 +244,12 @@ class AgentGraph:
         )
         graph.add_conditional_edges(
             GraphRoute.EXECUTE.value, self._route,
-            self._route_map(GraphRoute.OBSERVE_AFTER, GraphRoute.REFLECT, GraphRoute.FAIL),
+            # PLAN / OBSERVE: skip-verify actions continue without a post
+            # observation (e.g. paste_text, chat composer focus clicks).
+            self._route_map(
+                GraphRoute.OBSERVE_AFTER, GraphRoute.PLAN, GraphRoute.OBSERVE,
+                GraphRoute.REFLECT, GraphRoute.FAIL,
+            ),
         )
         graph.add_conditional_edges(
             GraphRoute.OBSERVE_AFTER.value, self._route,
@@ -454,6 +464,35 @@ class AgentGraph:
 
     async def execute_node(self, graph: GraphState) -> GraphState:
         state = graph["agent_state"]
+
+        # Same pre-execution evidence gate as AgentChain: a click without a
+        # matched target must never reach the executor.
+        validation_error = validate_click_target(
+            state.latest_action, require_evidence=True
+        )
+        if validation_error:
+            target_rejection_count = (
+                int(state.metadata.get("target_rejection_count", 0)) + 1
+            )
+            state.metadata["target_rejection_count"] = target_rejection_count
+            state.add_history(
+                event_type="action_rejected",
+                message=validation_error,
+                status=ResultStatus.RETRY,
+                metadata={
+                    "rejection_count": target_rejection_count,
+                    "max_rejections": 2,
+                },
+            )
+            if target_rejection_count > 2:
+                return self._fail_update(
+                    state,
+                    f"Target validation failed repeatedly: {validation_error}",
+                )
+            state.set_phase(AgentPhase.OBSERVING)
+            return {"agent_state": state, "route": GraphRoute.OBSERVE.value}
+        state.metadata["target_rejection_count"] = 0
+
         if prepare_close_execution(state):
             state.add_history(
                 event_type="close_window_activated",
@@ -503,7 +542,10 @@ class AgentGraph:
             self._commit_current_step(state)
             if state.is_terminal:
                 return {"agent_state": state, "route": GraphRoute.FAIL.value}
-            if state.observation is not None:
+            # Plan on the kept observation unless it is a partial capture.
+            if state.observation is not None and not is_partial_observation(
+                state.observation
+            ):
                 state.set_phase(AgentPhase.PLANNING)
                 return {"agent_state": state, "route": GraphRoute.PLAN.value}
             state.set_phase(AgentPhase.OBSERVING)
@@ -612,6 +654,12 @@ class AgentGraph:
         state: AgentState,
         data: dict[str, Any],
     ) -> dict[str, Any]:
+        # Focus evidence only means something inside a browser-search flow;
+        # on other tasks it would overturn a legitimate VLM verdict.
+        if search_progress(state) is None and not is_address_bar_focus_action(
+            state.latest_action
+        ):
+            return data
         data, overridden = apply_focus_verify_override(
             data,
             action=state.latest_action,
@@ -674,7 +722,16 @@ class AgentGraph:
             elif is_chat_send_task(instruction) and (
                 is_chat_paste_action(state.latest_action)
                 or is_chat_submit_action(state.latest_action)
-                or self._latest_action_type(state.latest_action) == "wait"
+                or (
+                    # Only submitted-phase waits belong to the chat flow; a
+                    # generic wait earlier must go through normal VLM verify.
+                    self._latest_action_type(state.latest_action) == "wait"
+                    and str(
+                        (state.metadata.get("chat_progress") or {}).get("phase")
+                        or ""
+                    )
+                    == "submitted"
+                )
             ):
                 ensure_chat_progress(state)
                 data = {
@@ -851,7 +908,8 @@ class AgentGraph:
         state.update_verification_result(verification)
 
         if task_complete and confidence >= self.config.verify_confidence_threshold:
-            self._commit_current_step(state)
+            # final=True: completing on the last step is success, not MAX_STEPS.
+            self._commit_current_step(state, final=True)
             return {
                 "agent_state": state, "route": GraphRoute.FINISH.value,
                 "verify_data": data, "last_prompt": prompt,
@@ -907,10 +965,14 @@ class AgentGraph:
         if state.is_terminal or self._limit_reached(state):
             return self._fail_update(state, "Agent reached its step/time limit.")
         route = GraphRoute.PLAN if bool(data["should_replan"]) else GraphRoute.OBSERVE
-        if route is GraphRoute.PLAN and state.observation is None:
+        if route is GraphRoute.PLAN and (
+            state.observation is None
+            or is_partial_observation(state.observation)
+        ):
             route = GraphRoute.OBSERVE
-        else:
-            state.set_phase(AgentPhase.PLANNING if route is GraphRoute.PLAN else AgentPhase.OBSERVING)
+        state.set_phase(
+            AgentPhase.PLANNING if route is GraphRoute.PLAN else AgentPhase.OBSERVING
+        )
         return {
             "agent_state": state, "route": route.value,
             "reflection_data": data, "last_prompt": prompt,
@@ -950,6 +1012,10 @@ class AgentGraph:
         twice: nothing touched the GUI between the two observations."""
 
         if not self.config.reuse_post_action_observation:
+            return False
+        # Narrow-band / Win32-only captures cover a sliver of the screen and
+        # must never seed the next plan (they poison screen size and targets).
+        if is_partial_observation(state.observation):
             return False
         if not consume_post_action_observation(state, state.observation):
             return False
@@ -1063,11 +1129,11 @@ class AgentGraph:
             raise ModelResponseError("should_replan must be boolean")
 
     @staticmethod
-    def _commit_current_step(state: AgentState) -> None:
+    def _commit_current_step(state: AgentState, *, final: bool = False) -> None:
         if state.last_planner_result is None:
             return
         try:
-            state.commit_step()
+            state.commit_step(final=final)
         except Exception:
             # FINISH planner decisions do not always form an executable step.
             if not state.last_planner_result.is_finished:

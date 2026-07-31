@@ -33,7 +33,6 @@ Therefore:
 
 from __future__ import annotations
 
-import csv
 import json
 import logging
 import random
@@ -43,6 +42,12 @@ from typing import Any, Iterator, Sequence
 
 from datasets import Dataset, DatasetDict, load_from_disk
 
+from ._common import (
+    _csv_json,
+    _optional_string,
+    _validate_split_ratios,
+    _write_csv,
+)
 from .schema import (
     DatasetSplit,
     DatasetStatistics,
@@ -303,7 +308,7 @@ class Mind2WebLoader:
         One dataset row corresponds to one complete task.
         Each element in ``actions`` becomes one GUITaskStep.
         """
-        self._validate_index(index)
+        index = self._resolve_index(index)
 
         if (
             use_cache
@@ -1070,24 +1075,9 @@ class Mind2WebLoader:
         self._write_csv(destination, [row], encoding=encoding)
         return destination
 
-    @staticmethod
-    def _csv_json(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    _csv_json = staticmethod(_csv_json)
 
-    @staticmethod
-    def _write_csv(destination: Path, rows: Sequence[dict[str, Any]], *, encoding: str) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames: list[str] = []
-        for row in rows:
-            for key in row:
-                if key not in fieldnames:
-                    fieldnames.append(key)
-        if not fieldnames:
-            fieldnames = ["task_id"]
-        with destination.open("w", encoding=encoding, newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+    _write_csv = staticmethod(_write_csv)
 
     def split_dataset(
         self,
@@ -1219,57 +1209,32 @@ class Mind2WebLoader:
             test=test_samples,
         )
 
-    @staticmethod
-    def _validate_split_ratios(
-        train_ratio: float,
-        validation_ratio: float,
-        test_ratio: float,
-    ) -> None:
-        ratios = [
-            train_ratio,
-            validation_ratio,
-            test_ratio,
-        ]
-
-        if any(
-            not isinstance(value, (int, float))
-            for value in ratios
-        ):
-            raise TypeError(
-                "Split ratios must be numeric."
-            )
-
-        if any(value < 0 for value in ratios):
-            raise ValueError(
-                "Split ratios must not be negative."
-            )
-
-        if abs(sum(ratios) - 1.0) > 1e-8:
-            raise ValueError(
-                "train_ratio + validation_ratio + "
-                "test_ratio must equal 1.0."
-            )
+    _validate_split_ratios = staticmethod(_validate_split_ratios)
 
     # ============================================================
     # Helpers
     # ============================================================
 
-    def _validate_index(
+    def _resolve_index(
         self,
         index: int,
-    ) -> None:
+    ) -> int:
         if not isinstance(index, int):
             raise TypeError(
                 "index must be an integer."
             )
 
-        if index < 0:
-            index += len(self.dataset)
+        resolved = index
 
-        if index < 0 or index >= len(self.dataset):
+        if resolved < 0:
+            resolved += len(self.dataset)
+
+        if resolved < 0 or resolved >= len(self.dataset):
             raise IndexError(
                 f"Mind2Web index out of range: {index}"
             )
+
+        return resolved
 
     @staticmethod
     def _required_string(
@@ -1295,18 +1260,7 @@ class Mind2WebLoader:
 
         return value
 
-    @staticmethod
-    def _optional_string(
-        value: Any,
-    ) -> str | None:
-        if value is None:
-            return None
-
-        if isinstance(value, str):
-            text = value.strip()
-            return text or None
-
-        return str(value)
+    _optional_string = staticmethod(_optional_string)
 
     def clear_cache(self) -> None:
         """Clear converted sample cache."""

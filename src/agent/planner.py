@@ -1403,15 +1403,17 @@ class Planner:
                     "Rewrote a chat-task action to %s.",
                     action_type,
                 )
+            # Chat-phase validation must run before target resolution strips
+            # target_text into metadata, or its click checks see empty labels.
+            try:
+                validate_chat_action(action_type, parameters, state)
+            except ValueError as error:
+                raise PlannerValidationError(str(error)) from error
             parameters = self._validate_action_parameters(
                 action_type,
                 parameters,
                 state,
             )
-            try:
-                validate_chat_action(action_type, parameters, state)
-            except ValueError as error:
-                raise PlannerValidationError(str(error)) from error
 
         elif decision == PlannerDecision.FINISH:
             if not finish_message:
@@ -2045,10 +2047,12 @@ class Planner:
 
         if target is None and target_text:
             expected = normalise_target_text(target_text)
-            matches: list[tuple[int, float, int, int, Any]] = []  # 添加bbox_size
+            matches: list[tuple[int, int, float, int, int, Any]] = []
             
             # 获取屏幕高度用于桌面区域判断
             screen_height = observation.screen_height if observation else 1080
+            # 桌面图标偏好只适用于启动类动作（双击桌面快捷方式）。
+            prefers_desktop_icon = action_type == "double_click"
             
             for index, element in enumerate(elements):
                 # element_type 只是启发式类别，不能作为语义证据，因此不参与匹配：
@@ -2080,36 +2084,34 @@ class Planner:
                         candidate_id = index
                     
                     # 计算bbox大小（用于优先选择小图标）
+                    desktop_bonus = 0
                     bbox = self._element_value(element, "bbox", [0, 0, 0, 0])
                     if isinstance(bbox, Sequence) and len(bbox) == 4:
                         width = abs(bbox[2] - bbox[0])
                         height = abs(bbox[3] - bbox[1])
                         bbox_size = width * height
                         
-                        # 检查是否在桌面区域（屏幕下半部分）
+                        # 桌面区域（屏幕下半部分）的小图标：仅在启动类动作里
+                        # 作为同分候选之间的次级偏好，绝不能压过精确文本匹配。
                         center_y = (bbox[1] + bbox[3]) / 2
                         is_desktop_area = center_y > screen_height * 0.5
-                        
-                        # 桌面图标通常很小（宽高都小于100）
                         is_small_icon = width < 100 and height < 100
-                        
-                        # 如果是桌面应用任务，优先选择桌面区域的小图标
-                        if is_desktop_area and is_small_icon:
-                            score += 10  # 大幅提升桌面小图标的优先级
+                        if prefers_desktop_icon and is_desktop_area and is_small_icon:
+                            desktop_bonus = 1
                     else:
                         bbox_size = 999999  # 无效bbox给最大值
                     
                     matches.append(
-                        (score, confidence, bbox_size, candidate_id, element)
+                        (score, desktop_bonus, confidence, bbox_size, candidate_id, element)
                     )
 
             if not matches:
                 raise PlannerValidationError(
                     f"Target element was not detected: {target_text!r}."
                 )
-            # 优先级：score最高 -> confidence最高 -> bbox最小（优先小图标）
-            _, _, _, resolved_element_id, target = max(
-                matches, key=lambda item: (item[0], item[1], -item[2])
+            # 优先级：score最高 -> 桌面图标偏好 -> confidence最高 -> bbox最小
+            _, _, _, _, resolved_element_id, target = max(
+                matches, key=lambda item: (item[0], item[1], item[2], -item[3])
             )
 
         if target is None:

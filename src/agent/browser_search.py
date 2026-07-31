@@ -16,6 +16,7 @@ from typing import Any
 from src.common.target_validation import (
     CLICK_ACTION_TYPES,
     coerce_action_mapping,
+    flatten_action_evidence,
     normalise_target_text,
 )
 
@@ -277,28 +278,12 @@ def maybe_rewrite_address_bar_click(
 
 
 def _action_target_text(action: Any) -> str:
-    if action is None:
-        return ""
-    data = coerce_action_mapping(action)
-    nested = data.get("parameters")
-    if isinstance(nested, Mapping):
-        data = {**data, **dict(nested)}
-    metadata = data.get("metadata")
-    if isinstance(metadata, Mapping):
-        validation = metadata.get("target_validation")
-        if isinstance(validation, Mapping) and validation.get("target_text"):
-            return str(validation.get("target_text") or "")
+    data = flatten_action_evidence(action)
     return str(data.get("target_text") or data.get("text") or "")
 
 
 def _action_data(action: Any) -> dict[str, Any]:
-    if action is None:
-        return {}
-    data = coerce_action_mapping(action)
-    nested = data.get("parameters")
-    if isinstance(nested, Mapping):
-        data = {**data, **dict(nested)}
-    return data
+    return flatten_action_evidence(action)
 
 
 def _action_type(data: Mapping[str, Any]) -> str:

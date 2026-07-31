@@ -21,7 +21,7 @@ from typing import Any
 
 from src.common.target_validation import (
     CLICK_ACTION_TYPES,
-    coerce_action_mapping,
+    flatten_action_evidence,
     normalise_target_text,
 )
 
@@ -70,9 +70,18 @@ _THINKING_MARKERS: tuple[str, ...] = (
     "reasoning",
     "stopgenerating",
     "停止生成",
+)
+
+# Short generic labels match only as the *entire* OCR text; substring matching
+# would fire on desktop / Stopwatch / 暂停止血 and fake task completion.
+_THINKING_EXACT_MARKERS: tuple[str, ...] = (
     "停止",
     "stop",
 )
+
+# After this many fruitless narrow-band waits in the submitted phase, hand
+# control back to the VLM on a full-screen observation instead of looping.
+_MAX_SUBMITTED_WAITS: int = 3
 
 _PASTE_ACTION_TYPES: frozenset[str] = frozenset(
     {"paste_text", "paste", "type_text", "type", "write"}
@@ -152,16 +161,27 @@ def message_fingerprint(message: Any) -> str:
 
 
 def is_chat_input_target(text: Any) -> bool:
+    """True only for genuine composer placeholders.
+
+    Containment needs length guards: bare ``发送`` is a substring of the
+    placeholder ``给chatgpt发送消息`` but is a send *button*, not the input box.
+    """
+
     normalised = normalise_target_text(text)
     if not normalised:
         return False
-    if normalised.startswith("+"):
-        normalised = normalised[1:]
-    placeholders = [normalise_target_text(item) for item in _INPUT_PLACEHOLDERS]
-    return any(
-        marker and (marker in normalised or normalised in marker)
-        for marker in placeholders
-    )
+    for raw_marker in _INPUT_PLACEHOLDERS:
+        marker = normalise_target_text(raw_marker)
+        if not marker:
+            continue
+        if normalised == marker:
+            return True
+        if marker in normalised and len(marker) >= 6:
+            return True
+        # A fragment of the placeholder only counts when it is substantial.
+        if normalised in marker and len(normalised) >= max(6, (len(marker) + 1) // 2):
+            return True
+    return False
 
 
 def chat_progress(state: Any) -> dict[str, Any] | None:
@@ -227,7 +247,7 @@ def ensure_chat_progress(state: Any) -> dict[str, Any] | None:
         "fingerprint": fingerprint,
         "next_action": _guidance_for(phase, message),
     }
-    for key in ("input_bbox", "input_target", "evidence"):
+    for key in ("input_bbox", "input_target", "evidence", "wait_attempts"):
         if key in current:
             progress[key] = current[key]
     metadata[CHAT_PROGRESS_KEY] = progress
@@ -329,7 +349,21 @@ def forced_chat_action(state: Any) -> tuple[str, dict[str, Any]] | None:
         )
 
     if phase == PHASE_SUBMITTED:
-        logger.info("chat_progress forcing wait before thinking check | phase=%s", phase)
+        attempts = int(progress.get("wait_attempts") or 0)
+        if attempts >= _MAX_SUBMITTED_WAITS:
+            logger.info(
+                "chat_progress wait budget exhausted (%d); handing control "
+                "back to the planner on a full observation.",
+                attempts,
+            )
+            return None
+        logger.info(
+            "chat_progress forcing wait before thinking check | phase=%s | "
+            "attempt=%d/%d",
+            phase,
+            attempts + 1,
+            _MAX_SUBMITTED_WAITS,
+        )
         return (
             "wait",
             {
@@ -409,7 +443,9 @@ def maybe_rewrite_chat_action(
                 },
                 True,
             )
-        if _PHASE_RANK.get(phase, 0) >= _PHASE_RANK[PHASE_SUBMITTED]:
+        if _PHASE_RANK.get(phase, 0) >= _PHASE_RANK[PHASE_SUBMITTED] and (
+            int(progress.get("wait_attempts") or 0) < _MAX_SUBMITTED_WAITS
+        ):
             logger.info(
                 "Rewrote post-submit chat click to wait | target=%r",
                 target,
@@ -454,36 +490,9 @@ def maybe_rewrite_chat_action(
 
 
 def _action_data(action: Any) -> dict[str, Any]:
-    """Flatten Action / nested parameters / planner target_validation evidence.
+    """Flat action mapping with planner target_validation evidence restored."""
 
-    Planner stores click evidence under ``metadata.target_validation`` and
-    strips top-level ``target_text`` / ``element_id`` before building the
-    Action. Callers that only read ``target_text`` or ``bbox`` therefore miss
-    the composer label — flatten the validation block so chat helpers share
-    the same field names as ``validate_click_target``.
-    """
-
-    data = coerce_action_mapping(action)
-    nested = data.get("parameters")
-    if isinstance(nested, Mapping):
-        data = {**data, **dict(nested)}
-    metadata = data.get("metadata")
-    if not isinstance(metadata, Mapping):
-        return data
-    validation = metadata.get("target_validation")
-    if not isinstance(validation, Mapping):
-        return data
-    if not data.get("target_text") and validation.get("target_text"):
-        data["target_text"] = validation["target_text"]
-    if not data.get("matched_text") and validation.get("matched_text"):
-        data["matched_text"] = validation["matched_text"]
-    if data.get("element_id") is None and validation.get("element_id") is not None:
-        data["element_id"] = validation["element_id"]
-    if not data.get("bbox") and not data.get("bounding_box"):
-        bbox = validation.get("matched_bbox")
-        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-            data["bbox"] = list(bbox)
-    return data
+    return flatten_action_evidence(action)
 
 
 def register_chat_composer_target(
@@ -657,6 +666,17 @@ def record_chat_phase_for_executed_action(
             )
         return progress
 
+    if latest_action_type(action) == "wait" and phase == PHASE_SUBMITTED:
+        metadata = getattr(state, "metadata", None)
+        if isinstance(metadata, MutableMapping):
+            updated = {
+                **progress,
+                "wait_attempts": int(progress.get("wait_attempts") or 0) + 1,
+            }
+            metadata[CHAT_PROGRESS_KEY] = updated
+            return updated
+        return progress
+
     return progress
 
 
@@ -754,6 +774,13 @@ def chat_observe_options(state: Any, action: Any) -> dict[str, Any] | None:
     )
     if not useful:
         return None
+    # Once the wait budget is nearly spent, fall back to a full observation so
+    # thinking markers / reply bubbles outside the narrow band become visible.
+    if (
+        phase == PHASE_SUBMITTED
+        and int(progress.get("wait_attempts") or 0) >= _MAX_SUBMITTED_WAITS - 1
+    ):
+        return None
     bbox = progress.get("input_bbox")
     if not isinstance(bbox, Sequence) or len(bbox) != 4:
         return None
@@ -813,7 +840,10 @@ def detect_pasted_message(
         normalised = normalise_target_text(text)
         if not normalised:
             continue
-        if needle not in normalised and normalised not in needle:
+        reverse_hit = (
+            normalised in needle and len(normalised) >= _FINGERPRINT_MIN
+        )
+        if needle not in normalised and not reverse_hit:
             # Also accept when the full message appears.
             if normalise_target_text(message) not in normalised:
                 continue
@@ -866,7 +896,11 @@ def detect_thinking_marker(observation: Any) -> tuple[bool, list[str]]:
             if marker_n and marker_n in normalised:
                 evidence.append(f"Thinking marker visible: {text!r}.")
                 return True, evidence
-    # Also scan raw joined OCR for short markers like Stop.
+        # 停止 / Stop count only as a standalone label (the stop button).
+        if normalised in _THINKING_EXACT_MARKERS:
+            evidence.append(f"Stop button visible: {text!r}.")
+            return True, evidence
+    # Also scan raw joined OCR for the longer, unambiguous markers.
     corpus = normalise_target_text(
         " ".join(iter_texts(observation))
     )
@@ -950,11 +984,12 @@ def apply_chat_verify_override(
             return data, True
         return data, False
 
-    # After enter / wait: look for thinking / generating chrome.
-    if (
-        phase == PHASE_SUBMITTED
-        or is_chat_submit_action(action)
-        or latest_action_type(action) == "wait"
+    # After enter / wait: look for thinking / generating chrome. A stray wait
+    # in an earlier phase must not open this branch, or a false thinking
+    # marker could complete the task before anything was even pasted.
+    if phase == PHASE_SUBMITTED or (
+        is_chat_submit_action(action)
+        and _PHASE_RANK.get(phase, 0) >= _PHASE_RANK[PHASE_TEXT_PASTED]
     ):
         detected, evidence = detect_thinking_marker(after)
         if detected:

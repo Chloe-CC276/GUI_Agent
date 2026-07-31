@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from src.agent.prompts._init_ import PromptBuilder, PromptConfig, PromptLanguage
+from src.agent.prompts import PromptBuilder, PromptConfig, PromptLanguage
 
 
 class RecordingVLM:

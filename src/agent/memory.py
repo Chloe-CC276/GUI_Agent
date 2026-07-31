@@ -644,9 +644,11 @@ def make_vlm_summarizer(vlm: Any, *, prompt_config: Any = None) -> SummarizerPro
         history: Sequence[Mapping[str, Any]],
     ) -> Any:
         try:
-            from prompts.memory_prompt import build_memory_messages
+            from .prompts.memory_prompt import build_memory_messages
         except ImportError as error:
-            raise MemorySummarizationError("prompts.memory_prompt is unavailable.") from error
+            raise MemorySummarizationError(
+                "src.agent.prompts.memory_prompt is unavailable."
+            ) from error
         prompt = build_memory_messages(
             state, prompt_config, existing_memory=existing_memory, history=history,
         )
@@ -677,14 +679,15 @@ def summarize_with_vlm(
     )
 
 
+# Keys must match the event_type strings emitted by AgentState.add_history.
 _EVENT_KIND_MAP: dict[str, MemoryKind] = {
     "observation_updated": MemoryKind.OBSERVATION,
     "observation": MemoryKind.OBSERVATION,
-    "planner_result_updated": MemoryKind.PLAN,
+    "planner_result": MemoryKind.PLAN,
     "planned": MemoryKind.PLAN,
-    "execution_result_updated": MemoryKind.EXECUTION,
+    "execution_result": MemoryKind.EXECUTION,
     "executed": MemoryKind.EXECUTION,
-    "verification_result_updated": MemoryKind.VERIFICATION,
+    "verification_result": MemoryKind.VERIFICATION,
     "verified": MemoryKind.VERIFICATION,
     "reflection": MemoryKind.REFLECTION,
     "run_finished": MemoryKind.SUCCESS,

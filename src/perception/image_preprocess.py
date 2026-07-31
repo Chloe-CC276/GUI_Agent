@@ -45,7 +45,7 @@ class ImageProcessor(BaseImageProcessor):
             ratio = width / w
             height = int(h * ratio)
 
-        return cv2.resize(image, (width, height), interpolation)
+        return cv2.resize(image, (width, height), interpolation=interpolation)
     
 
     # Grey灰度化
@@ -170,6 +170,21 @@ class ImageProcessor(BaseImageProcessor):
         
         if not isinstance(image, np.ndarray) or image.size == 0:
             raise ValueError("image must be a non-empty numpy array.")
+
+        any_step_enabled = bool(
+            resize_width
+            or resize_height
+            or use_gray
+            or use_gaussian
+            or use_median
+            or use_binary
+            or use_adaptive
+            or use_clahe
+            or use_sharpen
+        )
+
+        if not any_step_enabled:
+            return image
 
         result = image.copy()
 

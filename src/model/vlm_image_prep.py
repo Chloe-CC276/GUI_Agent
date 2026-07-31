@@ -24,10 +24,15 @@ def prepare_image_bytes_for_vlm(
     max_side: int = DEFAULT_MAX_SIDE,
     jpeg_quality: int = DEFAULT_JPEG_QUALITY,
     mime_type: str | None = None,
+    info: dict[str, Any] | None = None,
 ) -> tuple[bytes, str]:
     """Return ``(bytes, mime_type)`` suitable for a cheaper VLM image part.
 
     No-ops when the payload is already small or OpenCV is unavailable.
+
+    When ``info`` is provided and the prepared image is used, it is populated
+    with ``vlm_scale`` (prepared / original size ratio, 1.0 when not resized)
+    and ``original_size`` ([width, height] of the decoded input).
     """
 
     if not data or len(data) < _MIN_BYTES_TO_PREP:
@@ -47,6 +52,7 @@ def prepare_image_bytes_for_vlm(
 
         height, width = image.shape[:2]
         longest = max(height, width)
+        scale = 1.0
         if longest > max_side:
             scale = max_side / float(longest)
             image = cv2.resize(
@@ -66,6 +72,9 @@ def prepare_image_bytes_for_vlm(
         prepared = encoded.tobytes()
         if len(prepared) >= len(data):
             return data, mime_type or "image/png"
+        if info is not None:
+            info["vlm_scale"] = scale
+            info["original_size"] = [int(width), int(height)]
         logger.debug(
             "Prepared VLM image: %d -> %d bytes (max_side=%d, q=%d)",
             len(data),
@@ -84,8 +93,14 @@ def prepare_numpy_image_for_vlm(
     *,
     max_side: int = DEFAULT_MAX_SIDE,
     jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+    info: dict[str, Any] | None = None,
 ) -> tuple[bytes, str] | None:
-    """Encode a BGR/RGB numpy screenshot for VLM use."""
+    """Encode a BGR/RGB numpy screenshot for VLM use.
+
+    When ``info`` is provided and encoding succeeds, it is populated with
+    ``vlm_scale`` (prepared / original size ratio, 1.0 when not resized) and
+    ``original_size`` ([width, height] of the input image).
+    """
 
     try:
         import cv2
@@ -104,6 +119,7 @@ def prepare_numpy_image_for_vlm(
 
     height, width = prepared.shape[:2]
     longest = max(height, width)
+    scale = 1.0
     if longest > max_side:
         scale = max_side / float(longest)
         prepared = cv2.resize(
@@ -120,6 +136,9 @@ def prepare_numpy_image_for_vlm(
     )
     if not ok:
         return None
+    if info is not None:
+        info["vlm_scale"] = scale
+        info["original_size"] = [int(width), int(height)]
     return encoded.tobytes(), "image/jpeg"
 
 

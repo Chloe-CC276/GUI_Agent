@@ -21,7 +21,7 @@ from typing import Any
 
 from src.common.target_validation import (
     CLICK_ACTION_TYPES,
-    coerce_action_mapping,
+    flatten_action_evidence,
     normalise_target_text,
 )
 from src.executor import win32_windows
@@ -695,10 +695,7 @@ def is_close_action(action: Any, instruction: Any | None = None) -> bool:
 
     action_type = latest_action_type(action)
     if action_type == "hotkey":
-        data = coerce_action_mapping(action)
-        nested = data.get("parameters")
-        if isinstance(nested, Mapping):
-            data = {**data, **dict(nested)}
+        data = flatten_action_evidence(action)
         keys = [
             str(item).strip().casefold()
             for item in (data.get("keys") or [])
@@ -710,11 +707,12 @@ def is_close_action(action: Any, instruction: Any | None = None) -> bool:
         ]
         return keys == expected
     if action_type in CLICK_ACTION_TYPES:
-        data = coerce_action_mapping(action)
-        nested = data.get("parameters")
-        if isinstance(nested, Mapping):
-            data = {**data, **dict(nested)}
-        target = data.get("target_text") or data.get("text")
+        data = flatten_action_evidence(action)
+        target = (
+            data.get("target_text")
+            or data.get("matched_text")
+            or data.get("text")
+        )
         return is_close_control_target(target)
     return False
 
@@ -1244,10 +1242,7 @@ def advance_close_phase_after_verify(
     if str(progress.get("phase")) != PHASE_ACTIVATE:
         return progress
 
-    action_data = coerce_action_mapping(action)
-    nested = action_data.get("parameters")
-    if isinstance(nested, Mapping):
-        action_data = {**action_data, **dict(nested)}
+    action_data = flatten_action_evidence(action)
     action_type = str(
         action_data.get("type") or action_data.get("action_type") or ""
     ).strip().lower()
