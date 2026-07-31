@@ -54,16 +54,20 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
             "Edge 地址栏聚焦后常见现象就是历史下拉贴在地址栏下方——这就是成功证据。"
         )
         planner = (
-            "浏览器内打开网站或发起搜索时，优先用 hotkey Ctrl+L（macOS 用 Command+L）"
+            "浏览器内打开网站（如 Google）时，优先用 hotkey Ctrl+L（macOS 用 Command+L）"
             "聚焦地址栏，不要点击地址栏占位文案，也不要点击历史/建议下拉项；"
-            "若当前观察已满足焦点成功标准（搜索框+下方历史下拉，或框内高亮/光标），"
-            "下一步必须 paste_text 粘贴完整文本（不要 type_text），然后 press enter；"
-            "不要仅为确认焦点而重复 Ctrl+L 或重复点击同一控件。"
+            "若当前观察已满足焦点成功标准，或 search_progress.phase=input_focused，"
+            "下一步必须 paste_text 粘贴 google.com（禁止裸词 google），然后 press enter；"
+            "若 search_progress.phase=nav_submitted，应观察是否已到 Google 首页"
+            "（logo+中央搜索框），已到则结束；若误入 Bing 结果页则 Ctrl+L 后重贴 google.com；"
+            "不要仅为确认焦点而重复 Ctrl+L。"
         )
         reflection = (
-            "诊断聚焦搜索框/地址栏是否失败时，必须应用上述（A）/（B）标准；"
-            "出现贴在搜索框下方的历史下拉列表是焦点成功证据，不得判为 no_effect，"
-            "也不得建议去点击下拉列表中的 OCR 噪声行；下一策略应是 paste_text。"
+            "诊断聚焦是否失败时，必须应用上述（A）/（B）标准；"
+            "出现贴在地址栏下方的历史下拉列表是焦点成功证据，不得判为 no_effect，"
+            "也不得建议去点击下拉列表中的 OCR 噪声行；"
+            "若已 input_focused，下一策略应是 paste_text google.com；"
+            "若已在 Bing 结果页，下一策略应是地址栏重开 google.com，而不是点击结果链接。"
         )
         return (intro, verify, planner, reflection)
 
@@ -88,18 +92,21 @@ def input_focus_rules(language: PromptLanguage) -> tuple[str, ...]:
         "under the address bar is success evidence."
     )
     planner = (
-        "When opening a site or starting a search in the browser, prefer hotkey Ctrl+L "
+        "When opening a website such as Google, prefer hotkey Ctrl+L "
         "(Command+L on macOS) to focus the address bar — do not click address-bar "
         "placeholder text or history/suggestion dropdown rows; if the current observation "
-        "already satisfies the focus success rule (box + dropdown below, or caret/highlight), "
-        "the next step MUST be paste_text with the full text (never type_text), then press "
-        "enter; do not repeat Ctrl+L or re-click only to reconfirm focus."
+        "already satisfies the focus success rule, or search_progress.phase=input_focused, "
+        "the next step MUST be paste_text google.com (never bare google), then press enter; "
+        "if search_progress.phase=nav_submitted, judge whether the Google homepage is open "
+        "(logo + central search box) and finish if so; if you are on Bing results, Ctrl+L "
+        "and paste google.com again; do not repeat Ctrl+L only to reconfirm focus."
     )
     reflection = (
-        "When diagnosing whether address/search focus failed, apply rules (A)/(B) above; "
-        "a history dropdown attached under the box is evidence of successful focus, not "
-        "no_effect, and must not be treated as a click target. The next strategy should "
-        "be paste_text."
+        "When diagnosing whether address focus failed, apply rules (A)/(B) above; "
+        "a history dropdown attached under the bar is evidence of successful focus, not "
+        "no_effect, and must not be treated as a click target. If already input_focused, "
+        "the next strategy should be paste_text google.com; if already on a Bing results "
+        "page, reopen google.com via the address bar instead of clicking result links."
     )
     return (intro, verify, planner, reflection)
 

@@ -39,6 +39,8 @@ class CLIConfig:
     max_retries: int = 2
     max_reflections: int = 3
     post_action_wait: float = 0.5
+    launch_wait: float = 2.5
+    launch_recheck_wait: float = 1.5
     dry_run: bool = False
     language: str = "zh"
     verbose: bool = True
@@ -68,8 +70,11 @@ class CLIConfig:
             raise CLIError(f"{name} 不能小于 0")
         if name == "max_steps" and value == 0:
             raise CLIError("max_steps 必须大于 0")
-        if name == "post_action_wait" and not 0 <= value <= 60:
-            raise CLIError("post_action_wait 必须在 0～60 秒之间")
+        if (
+            name in {"post_action_wait", "launch_wait", "launch_recheck_wait"}
+            and not 0 <= value <= 60
+        ):
+            raise CLIError(f"{name} 必须在 0～60 秒之间")
         setattr(self, name, value)
 
 
@@ -100,16 +105,18 @@ class AgentRuntime:
                     "按钮、菜单、标签页和任务栏图标使用 click"
                 ),
                 (
-                    "浏览器搜索按方案 B：先 hotkey Ctrl+L 聚焦地址栏"
-                    "（不要点占位文案或下拉建议），paste_text 粘贴 google 后 press enter；"
-                    "进入 Google 首页后点击中央搜索框，paste_text 粘贴查询词后 press enter；"
-                    "禁止 type_text，禁止点击地址栏/搜索框下拉列表中的 OCR 噪声行；"
-                    "焦点成功标准：搜索框存在且下方出现历史/建议下拉（空间关联），"
-                    "或框内出现光标/边框高亮/背景变化——满足即继续 paste，不要重复聚焦"
+                    "打开/搜索网站（如 Google）时：hotkey Ctrl+L 聚焦地址栏"
+                    "（不要点占位文案或下拉建议），paste_text 必须粘贴 google.com"
+                    "（禁止只粘贴 google，否则会进入 Bing/Edge 搜索结果），"
+                    "再 press enter；动作后观察若同时看到 Google logo 与中央搜索框，"
+                    "即任务成功并结束；禁止把 Bing 结果页上的 Google 链接当作官网；"
+                    "禁止 type_text；焦点成功标准：地址栏存在且下方出现历史/建议下拉"
+                    "（空间关联），或框内光标/边框高亮/背景变化——满足即 paste google.com，"
+                    "不要重复聚焦"
                 ),
                 (
-                    "Google 首页判定：同时看到 Google logo 与中央搜索框即已进入首页，"
-                    "不要反复点击 Google search"
+                    "Google 首页成功标准：同时看到 Google logo 与中央 Google 搜索框；"
+                    "Bing/Edge 的 keyword 结果页不算成功"
                 ),
             ],
             success_criteria=["通过动作后界面证据确认用户指令已经完成"],
@@ -199,6 +206,8 @@ def build_default_runtime(config: CLIConfig) -> AgentRuntime:
     memory = AgentMemory()
     chain_config = AgentChainConfig(
         post_action_wait_seconds=config.post_action_wait,
+        launch_post_action_wait_seconds=config.launch_wait,
+        launch_extra_observation_wait_seconds=config.launch_recheck_wait,
         max_reflections=config.max_reflections,
         max_model_repairs=1,
         max_chain_iterations=max(50, config.max_steps * 12),
@@ -892,6 +901,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="日志目录（或任意旧式日志路径）；实际文件名自动生成为 log_当前时间.log",
     )
     parser.add_argument("--post-action-wait", type=float, default=0.5)
+    parser.add_argument(
+        "--launch-wait",
+        type=float,
+        default=2.5,
+        help="双击等启动类动作后的额外等待秒数，等待应用窗口出现",
+    )
+    parser.add_argument(
+        "--launch-recheck-wait",
+        type=float,
+        default=1.5,
+        help="启动后画面未变化时，二次观察前的等待秒数",
+    )
     parser.add_argument("--dry-run", action="store_true", help="禁止真实鼠标键盘操作")
     parser.add_argument(
         "--factory",
@@ -910,6 +931,8 @@ def main(argv: list[str] | None = None) -> int:
         max_retries=args.max_retries,
         max_reflections=args.max_reflections,
         post_action_wait=args.post_action_wait,
+        launch_wait=args.launch_wait,
+        launch_recheck_wait=args.launch_recheck_wait,
         dry_run=args.dry_run,
         verbose=not args.quiet,
         task_retry_count=args.task_retries,

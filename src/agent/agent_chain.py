@@ -20,16 +20,56 @@ from ..common.target_validation import (
     coerce_action_mapping,
     validate_click_target,
 )
+from .document_tasks import (
+    advance_close_phase_after_verify,
+    apply_close_verify_override,
+    apply_open_verify_override,
+    build_window_close_observation,
+    ensure_close_progress,
+    forced_close_hotkey,
+    is_close_action,
+    is_close_task,
+    prepare_close_execution,
+    should_use_window_observe_after,
+    task_instruction,
+)
+from .chat_send import (
+    apply_chat_verify_override,
+    chat_observe_options,
+    ensure_chat_progress,
+    forced_chat_action,
+    is_chat_paste_action,
+    is_chat_send_task,
+    is_chat_submit_action,
+    record_chat_phase_for_executed_action,
+    should_finish_chat_task,
+)
+from .launch_wait import needs_additional_observation, resolve_post_action_wait
 from .memory import AgentMemory, MemoryImportance, MemoryKind
-from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
+from .observation_utils import (
+    consume_post_action_observation,
+    mark_post_action_observation,
+)
+from .result import (
+    ErrorInfo,
+    PlannerResult,
+    ResultStatus,
+    RunTerminationReason,
+    ToolResult,
+)
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
 from .verify_policy import latest_action_type, should_skip_verification
 from .browser_search import (
+    PHASE_INPUT_FOCUSED,
+    advance_search_phase_after_verify,
     apply_focus_verify_override,
+    apply_homepage_verify_override,
     build_focus_success_verify,
     detect_search_box_focus,
     is_address_bar_focus_action,
+    record_phase_for_executed_action,
+    record_search_phase,
 )
 
 from .prompts import PromptBuilder, PromptKind
@@ -101,6 +141,10 @@ class AgentChainConfig:
 
     observe_options: dict[str, Any] = field(default_factory=dict)
     post_action_wait_seconds: float = 0.5
+    launch_post_action_wait_seconds: float = 2.5
+    launch_extra_observation_attempts: int = 1
+    launch_extra_observation_wait_seconds: float = 1.5
+    reuse_post_action_observation: bool = True
     verify_confidence_threshold: float = 0.55
     max_reflections: int = 2
     max_model_repairs: int = 1
@@ -112,6 +156,18 @@ class AgentChainConfig:
     def __post_init__(self) -> None:
         if not 0 <= self.post_action_wait_seconds <= 60:
             raise ValueError("post_action_wait_seconds must be between 0 and 60")
+        if not 0 <= self.launch_post_action_wait_seconds <= 60:
+            raise ValueError(
+                "launch_post_action_wait_seconds must be between 0 and 60"
+            )
+        if not 0 <= self.launch_extra_observation_wait_seconds <= 60:
+            raise ValueError(
+                "launch_extra_observation_wait_seconds must be between 0 and 60"
+            )
+        if self.launch_extra_observation_attempts < 0:
+            raise ValueError(
+                "launch_extra_observation_attempts must be non-negative"
+            )
         if not 0 <= self.verify_confidence_threshold <= 1:
             raise ValueError("verify_confidence_threshold must be between 0 and 1")
         if (
@@ -282,6 +338,11 @@ class AgentChain:
         state = context["agent_state"]
         if self._limit_reached(state):
             return self._fail_update(state, "Agent reached its step/time limit.")
+
+        forced = self._force_chat_plan(state)
+        if forced is not None:
+            return forced
+
         try:
             async_method = getattr(self.planner, "aplan", None)
             result = (
@@ -343,6 +404,35 @@ class AgentChain:
                     getattr(result, "error", None),
                 )
 
+            # Close tasks: never burn another full observation on the same
+            # unreachable ✕ click. Force Ctrl+W when possible, otherwise replan
+            # on the existing observation.
+            if is_close_task(task_instruction(state)) and state.observation is not None:
+                recovered = self._recover_close_plan(state)
+                if recovered is not None:
+                    return recovered
+                state.set_phase(AgentPhase.PLANNING)
+                return {
+                    "agent_state": state,
+                    "stage": ChainStage.PLAN.value,
+                    "chain_error": retry_reason,
+                    "planner_retry_count": retry_count,
+                }
+
+            # Chat tasks: inject the deterministic stage action instead of
+            # re-observing and re-clicking the composer.
+            if is_chat_send_task(task_instruction(state)) and state.observation is not None:
+                recovered = self._force_chat_plan(state)
+                if recovered is not None:
+                    return recovered
+                state.set_phase(AgentPhase.PLANNING)
+                return {
+                    "agent_state": state,
+                    "stage": ChainStage.PLAN.value,
+                    "chain_error": retry_reason,
+                    "planner_retry_count": retry_count,
+                }
+
             return {
                 "agent_state": state,
                 "stage": ChainStage.OBSERVE.value,
@@ -356,6 +446,98 @@ class AgentChain:
             or "Planner returned no usable decision.",
             getattr(result, "error", None),
         )
+
+    def _force_chat_plan(self, state: AgentState) -> ChainState | None:
+        """Inject paste/enter/wait or finish for a chat-send stage."""
+
+        if should_finish_chat_task(state):
+            state.add_history(
+                event_type="chat_finish_forced",
+                message="ChatGPT thinking marker already detected; finishing.",
+                status=ResultStatus.SUCCESS,
+                metadata={"chat_phase": "thinking"},
+            )
+            result = PlannerResult.finish(
+                message="ChatGPT is thinking/generating after the message was sent.",
+                reason="chat_progress reached thinking.",
+                confidence=0.92,
+                metadata={"forced_chat_finish": True},
+            )
+            state.update_planner_result(result)
+            state.metadata["planner_retry_count"] = 0
+            return {
+                "agent_state": state,
+                "stage": ChainStage.FINISH.value,
+            }
+
+        forced = forced_chat_action(state)
+        if forced is None:
+            return None
+        action_type, parameters = forced
+        create = getattr(self.planner, "create_action", None)
+        if not callable(create):
+            return None
+        action = create(action_type, parameters)
+        result = PlannerResult.act(
+            action,
+            reason=(
+                f"Deterministic chat stage action: {action_type} "
+                f"(skipped VLM replan)."
+            ),
+            confidence=0.95,
+            metadata={
+                "forced_chat_action": True,
+                "action_type": action_type,
+            },
+        )
+        state.update_planner_result(result)
+        state.metadata["planner_retry_count"] = 0
+        state.add_history(
+            event_type="chat_action_forced",
+            message=result.reason,
+            status=ResultStatus.SUCCESS,
+            metadata={
+                "action_type": action_type,
+                "parameters": parameters,
+            },
+        )
+        return {
+            "agent_state": state,
+            "stage": ChainStage.EXECUTE.value,
+        }
+
+    def _recover_close_plan(self, state: AgentState) -> ChainState | None:
+        """Inject Ctrl+W/Alt+F4 for a close task instead of re-observing."""
+
+        forced = forced_close_hotkey(state)
+        if forced is None:
+            return None
+        action_type, parameters = forced
+        create = getattr(self.planner, "create_action", None)
+        if not callable(create):
+            return None
+        action = create(action_type, parameters)
+        result = PlannerResult.act(
+            action,
+            reason=(
+                "Recovered close task with the close hotkey after a failed "
+                "plan; skipped a redundant observation."
+            ),
+            confidence=0.9,
+            metadata={"forced_close_hotkey": True, "recovered_in_chain": True},
+        )
+        state.update_planner_result(result)
+        state.metadata["planner_retry_count"] = 0
+        state.add_history(
+            event_type="close_hotkey_recovered",
+            message=result.reason,
+            status=ResultStatus.SUCCESS,
+            metadata={"keys": parameters.get("keys")},
+        )
+        return {
+            "agent_state": state,
+            "stage": ChainStage.EXECUTE.value,
+        }
 
     @staticmethod
     def _action_mapping(action: Any) -> dict[str, Any]:
@@ -408,6 +590,14 @@ class AgentChain:
         # 目标校验成功，清零连续拒绝次数
         state.metadata["target_rejection_count"] = 0
 
+        if prepare_close_execution(state):
+            state.add_history(
+                event_type="close_window_activated",
+                message="Activated the target Word window before close.",
+                status=ResultStatus.SUCCESS,
+                metadata={"prepare_close_execution": True},
+            )
+
         result = await self.tools.acall(
             "execute_action",
             {"action": state.latest_action},
@@ -420,22 +610,40 @@ class AgentChain:
 
         state.update_execution_result(result)
 
+        # Decide skip_verify against the pre-record chat phase. Recording focus
+        # first would advance idle → input_focused and make the skip check fail.
+        skip_verify = False
+        if result.succeeded:
+            skip_verify = self._should_skip_verification(
+                state.latest_action, state
+            )
+            record_phase_for_executed_action(state, state.latest_action)
+            record_chat_phase_for_executed_action(state, state.latest_action)
+
         if state.is_terminal:
             return {
                 "agent_state": state,
                 "stage": ChainStage.FAIL.value,
             }
 
-        if result.succeeded and self._should_skip_verification(state.latest_action):
+        if result.succeeded and skip_verify:
             action_type = self._latest_action_type(state.latest_action)
             state.add_history(
                 event_type="verify_skipped",
                 message=(
                     f"Skipped verification after {action_type}; "
-                    "continuing to plan the next search step."
+                    "continuing to plan the next step."
                 ),
                 status=ResultStatus.SUCCESS,
-                metadata={"action_type": action_type},
+                metadata={
+                    "action_type": action_type,
+                    "skip_verify": True,
+                    "chat_phase": (
+                        (state.metadata.get("chat_progress") or {}).get("phase")
+                        if isinstance(state.metadata.get("chat_progress"), dict)
+                        else None
+                    ),
+                },
             )
             self._commit_current_step(state)
             if state.is_terminal:
@@ -472,28 +680,222 @@ class AgentChain:
         return latest_action_type(action)
 
     @classmethod
-    def _should_skip_verification(cls, action: Any) -> bool:
-        return should_skip_verification(action)
+    def _should_skip_verification(cls, action: Any, state: Any = None) -> bool:
+        return should_skip_verification(action, state)
 
     async def _observe_after(self, context: ChainState) -> ChainState:
         state = context["agent_state"]
-        if self.config.post_action_wait_seconds:
-            await self.tools.acall(
-                "wait", {"seconds": self.config.post_action_wait_seconds}
+        action = state.latest_action
+        # Still the pre-action observation: update_observation runs once, at the end.
+        before = state.observation
+
+        wait_seconds = resolve_post_action_wait(
+            action,
+            base_seconds=self.config.post_action_wait_seconds,
+            launch_seconds=self.config.launch_post_action_wait_seconds,
+        )
+        if wait_seconds:
+            await self.tools.acall("wait", {"seconds": wait_seconds})
+
+        if should_use_window_observe_after(state, action):
+            observation = build_window_close_observation(
+                before=before,
+                instruction=task_instruction(state),
             )
-        result = await self.tools.acall("observe", self.config.observe_options)
+            result = ToolResult.success(
+                "observe",
+                output=observation,
+                message=(
+                    "Observed top-level windows for close verification "
+                    f"({len(observation.gui_elements)} windows)."
+                ),
+                metadata={
+                    "observation_id": observation.observation_id,
+                    "observation_kind": "win32_windows",
+                },
+            )
+            state.update_observation(result.output, tool_result=result)
+            mark_post_action_observation(state, result.output)
+            state.set_phase(AgentPhase.VERIFYING)
+            return {"agent_state": state, "stage": ChainStage.VERIFY.value}
+
+        observe_args = dict(self.config.observe_options)
+        chat_opts = chat_observe_options(state, action)
+        if chat_opts:
+            observe_args.update(chat_opts)
+
+        result = await self.tools.acall("observe", observe_args)
         if not result.succeeded or not isinstance(result.output, ObservationState):
             return self._tool_failure(state, result, "post-action observation")
+
+        for attempt in range(max(0, self.config.launch_extra_observation_attempts)):
+            if not needs_additional_observation(action, before, result.output):
+                break
+            extra_wait = self.config.launch_extra_observation_wait_seconds
+            state.add_history(
+                event_type="observe_after_retry",
+                message=(
+                    "Screen still matches the pre-action state after a launch "
+                    f"action; re-observing in {extra_wait}s."
+                ),
+                status=ResultStatus.RETRY,
+                metadata={
+                    "attempt": attempt + 1,
+                    "action_type": self._latest_action_type(action),
+                    "wait_seconds": extra_wait,
+                },
+            )
+            if extra_wait:
+                await self.tools.acall("wait", {"seconds": extra_wait})
+            retry = await self.tools.acall("observe", observe_args)
+            if not retry.succeeded or not isinstance(retry.output, ObservationState):
+                break
+            result = retry
+
         state.update_observation(result.output, tool_result=result)
+        mark_post_action_observation(state, result.output)
         state.set_phase(AgentPhase.VERIFYING)
         return {"agent_state": state, "stage": ChainStage.VERIFY.value}
+
+    @staticmethod
+    def _persist_focus_stage(state: AgentState, evidence: Any = ()) -> None:
+        """Remember a confirmed focus so the next planner turn pastes instead
+        of focusing the input again."""
+
+        notes = [str(item) for item in (evidence or ())]
+        record_search_phase(state, PHASE_INPUT_FOCUSED, evidence=notes)
+        if state.observation is not None:
+            metadata = dict(getattr(state.observation, "metadata", None) or {})
+            metadata["search_focus_detected"] = True
+            if notes:
+                metadata["search_focus_evidence"] = notes
+            state.observation.metadata = metadata
+
+    def _apply_focus_override(
+        self,
+        state: AgentState,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        data, overridden = apply_focus_verify_override(
+            data,
+            action=state.latest_action,
+            before=state.previous_observation,
+            after=state.observation,
+        )
+        if overridden:
+            state.add_history(
+                event_type="verify_focus_override",
+                message=str(data.get("reason") or "Focus verify override"),
+                status=ResultStatus.SUCCESS,
+                metadata={"verify": data},
+            )
+            self._persist_focus_stage(state, data.get("evidence") or ())
+        return data
 
     async def _verify(self, context: ChainState) -> ChainState:
         state = context["agent_state"]
         prompt = ""
         raw: Any = None
         try:
-            if is_address_bar_focus_action(state.latest_action):
+            instruction = task_instruction(state)
+            if is_close_task(instruction) and is_close_action(
+                state.latest_action, instruction
+            ):
+                ensure_close_progress(state)
+                meta = getattr(state.observation, "metadata", None) or {}
+                code_only = str(meta.get("observation_kind") or "") == "win32_windows"
+                if code_only:
+                    data = {
+                        "status": "retry",
+                        "action_effective": False,
+                        "task_complete": False,
+                        "evidence": [],
+                        "reason": (
+                            "Close verification uses Win32 window identity."
+                        ),
+                        "confidence": 0.5,
+                        "recommended_next": "continue",
+                    }
+                else:
+                    prompt = self.prompts.build_text(PromptKind.VERIFY, state)
+                    data, raw = await self._call_structured(
+                        prompt, VERIFY_RESPONSE_SCHEMA, PromptKind.VERIFY
+                    )
+                    self._validate_verify(data)
+                data, closed_hit = apply_close_verify_override(
+                    state,
+                    data,
+                    before=state.previous_observation,
+                    after=state.observation,
+                )
+                if closed_hit:
+                    state.add_history(
+                        event_type="verify_document_closed",
+                        message=str(data.get("reason") or "Document closed"),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data},
+                    )
+            elif is_chat_send_task(instruction) and (
+                is_chat_paste_action(state.latest_action)
+                or is_chat_submit_action(state.latest_action)
+                or self._latest_action_type(state.latest_action) == "wait"
+            ):
+                ensure_chat_progress(state)
+                data = {
+                    "status": "retry",
+                    "action_effective": False,
+                    "task_complete": False,
+                    "evidence": [],
+                    "reason": "Chat send verification uses composer OCR.",
+                    "confidence": 0.5,
+                    "recommended_next": "continue",
+                }
+                data, chat_hit = apply_chat_verify_override(
+                    state,
+                    data,
+                    before=state.previous_observation,
+                    after=state.observation,
+                )
+                if chat_hit:
+                    event = (
+                        "verify_chat_thinking"
+                        if bool(data.get("task_complete"))
+                        else "verify_chat_text"
+                    )
+                    state.add_history(
+                        event_type=event,
+                        message=str(data.get("reason") or "Chat verify override"),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data},
+                    )
+                elif is_chat_submit_action(state.latest_action) or (
+                    self._latest_action_type(state.latest_action) == "wait"
+                ):
+                    data = {
+                        "status": "success",
+                        "action_effective": True,
+                        "task_complete": False,
+                        "evidence": list(data.get("evidence") or []),
+                        "reason": (
+                            "Enter/wait completed; thinking marker not visible yet."
+                        ),
+                        "confidence": 0.55,
+                        "recommended_next": "continue",
+                    }
+                else:
+                    data = {
+                        "status": "success",
+                        "action_effective": True,
+                        "task_complete": False,
+                        "evidence": list(data.get("evidence") or []),
+                        "reason": (
+                            "Paste was delivered; composer OCR has not confirmed "
+                            "the message yet — paste again or re-observe."
+                        ),
+                        "confidence": 0.55,
+                        "recommended_next": "continue",
+                    }
+            elif is_address_bar_focus_action(state.latest_action):
                 detected, evidence = detect_search_box_focus(state.observation)
                 if detected:
                     data = build_focus_success_verify(
@@ -507,60 +909,97 @@ class AgentChain:
                         status=ResultStatus.SUCCESS,
                         metadata={"verify": data, "evidence": evidence},
                     )
-                    metadata = dict(getattr(state.observation, "metadata", None) or {})
-                    metadata["search_focus_detected"] = True
-                    metadata["search_focus_evidence"] = list(evidence)
-                    state.observation.metadata = metadata
+                    self._persist_focus_stage(state, evidence)
                 else:
                     prompt = self.prompts.build_text(PromptKind.VERIFY, state)
                     data, raw = await self._call_structured(
                         prompt, VERIFY_RESPONSE_SCHEMA, PromptKind.VERIFY
                     )
                     self._validate_verify(data)
-                    data, overridden = apply_focus_verify_override(
-                        data,
-                        action=state.latest_action,
-                        before=state.previous_observation,
-                        after=state.observation,
+                    data = self._apply_focus_override(state, data)
+                data, homepage_hit = apply_homepage_verify_override(
+                    state, data, after=state.observation
+                )
+                if homepage_hit:
+                    state.add_history(
+                        event_type="verify_homepage_detected",
+                        message=str(
+                            data.get("reason") or "Google homepage reached"
+                        ),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data},
                     )
-                    if overridden:
-                        state.add_history(
-                            event_type="verify_focus_override",
-                            message=str(data.get("reason") or "Focus verify override"),
-                            status=ResultStatus.SUCCESS,
-                            metadata={"verify": data},
-                        )
-                        if state.observation is not None:
-                            metadata = dict(getattr(state.observation, "metadata", None) or {})
-                            metadata["search_focus_detected"] = True
-                            state.observation.metadata = metadata
             else:
                 prompt = self.prompts.build_text(PromptKind.VERIFY, state)
                 data, raw = await self._call_structured(
                     prompt, VERIFY_RESPONSE_SCHEMA, PromptKind.VERIFY
                 )
                 self._validate_verify(data)
-                data, overridden = apply_focus_verify_override(
-                    data,
-                    action=state.latest_action,
-                    before=state.previous_observation,
-                    after=state.observation,
+                data = self._apply_focus_override(state, data)
+                data, homepage_hit = apply_homepage_verify_override(
+                    state, data, after=state.observation
                 )
-                if overridden:
+                if homepage_hit:
                     state.add_history(
-                        event_type="verify_focus_override",
-                        message=str(data.get("reason") or "Focus verify override"),
+                        event_type="verify_homepage_detected",
+                        message=str(
+                            data.get("reason") or "Google homepage reached"
+                        ),
                         status=ResultStatus.SUCCESS,
                         metadata={"verify": data},
                     )
-                    if state.observation is not None:
-                        metadata = dict(getattr(state.observation, "metadata", None) or {})
-                        metadata["search_focus_detected"] = True
-                        state.observation.metadata = metadata
+                data, document_hit = apply_open_verify_override(
+                    state, data, after=state.observation
+                )
+                if document_hit:
+                    state.add_history(
+                        event_type="verify_document_opened",
+                        message=str(data.get("reason") or "Document opened"),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data},
+                    )
+                data, closed_hit = apply_close_verify_override(
+                    state,
+                    data,
+                    before=state.previous_observation,
+                    after=state.observation,
+                )
+                if closed_hit:
+                    state.add_history(
+                        event_type="verify_document_closed",
+                        message=str(data.get("reason") or "Document closed"),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data},
+                    )
+                data, chat_hit = apply_chat_verify_override(
+                    state,
+                    data,
+                    before=state.previous_observation,
+                    after=state.observation,
+                )
+                if chat_hit:
+                    event = (
+                        "verify_chat_thinking"
+                        if bool(data.get("task_complete"))
+                        else "verify_chat_text"
+                    )
+                    state.add_history(
+                        event_type=event,
+                        message=str(data.get("reason") or "Chat verify override"),
+                        status=ResultStatus.SUCCESS,
+                        metadata={"verify": data},
+                    )
         except Exception as error:
             return self._exception_reflection(state, error, "verification")
 
         succeeded = bool(data["action_effective"]) and data["status"] == "success"
+        if succeeded:
+            advance_search_phase_after_verify(
+                state, state.latest_action, data
+            )
+            advance_close_phase_after_verify(
+                state, state.latest_action, data
+            )
         complete = bool(data["task_complete"])
         confidence = float(data["confidence"])
         verification = ToolResult(
@@ -657,10 +1096,31 @@ class AgentChain:
             stage = ChainStage.FINISH if state.is_finished else ChainStage.FAIL
         elif self._limit_reached(state):
             return self._fail_update(state, "Agent reached its step/time limit.")
+        elif self._reuse_post_action_observation(state):
+            state.set_phase(AgentPhase.PLANNING)
+            stage = ChainStage.PLAN
         else:
             state.set_phase(AgentPhase.OBSERVING)
             stage = ChainStage.OBSERVE
         return {"agent_state": state, "stage": stage.value}
+
+    def _reuse_post_action_observation(self, state: AgentState) -> bool:
+        """Plan on the post-action capture instead of observing the same screen
+        twice: nothing touched the GUI between the two observations."""
+
+        if not self.config.reuse_post_action_observation:
+            return False
+        if not consume_post_action_observation(state, state.observation):
+            return False
+        state.add_history(
+            event_type="observation_reused",
+            message="Planning on the post-action observation; skipped a re-observe.",
+            status=ResultStatus.SUCCESS,
+            metadata={
+                "observation_id": getattr(state.observation, "observation_id", None)
+            },
+        )
+        return True
 
     async def _finish(self, context: ChainState) -> ChainState:
         state = context["agent_state"]
