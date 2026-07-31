@@ -345,8 +345,20 @@ def perception_to_observation(
     ocr_items = list(getattr(result, "ocr_elements", None) or [])
     texts = [str(getattr(item, "text", "")).strip() for item in ocr_items]
     metadata = dict(getattr(result, "metadata", None) or {})
+    # Prefer the true full-screen size recorded by the perception pipeline;
+    # the image shape is only a fallback (it is the crop size for region
+    # observations).
+    metadata_width = metadata.get("screen_width")
+    metadata_height = metadata.get("screen_height")
+    if metadata_width is not None:
+        width = int(metadata_width)
+    if metadata_height is not None:
+        height = int(metadata_height)
+    capture_region = metadata.get("capture_region")
+    if capture_region is None:
+        capture_region = getattr(result, "capture_region", None)
     metadata.update({
-        "capture_region": getattr(result, "capture_region", None),
+        "capture_region": capture_region,
         "perception_elapsed_seconds": getattr(result, "elapsed_time", None),
     })
     return ObservationState(

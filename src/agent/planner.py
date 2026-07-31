@@ -1,4 +1,4 @@
-"""
+﻿"""
 planner
 
 Planner implementation for the GUI Agent.
@@ -27,6 +27,28 @@ from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, Sequence, TYPE_CHECKING
 
 from ..common.target_validation import normalise_target_text, texts_match
+from .browser_search import (
+    is_forbidden_suggestion_target,
+    maybe_rewrite_address_bar_click,
+)
+from .chat_send import (
+    ensure_chat_progress,
+    is_chat_send_task,
+    maybe_rewrite_chat_action,
+    register_chat_composer_target,
+    validate_chat_action,
+)
+from .document_tasks import (
+    ensure_close_progress,
+    forced_close_hotkey,
+    is_close_task,
+    is_forbidden_close_target,
+    is_status_close_decoy,
+    maybe_rewrite_close_action,
+    task_instruction,
+    validate_close_click_params,
+    validate_close_hotkey,
+)
 from .result import (
     ErrorInfo,
     PlannerDecision,
@@ -144,6 +166,7 @@ class ActionName(str, Enum):
     PRESS = "press"
     HOTKEY = "hotkey"
     TYPE_TEXT = "type_text"
+    PASTE_TEXT = "paste_text"
     WAIT = "wait"
     SCREENSHOT = "screenshot"
     FINISH = "finish"
@@ -453,6 +476,10 @@ class Planner:
 
         try:
             self._validate_state(state)
+            if is_close_task(task_instruction(state)):
+                ensure_close_progress(state)
+            if is_chat_send_task(task_instruction(state)):
+                ensure_chat_progress(state)
             prompt = self.build_prompt(state)
             images = self._collect_images(state)
         except Exception as error:
@@ -532,6 +559,17 @@ class Planner:
                     raw_response=raw_response,
                 )
 
+        forced = self._forced_close_hotkey_result(
+            state,
+            timing=timing,
+            raw_response=raw_response,
+            prompt=prompt,
+            diagnostic=last_diagnostic,
+            error=last_error,
+        )
+        if forced is not None:
+            return forced
+
         timing.finish()
 
         return self._failure_result(
@@ -545,6 +583,49 @@ class Planner:
             raw_response=raw_response,
             prompt=prompt,
             diagnostic=last_diagnostic,
+        )
+
+    def _forced_close_hotkey_result(
+        self,
+        state: AgentState,
+        *,
+        timing: TimingInfo,
+        raw_response: Any,
+        prompt: str | None,
+        diagnostic: Mapping[str, Any] | None,
+        error: ErrorInfo | None,
+    ) -> PlannerResult | None:
+        """Recover a close task by emitting Ctrl+W/Alt+F4 instead of retrying."""
+
+        forced = forced_close_hotkey(state)
+        if forced is None:
+            return None
+        action_type, parameters = forced
+        timing.finish()
+        action = self.create_action(action_type, parameters)
+        metadata = {
+            "forced_close_hotkey": True,
+            "planner_config": self._config_metadata(),
+            "diagnostic": dict(diagnostic or {}),
+        }
+        if error is not None:
+            metadata["recovered_from"] = getattr(error, "message", None) or str(error)
+        self.logger.info(
+            "Forced close hotkey %s after planner validation failures.",
+            "+".join(parameters.get("keys", ())),
+        )
+        return PlannerResult.act(
+            action,
+            reason=(
+                "Close-control click was unreachable; falling back to the "
+                "close hotkey while the target window is active."
+            ),
+            confidence=0.9,
+            metadata=metadata,
+            raw_output=self._extract_text(raw_response)
+            if self.config.include_raw_response
+            else None,
+            timing=timing,
         )
 
     async def aplan(self, state: AgentState) -> PlannerResult:
@@ -569,6 +650,10 @@ class Planner:
 
         try:
             self._validate_state(state)
+            if is_close_task(task_instruction(state)):
+                ensure_close_progress(state)
+            if is_chat_send_task(task_instruction(state)):
+                ensure_chat_progress(state)
             prompt = self.build_prompt(state)
             images = self._collect_images(state)
         except Exception as error:
@@ -643,6 +728,17 @@ class Planner:
                     error=error,
                     raw_response=raw_response,
                 )
+
+        forced = self._forced_close_hotkey_result(
+            state,
+            timing=timing,
+            raw_response=raw_response,
+            prompt=prompt,
+            diagnostic=last_diagnostic,
+            error=last_error,
+        )
+        if forced is not None:
+            return forced
 
         timing.finish()
 
@@ -1275,6 +1371,44 @@ class Planner:
             action_type = self._normalize_action_type(
                 action_type
             )
+            action_type, parameters, rewritten = maybe_rewrite_address_bar_click(
+                action_type,
+                parameters,
+            )
+            if rewritten:
+                self.logger.info(
+                    "Rewrote address-bar click to hotkey Ctrl+L for browser search focus."
+                )
+            if is_close_task(task_instruction(state)):
+                ensure_close_progress(state)
+            if is_chat_send_task(task_instruction(state)):
+                ensure_chat_progress(state)
+            action_type, parameters, closed = maybe_rewrite_close_action(
+                action_type,
+                parameters,
+                state=state,
+            )
+            if closed:
+                self.logger.info(
+                    "Rewrote a close-task click to %s.",
+                    "+".join(parameters.get("keys", ())),
+                )
+            action_type, parameters, chat_rewritten = maybe_rewrite_chat_action(
+                action_type,
+                parameters,
+                state=state,
+            )
+            if chat_rewritten:
+                self.logger.info(
+                    "Rewrote a chat-task action to %s.",
+                    action_type,
+                )
+            # Chat-phase validation must run before target resolution strips
+            # target_text into metadata, or its click checks see empty labels.
+            try:
+                validate_chat_action(action_type, parameters, state)
+            except ValueError as error:
+                raise PlannerValidationError(str(error)) from error
             parameters = self._validate_action_parameters(
                 action_type,
                 parameters,
@@ -1505,6 +1639,9 @@ class Planner:
             "input": "type_text",
             "write": "type_text",
             "keyboard_input": "type_text",
+            "paste": "paste_text",
+            "paste_text": "paste_text",
+            "clipboard_paste": "paste_text",
             "key_press": "press",
             "shortcut": "hotkey",
             "vertical_scroll": "scroll",
@@ -1617,7 +1754,7 @@ class Planner:
                 if alias != "amount":
                     params.pop(alias, None)
 
-        if action_type == "type_text":
+        if action_type in {"type_text", "paste_text"}:
             text = params.get("text")
 
             if text is None:
@@ -1625,19 +1762,19 @@ class Planner:
 
             if text is None:
                 raise PlannerValidationError(
-                    "type_text requires text."
+                    f"{action_type} requires text."
                 )
 
             text = str(text)
 
             if not text and not self.config.allow_empty_text:
                 raise PlannerValidationError(
-                    "type_text text must not be empty."
+                    f"{action_type} text must not be empty."
                 )
 
             if len(text) > self.config.max_text_length:
                 raise PlannerValidationError(
-                    "type_text exceeds max_text_length."
+                    f"{action_type} exceeds max_text_length."
                 )
 
             params["text"] = text
@@ -1683,6 +1820,10 @@ class Planner:
                 raise PlannerValidationError(
                     "hotkey keys must not be empty."
                 )
+            try:
+                validate_close_hotkey(params["keys"], state)
+            except ValueError as error:
+                raise PlannerValidationError(str(error)) from error
 
         if action_type == "wait":
             duration = (
@@ -1754,6 +1895,17 @@ class Planner:
         return getattr(element, name, default)
 
     @classmethod
+    def _element_labels(cls, element: Any) -> list[str]:
+        """Return the non-empty text/label/name of a detected element."""
+
+        values = (
+            cls._element_value(element, "text", ""),
+            cls._element_value(element, "label", ""),
+            cls._element_value(element, "name", ""),
+        )
+        return [str(value).strip() for value in values if str(value).strip()]
+
+    @classmethod
     def _observation_elements(cls, observation: Any) -> list[Any]:
         for name in (
             "elements",
@@ -1819,6 +1971,26 @@ class Planner:
                 "label and optionally include element_id."
             )
 
+        if is_forbidden_suggestion_target(target_text):
+            raise PlannerValidationError(
+                f"Refusing to click suggestion/OCR junk target {target_text!r}. "
+                "For browser search use hotkey Ctrl+L to focus the address bar, "
+                "then paste_text and press enter."
+            )
+
+        if is_close_task(task_instruction(state)):
+            if is_status_close_decoy(target_text):
+                raise PlannerValidationError(
+                    f"Refusing to click status chip {target_text!r} for a close "
+                    "task. Prefer hotkey Ctrl+W (or Alt+F4); click a close "
+                    "control only when OCR shows ✕ / × / 关闭 / Close."
+                )
+            if is_forbidden_close_target(target_text):
+                raise PlannerValidationError(
+                    f"Refusing to click menu/panel target {target_text!r} for a "
+                    "close task. Prefer hotkey Ctrl+W (or Alt+F4)."
+                )
+
         observation = state.observation
         if observation is None:
             raise PlannerValidationError(
@@ -1849,28 +2021,47 @@ class Planner:
                     target = element
                     resolved_element_id = candidate_id
                     break
-            if target is None:
-                raise PlannerValidationError(
-                    f"element_id={element_id} is not present in the "
-                    "current detected elements."
+            # An element_id is only an index inside one observation, so an id
+            # copied from an earlier step can be absent or point at an unrelated
+            # element. target_text stays the authority: drop the id and resolve
+            # by text instead of failing the whole plan.
+            if target is not None and not any(
+                texts_match(target_text, label)
+                for label in self._element_labels(target)
+            ):
+                self.logger.warning(
+                    "Ignoring element_id=%s: it does not match target_text=%r "
+                    "in the current observation.",
+                    element_id,
+                    target_text,
+                )
+                target = None
+                resolved_element_id = None
+            elif target is None:
+                self.logger.warning(
+                    "element_id=%s is not present in the current observation; "
+                    "resolving target_text=%r instead.",
+                    element_id,
+                    target_text,
                 )
 
         if target is None and target_text:
             expected = normalise_target_text(target_text)
-            matches: list[tuple[int, float, int, int, Any]] = []  # 添加bbox_size
+            matches: list[tuple[int, int, float, int, int, Any]] = []
             
             # 获取屏幕高度用于桌面区域判断
             screen_height = observation.screen_height if observation else 1080
+            # 桌面图标偏好只适用于启动类动作（双击桌面快捷方式）。
+            prefers_desktop_icon = action_type == "double_click"
             
             for index, element in enumerate(elements):
                 # element_type 只是启发式类别，不能作为语义证据，因此不参与匹配：
                 # 否则选中的元素会缺少 matched_text，动作在执行前必然被拒绝。
                 labels = [
-                    self._element_value(element, "text", ""),
-                    self._element_value(element, "label", ""),
-                    self._element_value(element, "name", ""),
+                    label
+                    for label in self._element_labels(element)
+                    if normalise_target_text(label)
                 ]
-                labels = [label for label in labels if normalise_target_text(label)]
                 score = 0
                 if any(normalise_target_text(label) == expected for label in labels):
                     score = 3
@@ -1893,50 +2084,40 @@ class Planner:
                         candidate_id = index
                     
                     # 计算bbox大小（用于优先选择小图标）
+                    desktop_bonus = 0
                     bbox = self._element_value(element, "bbox", [0, 0, 0, 0])
                     if isinstance(bbox, Sequence) and len(bbox) == 4:
                         width = abs(bbox[2] - bbox[0])
                         height = abs(bbox[3] - bbox[1])
                         bbox_size = width * height
                         
-                        # 检查是否在桌面区域（屏幕下半部分）
+                        # 桌面区域（屏幕下半部分）的小图标：仅在启动类动作里
+                        # 作为同分候选之间的次级偏好，绝不能压过精确文本匹配。
                         center_y = (bbox[1] + bbox[3]) / 2
                         is_desktop_area = center_y > screen_height * 0.5
-                        
-                        # 桌面图标通常很小（宽高都小于100）
                         is_small_icon = width < 100 and height < 100
-                        
-                        # 如果是桌面应用任务，优先选择桌面区域的小图标
-                        if is_desktop_area and is_small_icon:
-                            score += 10  # 大幅提升桌面小图标的优先级
+                        if prefers_desktop_icon and is_desktop_area and is_small_icon:
+                            desktop_bonus = 1
                     else:
                         bbox_size = 999999  # 无效bbox给最大值
                     
                     matches.append(
-                        (score, confidence, bbox_size, candidate_id, element)
+                        (score, desktop_bonus, confidence, bbox_size, candidate_id, element)
                     )
 
             if not matches:
                 raise PlannerValidationError(
                     f"Target element was not detected: {target_text!r}."
                 )
-            # 优先级：score最高 -> confidence最高 -> bbox最小（优先小图标）
-            _, _, _, resolved_element_id, target = max(
-                matches, key=lambda item: (item[0], item[1], -item[2])
+            # 优先级：score最高 -> 桌面图标偏好 -> confidence最高 -> bbox最小
+            _, _, _, _, resolved_element_id, target = max(
+                matches, key=lambda item: (item[0], item[1], item[2], -item[3])
             )
 
         if target is None:
             raise PlannerValidationError("No detected target was resolved.")
 
-        target_labels = [
-            self._element_value(target, "text", ""),
-            self._element_value(target, "label", ""),
-            self._element_value(target, "name", ""),
-        ]
-        detected_text = next(
-            (str(value).strip() for value in target_labels if str(value).strip()),
-            "",
-        )
+        detected_text = next(iter(self._element_labels(target)), "")
 
         # 保留OCR/GUI检测的真实结果，不用target_text覆盖
         # matched_text必须是真实识别结果，后续验证通过标准化和包含关系接受部分匹配
@@ -1977,8 +2158,25 @@ class Planner:
                 f"Detected target {target_text!r} has an inverted bbox={bbox}."
             )
 
+        try:
+            validate_close_click_params(
+                target_text=target_text,
+                bbox=bbox,
+                state=state,
+            )
+        except ValueError as error:
+            raise PlannerValidationError(str(error)) from error
+
         params["x"] = (left + right) // 2
         params["y"] = (top + bottom) // 2
+        # Remember the composer identity before Action strips target_text.
+        # Phase stays idle until execute succeeds; this only stores label/bbox.
+        if is_chat_send_task(task_instruction(state)):
+            register_chat_composer_target(
+                state,
+                target_text=target_text,
+                bbox=bbox,
+            )
         params.pop("target_text", None)
         params.pop("element_id", None)
         validation = {

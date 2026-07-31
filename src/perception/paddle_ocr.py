@@ -436,10 +436,12 @@ class PaddleOCREngine(BaseOCREngine):
             "confidence",
             "confidences",
         )
+        # PaddleOCR 3.x: rec_texts aligns with rec_polys, so prefer it and
+        # only fall back to detection-stage polygons.
         polygons = self._first_available(
             data,
-            "dt_polys",
             "rec_polys",
+            "dt_polys",
             "polys",
             "boxes",
             "text_boxes",
@@ -460,6 +462,17 @@ class PaddleOCREngine(BaseOCREngine):
 
         # min(len())安全对齐，confidence_threshold过滤杂质，offset_x/y坐标平移
         item_count = min(len(texts), len(scores), len(polygons))
+
+        if not (len(texts) == len(scores) == len(polygons)):
+            logger.warning(
+                "OCR result length mismatch: texts=%d, scores=%d, "
+                "polygons=%d; truncating to %d items. Text/bbox pairing "
+                "may be unreliable.",
+                len(texts),
+                len(scores),
+                len(polygons),
+                item_count,
+            )
         elements: list[GUIElement] = []
 
         for index in range(item_count):

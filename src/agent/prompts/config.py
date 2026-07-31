@@ -98,6 +98,7 @@ DEFAULT_ALLOWED_ACTIONS: tuple[str, ...] = (
     "press",
     "hotkey",
     "type_text",
+    "paste_text",
     "wait",
     "screenshot",
     "finish",

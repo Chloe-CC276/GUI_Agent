@@ -54,6 +54,14 @@ _ACTION_PARAMETERS_SCHEMA: JSONSchema = {
             "minItems": 1,
         },
         "text": {"type": "string"},
+        "target_text": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Visible OCR/GUI label of the click target; required for all "
+                "click-family actions."
+            ),
+        },
         "seconds": {"type": "number", "minimum": 0},
         "message": {"type": "string"},
         "region": {

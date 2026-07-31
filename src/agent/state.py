@@ -1149,6 +1149,8 @@ class AgentState:
     def commit_step(
         self,
         step: AgentStepResult | None = None,
+        *,
+        final: bool = False,
     ) -> AgentStepResult:
         self._ensure_active()
 
@@ -1185,7 +1187,9 @@ class AgentState:
         self.runtime.next_step()
         self._clear_step_results()
 
-        if self.runtime.reached_max_steps:
+        # A task that completes exactly on its last step is a success, not a
+        # MaximumStepsExceeded failure; ``final`` commits skip the limit check.
+        if self.runtime.reached_max_steps and not final:
             self.fail(
                 error=ErrorInfo(
                     error_type="MaximumStepsExceeded",

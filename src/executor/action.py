@@ -156,6 +156,15 @@ class Action:
         if isinstance(self.keys, list):
             self.keys = tuple(self.keys)
 
+        # The agent side calls the wait interval "duration" while the executor
+        # historically used "seconds"; accept both to keep the contract whole.
+        if (
+            self.type == ActionType.WAIT
+            and self.seconds is None
+            and self.duration is not None
+        ):
+            self.seconds = self.duration
+
         self.validate()
 
 
@@ -464,6 +473,20 @@ class Action:
             raise TypeError(
                 "data must be a dictionary."
             )
+
+        data = dict(data)
+
+        # Planner factories may emit "action_type" instead of "type".
+        if "type" not in data and data.get("action_type") is not None:
+            data["type"] = data.pop("action_type")
+
+        # Planner responses nest parameters ({"type": ..., "parameters": {...}});
+        # flatten them so x/y/text are not silently dropped into extra_fields
+        # (which would e.g. click at the current mouse position).
+        nested = data.pop("parameters", None)
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                data.setdefault(key, value)
 
         if "type" not in data:
             raise ValueError(

@@ -342,56 +342,79 @@ def normalise_image(
     *,
     mime_type: str = "image/png",
     detail: str | None = None,
+    prepare_for_vlm: bool = True,
 ) -> ImageInput:
-    """Convert a supported image value into ``ImageInput``."""
-    if isinstance(image, ImageInput):
-        return image
+    """Convert a supported image value into ``ImageInput``.
 
-    if isinstance(image, bytes):
-        return ImageInput.from_bytes(
+    When ``prepare_for_vlm`` is true (default), large screenshots are downscaled
+    and JPEG-compressed before they become multimodal tokens. OCR/click code
+    should keep using the original capture; only the model-facing payload is
+    prepared here.
+    """
+
+    if isinstance(image, ImageInput):
+        result = image
+    elif isinstance(image, bytes):
+        result = ImageInput.from_bytes(
             image,
             mime_type=mime_type,
             detail=detail,
         )
-
-    if isinstance(image, Path):
-        return ImageInput.from_path(
+    elif isinstance(image, Path):
+        result = ImageInput.from_path(
             image,
             detail=detail,
         )
-
-    if isinstance(image, str):
+    elif isinstance(image, str):
         text = image.strip()
 
         if text.startswith("data:"):
-            return ImageInput.from_data_url(
+            result = ImageInput.from_data_url(
                 text,
                 detail=detail,
             )
-
-        if re.match(r"^https?://", text, flags=re.IGNORECASE):
-            return ImageInput.from_url(
+        elif re.match(r"^https?://", text, flags=re.IGNORECASE):
+            result = ImageInput.from_url(
                 text,
                 detail=detail,
             )
-
-        return ImageInput.from_path(
-            text,
-            detail=detail,
-        )
-
-    if type(image).__module__.startswith("numpy"):
+        else:
+            result = ImageInput.from_path(
+                text,
+                detail=detail,
+            )
+    elif type(image).__module__.startswith("numpy"):
         try:
-            import cv2
-
             if getattr(image, "size", 0) == 0:
                 raise ValueError("NumPy image is empty.")
+
+            if prepare_for_vlm:
+                from .vlm_image_prep import prepare_numpy_image_for_vlm
+
+                prep_info: dict[str, Any] = {}
+                prepared = prepare_numpy_image_for_vlm(image, info=prep_info)
+                if prepared is not None:
+                    payload, prepared_mime = prepared
+                    prepared_metadata: dict[str, Any] = {"vlm_prepared": True}
+                    if "vlm_scale" in prep_info:
+                        prepared_metadata["vlm_scale"] = prep_info["vlm_scale"]
+                        prepared_metadata["original_size"] = prep_info[
+                            "original_size"
+                        ]
+                    return ImageInput.from_bytes(
+                        payload,
+                        mime_type=prepared_mime,
+                        detail=detail or "low",
+                        metadata=prepared_metadata,
+                    )
+
+            import cv2
 
             success, encoded = cv2.imencode(".png", image)
             if not success:
                 raise ValueError("OpenCV failed to encode image.")
 
-            return ImageInput.from_bytes(
+            result = ImageInput.from_bytes(
                 encoded.tobytes(),
                 mime_type="image/png",
                 detail=detail,
@@ -400,14 +423,12 @@ def normalise_image(
             raise TypeError(
                 f"Failed to convert NumPy image: {error}"
             ) from error
-
-    # 支持 PIL.Image
-    if type(image).__module__.startswith("PIL."):
+    elif type(image).__module__.startswith("PIL."):
         try:
             buffer = BytesIO()
             image.save(buffer, format="PNG")
 
-            return ImageInput.from_bytes(
+            result = ImageInput.from_bytes(
                 buffer.getvalue(),
                 mime_type="image/png",
                 detail=detail,
@@ -416,9 +437,50 @@ def normalise_image(
             raise TypeError(
                 f"Failed to convert PIL image: {error}"
             ) from error
+    else:
+        raise TypeError(
+            "image must be ImageInput, str, pathlib.Path, or bytes."
+        )
 
-    raise TypeError(
-        "image must be ImageInput, str, pathlib.Path, or bytes."
+    if prepare_for_vlm:
+        return _prepare_image_input_for_vlm(result, detail=detail)
+    return result
+
+
+def _prepare_image_input_for_vlm(
+    image: ImageInput,
+    *,
+    detail: str | None = None,
+) -> ImageInput:
+    if image.metadata.get("vlm_prepared") or image.metadata.get("skip_vlm_prep"):
+        return image
+    if image.source_type == ImageSourceType.URL:
+        return image
+    try:
+        from .vlm_image_prep import prepare_image_bytes_for_vlm
+
+        prep_info: dict[str, Any] = {}
+        raw = image.read_bytes()
+        prepared, prepared_mime = prepare_image_bytes_for_vlm(
+            raw,
+            mime_type=image.mime_type,
+            info=prep_info,
+        )
+    except Exception:
+        return image
+
+    metadata = dict(image.metadata)
+    metadata["vlm_prepared"] = True
+    metadata["original_bytes"] = len(raw)
+    metadata["prepared_bytes"] = len(prepared)
+    if "vlm_scale" in prep_info:
+        metadata["vlm_scale"] = prep_info["vlm_scale"]
+        metadata["original_size"] = prep_info["original_size"]
+    return ImageInput.from_bytes(
+        prepared,
+        mime_type=prepared_mime,
+        detail=detail or image.detail or "low",
+        metadata=metadata,
     )
 
 
@@ -798,18 +860,14 @@ class VLMUsage:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def normalise_total(self) -> None:
-        if self.total_tokens is None:
-            values = [
-                value
-                for value in (
-                    self.input_tokens,
-                    self.output_tokens,
-                )
-                if value is not None
-            ]
-
-            if values:
-                self.total_tokens = sum(values)
+        # Only derive a total when both counts are known; a lone input or
+        # output count is not a valid total.
+        if (
+            self.total_tokens is None
+            and self.input_tokens is not None
+            and self.output_tokens is not None
+        ):
+            self.total_tokens = self.input_tokens + self.output_tokens
 
     def to_dict(self) -> dict[str, Any]:
         self.normalise_total()
@@ -1537,15 +1595,20 @@ class BaseVLM(ABC):
         self._history.clear()
         self._response_history.clear()
 
+    _MAX_RESPONSE_HISTORY = 50
+
     def _record_success(
         self,
         request: VLMRequest,
         response: VLMResponse,
     ) -> None:
-        self._response_history.append(response)
-
         if not self.keep_history:
             return
+
+        self._response_history.append(response)
+
+        if len(self._response_history) > self._MAX_RESPONSE_HISTORY:
+            del self._response_history[: -self._MAX_RESPONSE_HISTORY]
 
         # Do not duplicate default/system/history messages. Only append the
         # newest user-side messages plus the assistant response.

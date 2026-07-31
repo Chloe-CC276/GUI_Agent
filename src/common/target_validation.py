@@ -52,6 +52,24 @@ def _loose_tokens(value: Any) -> set[str]:
     return set(str(value or "").casefold().split())
 
 
+# Close buttons and similar controls are often labeled with a bare glyph that
+# normalises to an empty string.  Map the common variants onto one canonical
+# form so "✕" can still be matched as a click target.
+_SYMBOL_EQUIVALENTS: dict[str, str] = {
+    "✕": "x",
+    "×": "x",
+    "⨉": "x",
+    "☓": "x",
+    "╳": "x",
+    "x": "x",
+}
+
+
+def _symbol_form(value: Any) -> str:
+    raw = str(value or "").strip().casefold()
+    return _SYMBOL_EQUIVALENTS.get(raw, raw)
+
+
 def texts_match(target_text: Any, candidate_text: Any) -> bool:
     """Report whether a detected label is strong enough evidence for a target.
 
@@ -64,7 +82,11 @@ def texts_match(target_text: Any, candidate_text: Any) -> bool:
     expected = normalise_target_text(target_text)
     actual = normalise_target_text(candidate_text)
     if not expected or not actual:
-        return False
+        # Symbol-only labels (✕ / × / …) normalise to "": compare the raw
+        # glyphs instead of rejecting them outright.
+        raw_expected = _symbol_form(target_text)
+        raw_actual = _symbol_form(candidate_text)
+        return bool(raw_expected) and raw_expected == raw_actual
     if expected == actual:
         return True
 
@@ -110,6 +132,41 @@ def coerce_action_mapping(action: Any) -> dict[str, Any]:
         if value is not None:
             result[name] = value
     return result
+
+
+def flatten_action_evidence(action: Any) -> dict[str, Any]:
+    """Return one flat mapping with the action's click evidence restored.
+
+    The planner strips ``target_text`` / ``element_id`` from click parameters
+    into ``metadata.target_validation`` before the Action is built.  Every
+    module that inspects an *executed* action must read through that block,
+    otherwise the target label and bbox appear missing.  This is the single
+    shared reader; do not reimplement it per task module.
+    """
+
+    if action is None:
+        return {}
+    data = coerce_action_mapping(action)
+    nested = data.get("parameters")
+    if isinstance(nested, Mapping):
+        data = {**data, **dict(nested)}
+    metadata = data.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return data
+    validation = metadata.get("target_validation")
+    if not isinstance(validation, Mapping):
+        return data
+    if not data.get("target_text") and validation.get("target_text"):
+        data["target_text"] = validation["target_text"]
+    if not data.get("matched_text") and validation.get("matched_text"):
+        data["matched_text"] = validation["matched_text"]
+    if data.get("element_id") is None and validation.get("element_id") is not None:
+        data["element_id"] = validation["element_id"]
+    if not data.get("bbox") and not data.get("bounding_box"):
+        bbox = validation.get("matched_bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            data["bbox"] = list(bbox)
+    return data
 
 
 def _action_type(data: Mapping[str, Any]) -> str:

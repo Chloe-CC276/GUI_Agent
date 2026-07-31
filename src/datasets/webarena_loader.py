@@ -17,7 +17,6 @@ Therefore, each task becomes a GUITaskSample with steps=[].
 
 from __future__ import annotations
 
-import csv
 import json
 import logging
 import os
@@ -28,6 +27,13 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 from urllib.parse import urlparse
 
+from ._common import (
+    _csv_json,
+    _natural_sort_key,
+    _optional_string,
+    _validate_split_ratios,
+    _write_csv,
+)
 from .schema import (
     DatasetSplit,
     DatasetStatistics,
@@ -1154,6 +1160,37 @@ class WebArenaLoader:
         self._write_csv(destination, rows, encoding=encoding)
         return destination
 
+    def export_configs_jsonl(
+        self,
+        output_path: str | Path,
+        ensure_ascii: bool = False,
+    ) -> Path:
+        """Export internal WebArenaTaskConfig objects to JSONL."""
+        destination = Path(
+            output_path
+        ).expanduser().resolve()
+
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with destination.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            for config in self._task_configs:
+                file.write(
+                    json.dumps(
+                        config.to_dict(),
+                        ensure_ascii=ensure_ascii,
+                        default=str,
+                    )
+                )
+                file.write("\n")
+
+        return destination
+
     def export_split_csv(
         self,
         output_dir: str | Path,
@@ -1184,24 +1221,9 @@ class WebArenaLoader:
         self._write_csv(destination, [row], encoding=encoding)
         return destination
 
-    @staticmethod
-    def _csv_json(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    _csv_json = staticmethod(_csv_json)
 
-    @staticmethod
-    def _write_csv(destination: Path, rows: Sequence[dict[str, Any]], *, encoding: str) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames: list[str] = []
-        for row in rows:
-            for key in row:
-                if key not in fieldnames:
-                    fieldnames.append(key)
-        if not fieldnames:
-            fieldnames = ["task_id"]
-        with destination.open("w", encoding=encoding, newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+    _write_csv = staticmethod(_write_csv)
 
     def split_dataset(
         self,
@@ -1317,19 +1339,7 @@ class WebArenaLoader:
 
         return text
 
-    @staticmethod
-    def _optional_string(
-        value: Any,
-    ) -> str | None:
-        if value is None:
-            return None
-
-        if not isinstance(value, str):
-            return str(value)
-
-        text = value.strip()
-
-        return text or None
+    _optional_string = staticmethod(_optional_string)
 
     @staticmethod
     def _normalise_string_list(
@@ -1406,19 +1416,7 @@ class WebArenaLoader:
         except Exception:
             return ""
 
-    @staticmethod
-    def _natural_sort_key(
-        value: str,
-    ) -> tuple[Any, ...]:
-        return tuple(
-            int(part)
-            if part.isdigit()
-            else part.casefold()
-            for part in re.split(
-                r"(\d+)",
-                value,
-            )
-        )
+    _natural_sort_key = staticmethod(_natural_sort_key)
 
     @staticmethod
     def _task_sort_key(
@@ -1429,39 +1427,7 @@ class WebArenaLoader:
 
         return 1, task_id
 
-    @staticmethod
-    def _validate_split_ratios(
-        train_ratio: float,
-        validation_ratio: float,
-        test_ratio: float,
-    ) -> None:
-        ratios = (
-            train_ratio,
-            validation_ratio,
-            test_ratio,
-        )
-
-        if any(
-            not isinstance(value, (int, float))
-            for value in ratios
-        ):
-            raise TypeError(
-                "Split ratios must be numeric."
-            )
-
-        if any(
-            value < 0
-            for value in ratios
-        ):
-            raise ValueError(
-                "Split ratios must not be negative."
-            )
-
-        if abs(sum(ratios) - 1.0) > 1e-8:
-            raise ValueError(
-                "train_ratio + validation_ratio + "
-                "test_ratio must equal 1.0."
-            )
+    _validate_split_ratios = staticmethod(_validate_split_ratios)
 
     def clear_cache(self) -> None:
         self._sample_cache.clear()

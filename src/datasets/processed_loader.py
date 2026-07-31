@@ -7,7 +7,6 @@ GUITaskSample objects.
 
 from __future__ import annotations
 
-import csv
 import json
 import logging
 import random
@@ -15,6 +14,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from ._common import (
+    _csv_json,
+    _optional_string,
+    _validate_split_ratios,
+    _write_csv,
+)
 from .schema import (
     DatasetSplit,
     DatasetStatistics,
@@ -734,24 +739,9 @@ class ProcessedDatasetLoader:
     def _enum_value(value: Any) -> Any:
         return getattr(value, "value", value)
 
-    @staticmethod
-    def _csv_json(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    _csv_json = staticmethod(_csv_json)
 
-    @staticmethod
-    def _write_csv(destination: Path, rows: Sequence[dict[str, Any]], *, encoding: str) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames: list[str] = []
-        for row in rows:
-            for key in row:
-                if key not in fieldnames:
-                    fieldnames.append(key)
-        if not fieldnames:
-            fieldnames = ["task_id"]
-        with destination.open("w", encoding=encoding, newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+    _write_csv = staticmethod(_write_csv)
 
     def source_counts(self) -> dict[str, int]:
         counter: Counter[str] = Counter()
@@ -788,27 +778,6 @@ class ProcessedDatasetLoader:
             raise ProcessedDatasetError(f"{field_name} must not be empty.")
         return text
 
-    @staticmethod
-    def _optional_string(value: Any) -> str | None:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            text = value.strip()
-            return text or None
-        return str(value)
+    _optional_string = staticmethod(_optional_string)
 
-    @staticmethod
-    def _validate_split_ratios(
-        train_ratio: float,
-        validation_ratio: float,
-        test_ratio: float,
-    ) -> None:
-        ratios = (train_ratio, validation_ratio, test_ratio)
-        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in ratios):
-            raise TypeError("Split ratios must be numeric.")
-        if any(v < 0 for v in ratios):
-            raise ValueError("Split ratios must not be negative.")
-        if abs(sum(ratios) - 1.0) > 1e-8:
-            raise ValueError(
-                "train_ratio + validation_ratio + test_ratio must equal 1.0."
-            )
+    _validate_split_ratios = staticmethod(_validate_split_ratios)

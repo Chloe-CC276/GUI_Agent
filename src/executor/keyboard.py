@@ -27,8 +27,51 @@ try:
 except ImportError:
     pyperclip = None
 
+from . import clipboard as win32_clipboard
+
 
 logger = logging.getLogger(__name__)
+
+
+def _clipboard_read() -> Optional[str]:
+    """Read clipboard text, preferring the dependency-free Win32 backend."""
+
+    if win32_clipboard.is_supported():
+        try:
+            return win32_clipboard.get_text()
+        except Exception:
+            logger.debug("Win32 clipboard read failed.", exc_info=True)
+
+    if pyperclip is not None:
+        try:
+            return pyperclip.paste()
+        except Exception:
+            logger.debug("pyperclip read failed.", exc_info=True)
+
+    return None
+
+
+def _clipboard_write(text: str) -> str:
+    """Write clipboard text and return the backend name that succeeded."""
+
+    errors: list[str] = []
+
+    if win32_clipboard.is_supported():
+        try:
+            win32_clipboard.copy_text(text)
+            return "win32"
+        except Exception as error:
+            errors.append(f"win32: {error}")
+
+    if pyperclip is not None:
+        try:
+            pyperclip.copy(text)
+            return "pyperclip"
+        except Exception as error:
+            errors.append(f"pyperclip: {error}")
+
+    detail = "; ".join(errors) if errors else "no clipboard backend available"
+    raise RuntimeError(f"Failed to write text to the clipboard ({detail}).")
 
 
 @dataclass
@@ -345,33 +388,37 @@ class KeyboardController:
                 "restore_clipboard must be a bool."
             )
 
-        if pyperclip is None:
+        if not win32_clipboard.is_supported() and pyperclip is None:
             raise RuntimeError(
-                "pyperclip is not installed. "
+                "No clipboard backend is available on this platform. "
                 "Run: uv pip install pyperclip"
             )
+
+        backend: dict[str, str] = {}
 
         def operation() -> None:
             previous_text: Optional[str] = None
 
             if restore_clipboard:
-                try:
-                    previous_text = pyperclip.paste()
-                except Exception:
-                    previous_text = None
+                previous_text = _clipboard_read()
 
-            pyperclip.copy(text)
+            backend["name"] = _clipboard_write(text)
 
             if self.system_name == "darwin":
                 pyautogui.hotkey("command", "v")
             else:
                 pyautogui.hotkey("ctrl", "v")
 
-            if restore_clipboard:
+            if restore_clipboard and previous_text is not None:
                 time.sleep(0.05)
 
-                if previous_text is not None:
-                    pyperclip.copy(previous_text)
+                try:
+                    _clipboard_write(previous_text)
+                except Exception:
+                    logger.debug(
+                        "Failed to restore previous clipboard content.",
+                        exc_info=True,
+                    )
 
         return self._execute_action(
             action_name="paste_text",
@@ -381,6 +428,7 @@ class KeyboardController:
                 "text": text,
                 "length": len(text),
                 "restore_clipboard": restore_clipboard,
+                "clipboard_backend": backend,
             },
         )
 

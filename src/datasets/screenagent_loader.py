@@ -39,6 +39,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from ._common import _natural_sort_key
+
 from .schema import (
     DatasetSplit,
     DatasetStatistics,
@@ -1373,6 +1375,54 @@ class ScreenAgentLoader:
 
         return results
 
+    def export_jsonl(
+        self,
+        output_path: str | Path,
+        samples: Sequence[GUITaskSample] | None = None,
+        ensure_ascii: bool = False,
+    ) -> Path:
+        """
+        将 ScreenAgent 数据导出为 JSONL。
+
+        每行对应一个完整的 GUITaskSample。
+        """
+        destination = Path(
+            output_path
+        ).expanduser().resolve()
+
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        output_samples = (
+            list(samples)
+            if samples is not None
+            else self.load_all()
+        )
+
+        with destination.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            for sample in output_samples:
+                file.write(
+                    json.dumps(
+                        sample.to_dict(),
+                        ensure_ascii=ensure_ascii,
+                        default=str,
+                    )
+                )
+                file.write("\n")
+
+        LOGGER.info(
+            "Exported ScreenAgent JSONL: path=%s, tasks=%d",
+            destination,
+            len(output_samples),
+        )
+
+        return destination
+
     def export_csv(
         self,
         output_path: str | Path,
@@ -1930,20 +1980,7 @@ class ScreenAgentLoader:
 
         return value
 
-    @staticmethod
-    def _natural_sort_key(
-        value: str,
-    ) -> tuple[Any, ...]:
-        """
-        自然排序：
-
-        2.json 在 10.json 前；
-        时间戳文件也可正确按名称顺序排列。
-        """
-        return tuple(
-            int(part) if part.isdigit() else part.casefold()
-            for part in re.split(r"(\d+)", value)
-        )
+    _natural_sort_key = staticmethod(_natural_sort_key)
 
     def __repr__(self) -> str:
         return (

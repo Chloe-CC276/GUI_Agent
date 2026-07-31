@@ -198,7 +198,7 @@ class PerceptionPipeline:
             self.merge_results,
         )
 
-        original_image, coordinate_offset = self._obtain_image(
+        original_image, coordinate_offset, screen_size = self._obtain_image(
             image=image,
             region=region,
         )
@@ -278,7 +278,12 @@ class PerceptionPipeline:
             "merge_enabled": use_merge,
             "image_shape": tuple(original_image.shape),
             "processed_image_shape": tuple(processed_image.shape),
+            "screen_width": int(screen_size[0]),
+            "screen_height": int(screen_size[1]),
         }
+
+        if region is not None:
+            metadata["capture_region"] = [int(value) for value in region]
 
         result = PerceptionResult(
             original_image=original_image,
@@ -527,12 +532,15 @@ class PerceptionPipeline:
         self,
         image: Optional[np.ndarray | str | Path],
         region: Optional[tuple[int, int, int, int]],
-    ) -> tuple[np.ndarray, tuple[int, int]]:
-        
+    ) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+        """Return (image, coordinate_offset, true_screen_size)."""
+
         if image is None:
+            screen_size = self.screen_capture.get_screen_size()
+
             if region is None:
                 captured = self.screen_capture.capture_screen()
-                return self._prepare_image(captured), (0, 0)
+                return self._prepare_image(captured), (0, 0), screen_size
 
             left, top, width, height = self._validate_region_tuple(region)
 
@@ -543,12 +551,16 @@ class PerceptionPipeline:
                 height=height,
             )
 
-            return self._prepare_image(captured), (left, top)
+            return self._prepare_image(captured), (left, top), screen_size
 
         loaded_image = self._prepare_image(image)
+        screen_size = (
+            int(loaded_image.shape[1]),
+            int(loaded_image.shape[0]),
+        )
 
         if region is None:
-            return loaded_image, (0, 0)
+            return loaded_image, (0, 0), screen_size
 
         left, top, width, height = self._validate_region_tuple(region)
 
@@ -568,7 +580,7 @@ class PerceptionPipeline:
         if cropped.size == 0:
             raise ValueError("Selected pipeline region is empty.")
 
-        return np.ascontiguousarray(cropped), (left, top)
+        return np.ascontiguousarray(cropped), (left, top), screen_size
 
     def _process_image(
         self,
@@ -581,7 +593,7 @@ class PerceptionPipeline:
         """
 
         if not enabled:
-            return image.copy()
+            return image
 
         options = dict(self.preprocess_options)
 
@@ -637,17 +649,24 @@ class PerceptionPipeline:
             merged_elements = list(ui_elements)
 
             if self.include_unmatched_ocr:
-                existing_texts = {
-                    element.text
+                existing_elements = [
+                    element
                     for element in merged_elements
                     if element.text.strip()
-                }
+                ]
 
                 merged_elements.extend(
                     element
                     for element in ocr_elements
                     if element.text.strip()
-                    and element.text not in existing_texts
+                    and not any(
+                        candidate.text == element.text
+                        and self._bboxes_overlap(
+                            element.bbox,
+                            candidate.bbox,
+                        )
+                        for candidate in existing_elements
+                    )
                 )
 
             return merged_elements
@@ -659,6 +678,44 @@ class PerceptionPipeline:
             return list(ui_elements)
 
         return []
+
+    @staticmethod
+    def _bboxes_overlap(
+        bbox_a: Sequence[float],
+        bbox_b: Sequence[float],
+    ) -> bool:
+        """
+        True when two bboxes overlap significantly: IoU >= 0.5 or one
+        bbox's center lies inside the other bbox.
+        """
+
+        ax1, ay1, ax2, ay2 = (float(value) for value in bbox_a)
+        bx1, by1, bx2, by2 = (float(value) for value in bbox_b)
+
+        inter_width = min(ax2, bx2) - max(ax1, bx1)
+        inter_height = min(ay2, by2) - max(ay1, by1)
+
+        if inter_width > 0 and inter_height > 0:
+            intersection = inter_width * inter_height
+            area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            union = area_a + area_b - intersection
+
+            if union > 0 and intersection / union >= 0.5:
+                return True
+
+        center_ax = (ax1 + ax2) / 2.0
+        center_ay = (ay1 + ay2) / 2.0
+        center_bx = (bx1 + bx2) / 2.0
+        center_by = (by1 + by2) / 2.0
+
+        if bx1 <= center_ax <= bx2 and by1 <= center_ay <= by2:
+            return True
+
+        if ax1 <= center_bx <= ax2 and ay1 <= center_by <= ay2:
+            return True
+
+        return False
 
     @staticmethod
     def _tag_source(

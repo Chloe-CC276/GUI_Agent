@@ -23,6 +23,12 @@ from .formatters import (
 
 _MISSING = object()
 
+# Mirrors src.agent.browser_search.SEARCH_PROGRESS_KEY; duplicated as a literal
+# to keep the prompt package free of imports from the agent package.
+SEARCH_PROGRESS_KEY = "search_progress"
+CLOSE_PROGRESS_KEY = "close_progress"
+CHAT_PROGRESS_KEY = "chat_progress"
+
 
 def _read(value: Any, *names: str, default: Any = None) -> Any:
     """Read the first available key or attribute from an arbitrary object."""
@@ -143,6 +149,14 @@ def build_observation_context(
         context["element_count"] = total
         context["elements_truncated"] = total > len(formatted)
 
+    metadata = _read(observation, "metadata", default={}) or {}
+    if isinstance(metadata, Mapping) and metadata.get("search_focus_detected"):
+        context["search_focus_detected"] = True
+        context["search_focus_evidence"] = metadata.get("search_focus_evidence")
+        context["focus_next_action_hint"] = (
+            "Address/search box is focused; next action should be paste_text then press enter."
+        )
+
     return _clean_mapping(context)
 
 
@@ -185,6 +199,36 @@ def _result_context(result: Any, *, config: PromptConfig) -> dict[str, Any] | No
     return data
 
 
+def search_progress_context(state: Any) -> dict[str, Any] | None:
+    """Return the confirmed search stage recorded on the agent state."""
+
+    metadata = _read(state, "metadata", default={})
+    progress = _read(metadata, SEARCH_PROGRESS_KEY)
+    if isinstance(progress, Mapping) and progress:
+        return dict(progress)
+    return None
+
+
+def close_progress_context(state: Any) -> dict[str, Any] | None:
+    """Return the activate→close stage recorded on the agent state."""
+
+    metadata = _read(state, "metadata", default={})
+    progress = _read(metadata, CLOSE_PROGRESS_KEY)
+    if isinstance(progress, Mapping) and progress:
+        return dict(progress)
+    return None
+
+
+def chat_progress_context(state: Any) -> dict[str, Any] | None:
+    """Return the chat-compose stage recorded on the agent state."""
+
+    metadata = _read(state, "metadata", default={})
+    progress = _read(metadata, CHAT_PROGRESS_KEY)
+    if isinstance(progress, Mapping) and progress:
+        return dict(progress)
+    return None
+
+
 def build_agent_context(
     state: Any,
     *,
@@ -218,8 +262,23 @@ def build_agent_context(
             }
         ),
         "task": _task_context(task),
-        "observation": build_observation_context(current, config=cfg, label="current"),
     }
+
+    # Kept ahead of the observation: the observation can exhaust the prompt
+    # character budget on its own, and truncation drops whatever follows it.
+    progress = search_progress_context(state)
+    if progress:
+        context[SEARCH_PROGRESS_KEY] = progress
+
+    close_progress = close_progress_context(state)
+    if close_progress:
+        context[CLOSE_PROGRESS_KEY] = close_progress
+
+    chat_progress = chat_progress_context(state)
+    if chat_progress:
+        context[CHAT_PROGRESS_KEY] = chat_progress
+
+    context["observation"] = build_observation_context(current, config=cfg, label="current")
 
     if cfg.include_previous_observation:
         context["previous_observation"] = build_observation_context(
@@ -299,9 +358,15 @@ class ContextBuilder:
 
 
 __all__ = [
+    "CHAT_PROGRESS_KEY",
+    "CLOSE_PROGRESS_KEY",
     "ContextBuilder",
+    "SEARCH_PROGRESS_KEY",
     "build_agent_context",
     "build_observation_context",
+    "chat_progress_context",
+    "close_progress_context",
     "compact_history",
     "gui_element_to_dict",
+    "search_progress_context",
 ]
