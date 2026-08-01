@@ -20,7 +20,8 @@ screenshots/
 *.log
 
 # 数据集与外部仓库（体积大，均来自公开渠道，不入库）
-data/
+# 仅忽略仓库根目录 data/；保留 src/tuning/data/ 等代码包
+/data/
 external/
 *.jsonl
 # Mind2Web 数据集样本（2.8 MB），预处理脚本可重新生成
