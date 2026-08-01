@@ -2,10 +2,8 @@
 
 ## 模型调优框架
 
-模型侧调优（框架优化 / LoRA GUI 训练 / 提示词优化）的设计与落地路径见：
-
-- [`docs/MODEL_TUNING_FRAMEWORK.md`](docs/MODEL_TUNING_FRAMEWORK.md)
-- 代码骨架：[`src/tuning/`](src/tuning/)
+模型侧调优（框架优化 / LoRA GUI 训练 / 提示词优化）的设计见：
+[`docs/MODEL_TUNING_FRAMEWORK.md`](docs/MODEL_TUNING_FRAMEWORK.md)
 
 ```text
 GUI_Agent/
