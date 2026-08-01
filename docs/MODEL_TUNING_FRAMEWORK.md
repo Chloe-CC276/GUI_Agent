@@ -54,31 +54,26 @@ Mind2Web 作语义动作辅助；WebArena 主要用于任务级评测（无演�
 
 ---
 
-## 3. 目标目录结构
+## 3. 目标目录结构（规划，尚未落地）
 
 ```text
-src/tuning/
-├── __init__.py
-├── README.md                 # 本模块速览与命令入口
+src/tuning/                   # 规划包，实现阶段再创建
 ├── configs/                  # YAML/JSON 训练与评测配置
 │   └── default_qlora.yaml
 ├── data/                     # 样本转换与过滤
-│   ├── __init__.py
 │   ├── sft_converter.py      # GUITaskSample → 多模态 chat SFT
 │   ├── dpo_converter.py      # llm_response vs corrected_response
 │   └── filters.py            # 缺图/坏动作/超长样本过滤
 ├── train/                    # LoRA / QLoRA 训练
-│   ├── __init__.py
 │   ├── collator.py           # 图文 batch collate
 │   ├── train_lora.py         # 主训练入口
 │   └── export_adapter.py     # 导出/合并 adapter
 └── eval/                     # 离线 + 在线评测
-    ├── __init__.py
     ├── offline_metrics.py    # JSON 合法率、动作类型、坐标误差
     └── online_harness.py     # dry-run / 有限步 Agent 回放
 
 docs/
-└── MODEL_TUNING_FRAMEWORK.md # 本文件
+└── MODEL_TUNING_FRAMEWORK.md # 本文件（当前仅有文档）
 
 data/                         # gitignored
 ├── processed/                # 已有 preprocess 输出
@@ -260,11 +255,11 @@ Agent Planner / Eval
 ## 8. 实施顺序（技术依赖，非日历）
 
 ```text
-Phase 0  框架落地（本 PR）
-         └─ 文档 + src/tuning 骨架 + 默认配置占位
+Phase 0  框架设计（当前）
+         └─ 仅文档：docs/MODEL_TUNING_FRAMEWORK.md
 
 Phase 1  数据转换
-         ├─ sft_converter / filters
+         ├─ 创建 src/tuning/data（sft_converter / filters）
          ├─ 补齐 ScreenAgent export_jsonl（若仍缺失）
          └─ 产出 data/sft/{train,validation,test}.jsonl
 
@@ -303,7 +298,7 @@ Phase 5  提示词迭代 + 可选 DPO
 
 ## 10. 下一步（实现入口）
 
-完成本框架后，优先实现：
+确认本框架后，实现阶段优先：
 
 1. `src/tuning/data/sft_converter.py` — 从 `ProcessedDatasetLoader` 读入并写出 SFT JSONL  
 2. `src/tuning/configs/default_qlora.yaml` — 填入可运行默认超参  
