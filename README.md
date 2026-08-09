@@ -1,9 +1,14 @@
 # GUI_Agent
 
+## 国企智慧采购智能助手 MVP
+
+本地 OA、采购云、ERP 与 Agent 演示环境位于
+[`apps/procurement_mvp`](apps/procurement_mvp/README.md)。该应用独立运行，
+不修改现有 GUI Agent 执行链路。
+
 ## 模型调优框架
 
-模型侧调优（框架优化 / LoRA GUI 训练 / 提示词优化）的设计见：
-[`docs/MODEL_TUNING_FRAMEWORK.md`](docs/MODEL_TUNING_FRAMEWORK.md)
+模型侧调优（框架优化 / LoRA GUI 训练 / 提示词优化）的设计文档位于本地 `docs/`（该目录已加入 `.gitignore`，不入库）。
 
 ```text
 GUI_Agent/

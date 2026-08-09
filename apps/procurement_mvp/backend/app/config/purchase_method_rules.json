@@ -1,0 +1,10 @@
+{
+  "version": "v1",
+  "currency": "CNY",
+  "rules": [
+    {"method": "网购", "min_amount": 0, "max_amount": 50000},
+    {"method": "比价", "min_amount": 50000, "max_amount": 200000},
+    {"method": "招标", "min_amount": 200000, "max_amount": 1000000},
+    {"method": "集中采购", "min_amount": 1000000}
+  ]
+}

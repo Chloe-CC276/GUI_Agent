@@ -26,7 +26,14 @@ external/
 # Mind2Web 数据集样本（2.8 MB），预处理脚本可重新生成
 /sample.json
 
-# 项目资料与文档（含实习项目大纲 PDF）
+# LoRA / 模型调优本地产物
+lora_tuning/
+
+# 项目文档与设计资料
+docs/
+doc/
+
+# 项目资料（含实习项目大纲等）
 *.pdf
 *.docx
 *.doc
@@ -34,6 +41,28 @@ external/
 *.ppt
 *.xlsx
 *.xls
+*.csv
+
+# 测试代码、E2E 与测试数据（不入库）
+/test/
+**/test/
+**/tests/
+**/e2e/
+**/__tests__/
+**/test_data/
+**/fixtures/
+*.test.ts
+*.test.tsx
+*.test.js
+*.test.jsx
+*.spec.ts
+*.spec.tsx
+*.spec.js
+test-results/
+playwright-report/
+coverage/
+.nyc_output/
+**/results.json
 
 # 编辑器与操作系统
 .idea/
@@ -45,3 +74,14 @@ Thumbs.db
 .env.*
 *.key
 secrets.json
+
+# Web MVP dependencies, builds and local SQLite data
+node_modules/
+dist/
+.cache/
+*.db
+*.db-shm
+*.db-wal
+*.db.bak-*
+**/exports/**
+!**/exports/.gitkeep
