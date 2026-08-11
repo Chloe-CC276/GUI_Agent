@@ -305,6 +305,50 @@ class AgentTask(Base):
     current_route: Mapped[str | None] = mapped_column(String(200), nullable=True)
     context_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     is_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    batch_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    po_no: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    executor_type: Mapped[str] = mapped_column(String(40), default="dom")
+    takeover_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentStepLog(Base):
+    __tablename__ = "agent_step_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    step_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    task_id: Mapped[str] = mapped_column(String(80), index=True)
+    step_name: Mapped[str] = mapped_column(String(80), index=True)
+    expected_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    actual_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    screenshot_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentSafetyLog(Base):
+    __tablename__ = "agent_safety_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    pr_no: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    po_no: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    stage: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    severity: Mapped[str] = mapped_column(String(20), default="INFO")
+    expected: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actual: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action_taken: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -375,6 +419,17 @@ class ERPPurchaseOrder(Base):
     task_id: Mapped[str] = mapped_column(String(80), index=True)
     status: Mapped[str] = mapped_column(String(30), default="created", index=True)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0"))
+    supplier_code: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    supplier_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    request_dept: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    purchasing_org: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    purchasing_group: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    currency_code: Mapped[str] = mapped_column(String(10), default="CNY")
+    payment_terms: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    buyer_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    total_amount_tax: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    created_by_agent_task_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -390,13 +445,19 @@ class ERPPurchaseOrderLine(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("erp_purchase_orders.id"), index=True)
     line_no: Mapped[int] = mapped_column(Integer)
+    po_item_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
     material_code: Mapped[str] = mapped_column(String(50), index=True)
     material_name: Mapped[str] = mapped_column(String(200))
     specification: Mapped[str] = mapped_column(String(300), default="")
     unit: Mapped[str] = mapped_column(String(30))
+    uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
     quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4))
     unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    unit_price_tax: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     line_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    line_amount_tax: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    delivery_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     order: Mapped["ERPPurchaseOrder"] = relationship(back_populates="lines")
 
 

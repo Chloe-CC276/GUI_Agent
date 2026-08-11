@@ -151,7 +151,7 @@ export const api = {
     }>(`/oa/applications/${oaApplyNo}/submit-procurement`, payload).then((r) => r.data),
   getLineage: (oaApplyNo: string) =>
     client.get<Lineage>(`/oa/proposals/${oaApplyNo}/lineage`).then((r) => r.data),
-  listMaterials: (params?: { search?: string }) =>
+  listMaterials: (params?: { search?: string; page?: number; page_size?: number }) =>
     client.get<PageResult<Material>>('/erp/materials', { params }).then((r) => r.data),
   listSuppliers: (params?: { search?: string }) =>
     client.get<{ items: Supplier[] }>('/erp/suppliers', { params }).then((r) => r.data),
@@ -183,6 +183,7 @@ export const api = {
       pr_no?: string
       erp_sync_status?: string
       procurement_status?: string
+      message?: string
       transfer?: Transfer
     }>(`/procurement/requests/${prNo}/submit-erp`, payload).then((r) => r.data),
   prepareERPSubmit: (prNo: string, payload: { task_id: string; business_key: string }) =>
@@ -370,4 +371,103 @@ export const api = {
     client.post<TaskStatus>(`/agent/tasks/${taskId}/resume`).then((r) => r.data),
   stopAgentTask: (taskId: string) =>
     client.post<TaskStatus>(`/agent/tasks/${taskId}/stop`).then((r) => r.data),
+
+  listPOCandidates: (params?: { status?: string; q?: string; page?: number; page_size?: number }) =>
+    client.get<PageResult<Record<string, unknown> & { pr_no: string; status: string }>>('/erp/po-candidates', { params }).then((r) => r.data),
+  createPOBatch: (payload: { pr_nos: string[]; operator?: string }) =>
+    client.post<{
+      batch_id: string
+      tasks: Array<{ task_id?: string | null; pr_no: string; status: string; po_no?: string | null; route?: string }>
+    }>('/erp/po-tasks/batch', payload).then((r) => r.data),
+  runPOTask: (taskId: string) =>
+    client.post<Record<string, unknown>>(`/erp/po-tasks/${taskId}/run`).then((r) => r.data),
+  getPOTask: (taskId: string) =>
+    client.get<Record<string, unknown>>(`/erp/po-tasks/${taskId}`).then((r) => r.data),
+  getPOCreateContext: (reference: string) =>
+    client.get<{
+      task_id?: string | null
+      pr_no: string
+      status?: string
+      po_no?: string | null
+      steps?: Array<{ step_id: string; title?: string; status?: string }>
+      form?: {
+        header?: Record<string, unknown>
+        lines?: Array<Record<string, unknown>>
+        oa_apply_no?: string
+        award_confirmed_at?: string
+        purchase_method?: string
+      }
+      source?: {
+        oa_apply_no?: string
+        award_confirmed_at?: string
+        purchase_method?: string
+      }
+    }>(`/erp/po-create-context/${reference}`).then((r) => r.data),
+  createPOFromForm: (
+    taskId: string,
+    payload: { header: Record<string, unknown>; lines: Array<Record<string, unknown>>; simulate_readback_fail?: boolean },
+  ) =>
+    client.post<{ task_id: string; pr_no: string; po_no: string; status: string; order?: ERPOrder }>(
+      `/erp/po-tasks/${taskId}/create-po`,
+      payload,
+    ).then((r) => r.data),
+  markPOCreated: (
+    taskId: string,
+    payload: { po_no?: string; success?: boolean; error_code?: string; message?: string },
+  ) => client.post<Record<string, unknown>>(`/erp/po-tasks/${taskId}/mark-created`, payload).then((r) => r.data),
+  getPODetail: (poNo: string) =>
+    client.get<{
+      po_no: string
+      pr_no: string
+      oa_apply_no?: string
+      status: string
+      supplier_code?: string
+      supplier_name?: string
+      request_dept?: string
+      purchasing_org?: string
+      purchasing_group?: string
+      currency_code?: string
+      total_amount?: number | string
+      total_amount_tax?: number | string
+      batch_id?: string
+      task_id?: string
+      created_at?: string
+      lines: Array<Record<string, unknown> & { id: number; line_no: number }>
+      agent_summary?: {
+        status?: string
+        retry_count?: number
+        takeover_flag?: boolean
+        duration_ms?: number | null
+        error_code?: string | null
+        executor_type?: string | null
+      }
+    }>(`/erp/pos/${poNo}`).then((r) => r.data),
+  getPOLineage: (poNo: string) =>
+    client.get<Lineage & { batch_id?: string }>(`/erp/pos/${poNo}/lineage`).then((r) => r.data),
+  getAgentDashboardSummary: (params?: { date_from?: string; date_to?: string; department?: string; batch_id?: string }) =>
+    client.get<Record<string, number>>('/erp/agent-dashboard/summary', { params }).then((r) => r.data),
+  getAgentDashboardFunnel: (params?: { date_from?: string; date_to?: string; batch_id?: string }) =>
+    client.get<Record<string, number>>('/erp/agent-dashboard/funnel', { params }).then((r) => r.data),
+  getAgentDashboardEvents: (params?: { event_type?: string; severity?: string; stage?: string; task_id?: string; page?: number; page_size?: number }) =>
+    client.get<PageResult<Record<string, unknown>>>('/erp/agent-dashboard/events', { params }).then((r) => r.data),
+  getAgentDashboardTasks: (params?: { status?: string; batch_id?: string; pr_no?: string; po_no?: string }) =>
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/agent-dashboard/tasks', { params }).then((r) => r.data),
+  getAgentDashboardTaskSteps: (taskId: string) =>
+    client.get<{ items: Array<Record<string, unknown>> }>(`/erp/agent-dashboard/tasks/${taskId}/steps`).then((r) => r.data),
+  retryAgentDashboardTask: (taskId: string) =>
+    client.post<Record<string, unknown>>(`/erp/agent-dashboard/tasks/${taskId}/retry`).then((r) => r.data),
+  stopAgentDashboardBatch: (batchId: string) =>
+    client.post<Record<string, unknown>>(`/erp/agent-dashboard/batches/${batchId}/stop`).then((r) => r.data),
+  getPODashboardSummary: (params?: { date_from?: string; date_to?: string; department?: string; supplier?: string }) =>
+    client.get<Record<string, number | string>>('/erp/po-dashboard/summary', { params }).then((r) => r.data),
+  getPODashboardTrend: (params?: { grain?: string; date_from?: string; date_to?: string }) =>
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/trend', { params }).then((r) => r.data),
+  getPODashboardByDepartment: (params?: { metric?: string }) =>
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/by-department', { params }).then((r) => r.data),
+  getPODashboardBySupplier: (params?: { limit?: number; metric?: string }) =>
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/by-supplier', { params }).then((r) => r.data),
+  getPODashboardByMaterial: (params?: { limit?: number; metric?: string }) =>
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/by-material', { params }).then((r) => r.data),
+  getPODashboardRecent: (params?: { page?: number; page_size?: number; status?: string }) =>
+    client.get<PageResult<Record<string, unknown>>>('/erp/po-dashboard/recent-pos', { params }).then((r) => r.data),
 }

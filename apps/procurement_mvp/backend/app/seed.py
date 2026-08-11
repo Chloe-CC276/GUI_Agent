@@ -216,6 +216,7 @@ def init_database(database: Database) -> None:
 
 def reset_database(database: Database) -> None:
     from .migrations import (
+        migrate_erp_po_agent,
         migrate_oa_closure,
         migrate_procurement_cloud,
         migrate_s0,
@@ -230,6 +231,7 @@ def reset_database(database: Database) -> None:
     migrate_oa_closure(database.engine)
     migrate_procurement_cloud(database.engine)
     migrate_supplier_award_sources(database.engine)
+    migrate_erp_po_agent(database.engine)
     with database.session_factory() as session:
         _seed(session)
 

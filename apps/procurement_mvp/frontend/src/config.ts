@@ -125,8 +125,10 @@ export const systemTabs: SystemTab[] = [
     match: (pathname) => pathname === '/erp' || pathname.startsWith('/erp/'),
     children: [
       { key: 'workbench', label: '采购工作台', path: '/erp/workbench', testId: 'subnav-erp-workbench', legacyNavId: 'nav-erp-workbench' },
-      { key: 'materials', label: '物料主数据', path: '/erp/materials', testId: 'subnav-erp-materials', legacyNavId: 'nav-erp-materials' },
+      { key: 'po-candidates', label: '待建 PO', path: '/erp/po-candidates', testId: 'subnav-erp-po-candidates' },
       { key: 'orders', label: '采购订单', path: '/erp/orders', testId: 'subnav-erp-orders', legacyNavId: 'nav-erp-orders' },
+      { key: 'dashboard', label: '看板', path: '/erp/dashboard', testId: 'subnav-erp-dashboard' },
+      { key: 'materials', label: '物料主数据', path: '/erp/materials', testId: 'subnav-erp-materials', legacyNavId: 'nav-erp-materials' },
       { key: 'requests-new', label: '新建采购申请', path: '/erp/requests/new', testId: 'subnav-erp-request-new' },
       { key: 'export', label: '批量导出与核对', path: '/erp/export', testId: 'subnav-erp-export' },
     ],
@@ -185,7 +187,12 @@ export const resolveActiveSubPath = (pathname: string, system: SystemId): string
     return '/oa'
   }
   if (system === 'procurement') return '/procurement'
-  if (system === 'erp' && pathname.startsWith('/erp/orders/')) return '/erp/orders'
+  if (system === 'erp') {
+    if (pathname.startsWith('/erp/orders/') || pathname.startsWith('/erp/pos/')) return '/erp/orders'
+    if (pathname.startsWith('/erp/po-create/')) return '/erp/po-candidates'
+    if (pathname.startsWith('/erp/po-candidates')) return '/erp/po-candidates'
+    if (pathname.startsWith('/erp/dashboard')) return '/erp/dashboard'
+  }
   const exact = tab.children.find((child) => child.path === pathname)
   if (exact) return exact.path
   return tab.defaultPath

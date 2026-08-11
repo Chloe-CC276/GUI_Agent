@@ -11,6 +11,7 @@ V21_VERSION = 3
 OA_CLOSURE_VERSION = 4
 PROCUREMENT_CLOUD_VERSION = 5
 SUPPLIER_AWARD_SOURCE_VERSION = 6
+ERP_PO_AGENT_VERSION = 7
 
 DEFAULT_AWARD_SOURCES = (
     ("offline_inquiry", "线下询比价"),
@@ -451,6 +452,97 @@ def migrate_supplier_award_sources(engine: Engine) -> None:
                 "VALUES (:version, 'Supplier award-source many-to-many')"
             ),
             {"version": SUPPLIER_AWARD_SOURCE_VERSION},
+        )
+
+
+AGENT_TASK_PO_COLUMNS = {
+    "batch_id": "VARCHAR(80)",
+    "started_at": "DATETIME",
+    "finished_at": "DATETIME",
+    "retry_count": "INTEGER NOT NULL DEFAULT 0",
+    "po_no": "VARCHAR(40)",
+    "error_code": "VARCHAR(80)",
+    "executor_type": "VARCHAR(40) DEFAULT 'dom'",
+    "takeover_flag": "BOOLEAN NOT NULL DEFAULT 0",
+}
+
+ERP_PO_HEADER_COLUMNS = {
+    "supplier_code": "VARCHAR(50)",
+    "supplier_name": "VARCHAR(200)",
+    "request_dept": "VARCHAR(100)",
+    "purchasing_org": "VARCHAR(80)",
+    "purchasing_group": "VARCHAR(80)",
+    "currency_code": "VARCHAR(10) DEFAULT 'CNY'",
+    "payment_terms": "VARCHAR(80)",
+    "buyer_id": "VARCHAR(80)",
+    "total_amount_tax": "NUMERIC(18, 2)",
+    "created_by_agent_task_id": "VARCHAR(80)",
+    "batch_id": "VARCHAR(80)",
+}
+
+ERP_PO_LINE_COLUMNS = {
+    "tax_rate": "NUMERIC(8, 4)",
+    "unit_price_tax": "NUMERIC(18, 2)",
+    "line_amount_tax": "NUMERIC(18, 2)",
+    "uom": "VARCHAR(30)",
+    "delivery_date": "DATE",
+    "po_item_no": "INTEGER",
+}
+
+
+def migrate_erp_po_agent(engine: Engine) -> None:
+    """ERP PO creation via Agent (Scheme A): task/step/safety + PO header extras."""
+    with engine.begin() as connection:
+        tables = set(inspect(connection).get_table_names())
+        if "agent_tasks" in tables:
+            _add_columns(connection, "agent_tasks", AGENT_TASK_PO_COLUMNS)
+        if "erp_purchase_orders" in tables:
+            _add_columns(connection, "erp_purchase_orders", ERP_PO_HEADER_COLUMNS)
+        if "erp_purchase_order_lines" in tables:
+            _add_columns(connection, "erp_purchase_order_lines", ERP_PO_LINE_COLUMNS)
+
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS agent_step_logs ("
+                "id INTEGER PRIMARY KEY, "
+                "step_id VARCHAR(80) NOT NULL UNIQUE, "
+                "task_id VARCHAR(80) NOT NULL, "
+                "step_name VARCHAR(80) NOT NULL, "
+                "expected_json JSON, "
+                "actual_json JSON, "
+                "status VARCHAR(30) NOT NULL DEFAULT 'pending', "
+                "retry_count INTEGER NOT NULL DEFAULT 0, "
+                "duration_ms INTEGER, "
+                "screenshot_hash VARCHAR(128), "
+                "error_code VARCHAR(80), "
+                "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS agent_safety_logs ("
+                "id INTEGER PRIMARY KEY, "
+                "event_id VARCHAR(80) NOT NULL UNIQUE, "
+                "task_id VARCHAR(80), "
+                "batch_id VARCHAR(80), "
+                "pr_no VARCHAR(40), "
+                "po_no VARCHAR(40), "
+                "stage VARCHAR(80), "
+                "event_type VARCHAR(80) NOT NULL, "
+                "severity VARCHAR(20) NOT NULL DEFAULT 'INFO', "
+                "expected TEXT, "
+                "actual TEXT, "
+                "action_taken VARCHAR(80), "
+                "retry_count INTEGER NOT NULL DEFAULT 0, "
+                "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT OR IGNORE INTO schema_versions(version, description) "
+                "VALUES (:version, 'ERP PO Agent creation and dashboard schema')"
+            ),
+            {"version": ERP_PO_AGENT_VERSION},
         )
 
 

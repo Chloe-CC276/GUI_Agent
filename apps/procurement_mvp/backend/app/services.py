@@ -1423,8 +1423,14 @@ def submit_procurement_to_erp(
     simulate_target_failure: bool = False,
     simulate_callback_failure: bool = False,
 ) -> dict[str, Any]:
-    """Validate award fields, prepare token, push to ERP (idempotent)."""
+    """方案 A：定标确认后仅进入 ERP 待建 PO，不经业务 API 直接建单。
+
+    simulate_* 保留兼容入参，方案 A 下不再触发采购云→ERP 直推建 PO。
+    """
+    _ = (simulate_target_failure, simulate_callback_failure)
     request = get_request_by_ref(session, pr_no)
+    oa = request.oa_application
+
     if request.po_no:
         order = session.scalar(
             select(ERPPurchaseOrder)
@@ -1435,9 +1441,37 @@ def submit_procurement_to_erp(
             "po_no": request.po_no,
             "pr_no": request.request_no,
             "erp_sync_status": request.erp_sync_status or "SUCCESS",
+            "procurement_status": (
+                normalize_procurement_status(oa.procurement_status) if oa else None
+            ),
             "transfer": None,
             "replay": True,
+            "upstream_sync_failed": False,
             "order": order,
+            "message": "PO already exists",
+        }
+
+    if (request.erp_sync_status or "") == "WAITING_PO" and normalize_procurement_status(
+        oa.procurement_status if oa else None
+    ) == PROCUREMENT_STATUS_AWARDED:
+        complete_task(
+            session,
+            task_id,
+            business_key,
+            "confirm_award_waiting_po",
+            {"pr_no": request.request_no, "erp_sync_status": "WAITING_PO"},
+        )
+        session.commit()
+        return {
+            "po_no": None,
+            "pr_no": request.request_no,
+            "erp_sync_status": "WAITING_PO",
+            "procurement_status": PROCUREMENT_STATUS_AWARDED,
+            "transfer": None,
+            "replay": True,
+            "upstream_sync_failed": False,
+            "order": None,
+            "message": "Already waiting for ERP PO creation",
         }
 
     if request.status not in {"draft", "validated", "ready"}:
@@ -1451,52 +1485,48 @@ def submit_procurement_to_erp(
         require_award=True,
     )
     request = get_request_by_ref(session, pr_no)
+    oa = request.oa_application
     request.award_confirmed_by = confirmed_by or task_id
     request.award_confirmed_at = utcnow()
     request.final_total_amount_tax = request.total_amount
-    request.erp_sync_status = "SENDING"
-    session.commit()
-
-    if request.status != "ready":
-        request.status = "ready"
-        session.commit()
-
-    _, token, _ = prepare_erp_submit(session, pr_no, f"{task_id}-prepare", business_key)
-    transfer, order, replay = push_pr_to_erp(
+    request.status = "ready"
+    request.erp_status = "waiting_po"
+    request.erp_sync_status = "WAITING_PO"
+    if oa is not None:
+        set_procurement_status(oa, PROCUREMENT_STATUS_AWARDED)
+    _upsert_lineage(
         session,
-        pr_no,
+        request.oa_apply_no or (oa.application_no if oa else ""),
+        pr_no=request.request_no,
+        task_id=task_id,
+        status="waiting_po",
+    )
+    _workflow_event(
+        session,
+        business_key=business_key,
+        event_type="award_confirmed_waiting_po",
+        status="success",
+        operator=task_id,
+        detail={"pr_no": request.request_no, "erp_sync_status": "WAITING_PO"},
+    )
+    complete_task(
+        session,
         task_id,
         business_key,
-        token,
-        simulate_target_failure=simulate_target_failure,
-        simulate_callback_failure=simulate_callback_failure,
+        "confirm_award_waiting_po",
+        {"pr_no": request.request_no, "erp_sync_status": "WAITING_PO"},
     )
-    request = get_request_by_ref(session, pr_no)
-    oa = request.oa_application
-    upstream_sync_failed = False
-    if (
-        order
-        and transfer.status == "success"
-        and oa is not None
-        and normalize_procurement_status(oa.procurement_status) != PROCUREMENT_STATUS_AWARDED
-    ):
-        try:
-            set_procurement_status(oa, PROCUREMENT_STATUS_AWARDED)
-            oa.linked_po_no = order.po_no
-            session.commit()
-        except Exception:  # noqa: BLE001 - record sync failure without undoing PO
-            upstream_sync_failed = True
+    session.commit()
     return {
-        "po_no": order.po_no if order else request.po_no,
+        "po_no": None,
         "pr_no": request.request_no,
-        "erp_sync_status": request.erp_sync_status,
-        "procurement_status": (
-            normalize_procurement_status(oa.procurement_status) if oa else None
-        ),
-        "transfer": transfer,
-        "replay": replay,
-        "upstream_sync_failed": upstream_sync_failed,
-        "order": order,
+        "erp_sync_status": "WAITING_PO",
+        "procurement_status": PROCUREMENT_STATUS_AWARDED,
+        "transfer": None,
+        "replay": False,
+        "upstream_sync_failed": False,
+        "order": None,
+        "message": "Award confirmed; entered ERP waiting-PO list",
     }
 
 

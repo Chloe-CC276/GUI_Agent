@@ -386,6 +386,12 @@ class PurchaseOrderLineOut(ORMModel):
     quantity: Decimal
     unit_price: Decimal
     line_amount: Decimal
+    po_item_no: int | None = None
+    uom: str | None = None
+    unit_price_tax: Decimal | None = None
+    tax_rate: Decimal | None = None
+    line_amount_tax: Decimal | None = None
+    delivery_date: date | None = None
 
 
 class PurchaseOrderOut(ORMModel):
@@ -399,6 +405,35 @@ class PurchaseOrderOut(ORMModel):
     created_at: datetime
     updated_at: datetime
     lines: list[PurchaseOrderLineOut]
+    supplier_code: str | None = None
+    supplier_name: str | None = None
+    request_dept: str | None = None
+    purchasing_org: str | None = None
+    purchasing_group: str | None = None
+    currency_code: str | None = "CNY"
+    payment_terms: str | None = None
+    buyer_id: str | None = None
+    total_amount_tax: Decimal | None = None
+    created_by_agent_task_id: str | None = None
+    batch_id: str | None = None
+
+
+class POBatchCreateInput(BaseModel):
+    pr_nos: list[str] = Field(min_length=1)
+    operator: str | None = None
+
+
+class POCreateFormInput(BaseModel):
+    header: dict[str, Any] = Field(default_factory=dict)
+    lines: list[dict[str, Any]] = Field(default_factory=list)
+    simulate_readback_fail: bool = False
+
+
+class POMarkCreatedInput(BaseModel):
+    po_no: str | None = None
+    success: bool = True
+    error_code: str | None = None
+    message: str | None = None
 
 
 class TransferOut(ORMModel):

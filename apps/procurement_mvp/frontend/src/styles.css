@@ -164,6 +164,36 @@ html, body, #root { margin: 0; min-height: 100%; font-family: "Segoe UI", "PingF
 .detail-action { margin-top: 12px; }
 .price-notice { margin-top: 12px; }
 
+.erp-classic-shell .erp-classic-card .ant-card-head {
+  background: #eef3f8;
+  border-bottom: 1px solid #c9d6e5;
+}
+.erp-form-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 12px 16px;
+}
+.erp-form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #4b5d73;
+}
+.erp-form-grid input {
+  border: 1px solid #9eb2c7;
+  border-radius: 2px;
+  padding: 6px 8px;
+  background: #fffef8;
+  font-family: Consolas, "Courier New", monospace;
+}
+.erp-amount-bar {
+  margin-top: 14px;
+  text-align: right;
+  font-weight: 600;
+  color: #183b69;
+}
+
 .stage-bar-card { overflow-x: auto; }
 .stage-bar { display: grid; grid-template-columns: repeat(9, minmax(96px, 1fr)); gap: 8px; }
 .stage-item {

@@ -55,6 +55,10 @@ import {
 } from './config'
 import { BatchExportPage } from './pages/BatchExportPage'
 import { ERPRequestNewPage } from './pages/ERPRequestNewPage'
+import { ERPBoardPage } from './pages/erp/ERPBoardPage'
+import { ERPPOCandidateListPage } from './pages/erp/ERPPOCandidateListPage'
+import { ERPPOCreatePage } from './pages/erp/ERPPOCreatePage'
+import { ERPPODetailPage } from './pages/erp/ERPPODetailPage'
 import { OAApprovalDetail } from './pages/oa/OAApprovalDetail'
 import { OAApprovalWorkbench } from './pages/oa/OAApprovalWorkbench'
 import { OADetailPage } from './pages/oa/OADetailPage'
@@ -152,29 +156,65 @@ function MaterialsPage() {
   const [keyword, setKeyword] = useState('')
   const [rows, setRows] = useState<Material[]>([])
   const [loading, setLoading] = useState(false)
-  const load = async () => {
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(50)
+  const [total, setTotal] = useState(0)
+  const load = async (nextPage = page, nextPageSize = pageSize) => {
     setLoading(true)
-    try { setRows((await api.listMaterials({ search: keyword || undefined })).items) }
-    catch (e) { message.error((e as Error).message) }
+    try {
+      const data = await api.listMaterials({
+        search: keyword || undefined,
+        page: nextPage,
+        page_size: nextPageSize,
+      })
+      setRows(data.items)
+      setTotal(data.pagination?.total ?? data.items.length)
+      setPage(data.pagination?.page ?? nextPage)
+      setPageSize(data.pagination?.page_size ?? nextPageSize)
+    } catch (e) { message.error((e as Error).message) }
     finally { setLoading(false) }
   }
-  useEffect(() => { void load() }, [])
+  useEffect(() => { void load(1, pageSize) }, [])
   return (
     <>
-      <PageTitle title="ERP 物料主数据" subtitle="按编码、名称或规格检索企业物料" />
+      <PageTitle title="ERP 物料主数据" subtitle={`按编码、名称或规格检索企业物料（共 ${total} 条）`} />
       <Card>
         <Space className="filter-bar">
-          <Input value={keyword} onChange={(e) => setKeyword(e.target.value)} onPressEnter={load} placeholder="物料编码 / 名称 / 规格" allowClear data-testid="erp-material-search" />
-          <Button type="primary" onClick={load} data-testid="erp-material-search-button">查询</Button>
+          <Input
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+            onPressEnter={() => void load(1, pageSize)}
+            placeholder="物料编码 / 名称 / 规格"
+            allowClear
+            data-testid="erp-material-search"
+          />
+          <Button type="primary" onClick={() => void load(1, pageSize)} data-testid="erp-material-search-button">查询</Button>
         </Space>
-        <Table rowKey="material_code" loading={loading} dataSource={rows} data-testid="erp-material-table" columns={[
-          { title: '物料编码', dataIndex: 'material_code' },
-          { title: '物料名称', dataIndex: 'material_name' },
-          { title: '规格型号', dataIndex: 'specification' },
-          { title: '计量单位', dataIndex: 'unit' },
-          { title: '标准单价', dataIndex: 'standard_price', render: (v) => `¥${Number(v).toFixed(2)}` },
-          { title: '状态', dataIndex: 'status', render: (v) => <Tag color={v === 'active' ? 'success' : 'default'}>{v}</Tag> },
-        ]} />
+        <Table
+          rowKey="material_code"
+          loading={loading}
+          dataSource={rows}
+          data-testid="erp-material-table"
+          pagination={{
+            current: page,
+            pageSize,
+            total,
+            showSizeChanger: true,
+            pageSizeOptions: [20, 50, 100, 200],
+            showTotal: (value) => `共 ${value} 条`,
+            onChange: (nextPage, nextPageSize) => {
+              void load(nextPage, nextPageSize)
+            },
+          }}
+          columns={[
+            { title: '物料编码', dataIndex: 'material_code' },
+            { title: '物料名称', dataIndex: 'material_name' },
+            { title: '规格型号', dataIndex: 'specification' },
+            { title: '计量单位', dataIndex: 'unit' },
+            { title: '标准单价', dataIndex: 'standard_price', render: (v) => `¥${Number(v).toFixed(2)}` },
+            { title: '状态', dataIndex: 'status', render: (v) => <Tag color={v === 'active' ? 'success' : 'default'}>{v}</Tag> },
+          ]}
+        />
       </Card>
     </>
   )
@@ -283,7 +323,7 @@ function ProcurementListPage() {
                   {row.po_no ? (
                     <Button
                       type="link"
-                      onClick={() => navigate(`/erp/orders/${row.po_no}`)}
+                      onClick={() => navigate(`/erp/pos/${row.po_no}`)}
                       data-testid={`procurement-open-erp-${row.request_no}`}
                     >
                       查看ERP
@@ -328,9 +368,12 @@ function ProcurementDetailPage() {
       }
     }).catch(() => undefined)
   }, [prNo])
-  const readOnly = Boolean(record?.po_no) || record?.procurement_status === 'AWARDED' || record?.status === 'submitted'
+  const readOnly = Boolean(record?.po_no)
+    || record?.procurement_status === 'AWARDED'
+    || record?.erp_sync_status === 'WAITING_PO'
+    || record?.status === 'submitted'
   const searchMaterials = async (search: string) => {
-    try { setMaterials((await api.listMaterials({ search })).items.filter((item) => item.status === 'active')) }
+    try { setMaterials((await api.listMaterials({ search, page_size: 100 })).items.filter((item) => item.status === 'active')) }
     catch (e) { message.error((e as Error).message) }
   }
   const chooseMaterial = (lineId: number, material: Material) => setRecord((current) => current && ({
@@ -402,7 +445,15 @@ function ProcurementDetailPage() {
       })
       setConfirmOpen(false)
       await load()
-      if (result.po_no) message.success(`ERP采购订单已创建：${result.po_no}`)
+      if (result.po_no) {
+        message.success(`ERP采购订单已创建：${result.po_no}`)
+        navigate(`/erp/pos/${result.po_no}`)
+      } else if (result.erp_sync_status === 'WAITING_PO') {
+        message.success('已定标，已进入 ERP 待建 PO 列表')
+        navigate('/erp/po-candidates')
+      } else {
+        message.success(result.message || '提交完成')
+      }
     } catch (e) { message.error((e as Error).message) }
     finally { setSubmitting(false) }
   }
@@ -426,7 +477,7 @@ function ProcurementDetailPage() {
     <PageTitle
       title={`采购申请 ${record.request_no}`}
       subtitle="采购准备与最小采购结果确认"
-      extra={record.po_no && <Button type="primary" onClick={() => navigate(`/erp/orders/${record.po_no}`)} data-testid="procurement-open-erp-detail">查看 ERP 订单</Button>}
+      extra={record.po_no && <Button type="primary" onClick={() => navigate(`/erp/pos/${record.po_no}`)} data-testid="procurement-open-erp-detail">查看 ERP 订单</Button>}
     />
     <Card title="A. 来源信息" data-testid="procurement-source-card">
       <Descriptions column={3}>
@@ -586,10 +637,15 @@ function ProcurementDetailPage() {
         {!readOnly && <Button onClick={() => void validate()} data-testid="validate-procurement-button">校验</Button>}
         {!readOnly && (
           <Button danger type="primary" onClick={() => setConfirmOpen(true)} data-testid="submit-erp-button">
-            确认并提交ERP
+            确认定标并进入待建PO
           </Button>
         )}
-        {record.po_no && <Button onClick={() => navigate(`/erp/orders/${record.po_no}`)}>跳转ERP详情</Button>}
+        {record.erp_sync_status === 'WAITING_PO' && !record.po_no && (
+          <Button type="primary" onClick={() => navigate('/erp/po-candidates')} data-testid="open-po-candidates">
+            打开待建 PO 列表
+          </Button>
+        )}
+        {record.po_no && <Button onClick={() => navigate(`/erp/pos/${record.po_no}`)}>跳转ERP详情</Button>}
       </Space>
     </Card>
     <Card title="G. ERP结果" className="section-card" data-testid="procurement-erp-result-card">
@@ -604,11 +660,11 @@ function ProcurementDetailPage() {
     <LineageCard lineage={lineage} onRetry={retry} />
     <Modal
       open={confirmOpen}
-      title="确认提交 ERP？"
+      title="确认定标并进入待建 PO？"
       onCancel={() => setConfirmOpen(false)}
       onOk={() => void submitErp()}
       confirmLoading={submitting}
-      okText="确认并提交 ERP"
+      okText="确认定标"
       okButtonProps={{ danger: true, 'data-testid': 'submit-erp-confirm-ok' } as React.ComponentProps<typeof Button>}
     >
       <Alert
@@ -617,6 +673,8 @@ function ProcurementDetailPage() {
         message="高风险操作"
         description={(
           <div data-testid="submit-erp-confirm-summary">
+            <div>确认后不会通过业务 API 直接创建 ERP PO。</div>
+            <div>单据将进入 ERP「待建 PO」列表，由 GUI Agent 在 ERP 页面录入创建。</div>
             <div>OA：{record.oa_apply_no || '-'}</div>
             <div>PR：{record.request_no}</div>
             <div>采购方式：{purchaseTypeOptions.find((item) => item.value === purchaseMethodValue)?.label || purchaseMethodValue || '-'}</div>
@@ -652,7 +710,7 @@ function ERPOrderListPage() {
       <Table rowKey="po_no" dataSource={rows} data-testid="erp-order-table" columns={[
         { title: 'PO', dataIndex: 'po_no' }, { title: 'PR', dataIndex: 'pr_no' }, { title: 'OA', dataIndex: 'oa_apply_no' },
         { title: '金额', dataIndex: 'total_amount', render: (value) => `¥${Number(value).toFixed(2)}` }, { title: '状态', dataIndex: 'status' }, { title: '时间', dataIndex: 'created_at' },
-        { title: '操作', render: (_, row) => <Button type="link" onClick={() => navigate(`/erp/orders/${row.po_no}`)} data-testid={`erp-order-view-${row.po_no}`}>查看</Button> },
+        { title: '操作', render: (_, row) => <Button type="link" onClick={() => navigate(`/erp/pos/${row.po_no}`)} data-testid={`erp-order-view-${row.po_no}`}>查看</Button> },
       ]} />
     </Card>
   </>
@@ -723,7 +781,7 @@ function ProcurementPage() {
   const addLine = () => setLines((current) => [...current, { line_no: Math.max(0, ...current.map((x) => x.line_no)) + 1, quantity: 1 }])
   const removeLine = (lineNo: number) => setLines((current) => current.filter((line) => line.line_no !== lineNo))
   const searchMaterials = async (search: string) => {
-    try { setMaterials((await api.listMaterials({ search })).items.filter((item) => item.status === 'active')) }
+    try { setMaterials((await api.listMaterials({ search, page_size: 100 })).items.filter((item) => item.status === 'active')) }
     catch (e) { message.error((e as Error).message) }
   }
 
@@ -917,8 +975,12 @@ export default function App() {
           <Route path="/erp" element={<Navigate to="/erp/workbench" replace />} />
           <Route path="/erp/workbench" element={<WorkbenchPage />} />
           <Route path="/erp/materials" element={<MaterialsPage />} />
+          <Route path="/erp/po-candidates" element={<ERPPOCandidateListPage />} />
+          <Route path="/erp/po-create/:taskId" element={<ERPPOCreatePage />} />
+          <Route path="/erp/pos/:poNo" element={<ERPPODetailPage />} />
+          <Route path="/erp/dashboard" element={<ERPBoardPage />} />
           <Route path="/erp/orders" element={<ERPOrderListPage />} />
-          <Route path="/erp/orders/:poNo" element={<ERPOrderDetailPage />} />
+          <Route path="/erp/orders/:poNo" element={<ERPPODetailPage />} />
           <Route path="/erp/requests/new" element={<ERPRequestNewPage />} />
           <Route path="/erp/export" element={<BatchExportPage />} />
           <Route path="/agent" element={<AgentPage />} />

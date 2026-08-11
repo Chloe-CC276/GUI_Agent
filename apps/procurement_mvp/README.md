@@ -78,8 +78,8 @@ OK  frontend: http://127.0.0.1:5173
 顶部是三个**大系统标签**（不是侧边栏混排）：
 
 1. **OA 系统** — 采购申请审批
-2. **采购云** — PR 承接、匹配、提交 ERP
-3. **ERP** — 工作台、物料、订单、建单、批量导出
+2. **采购云** — PR 承接、定标确认、进入待建 PO
+3. **ERP** — 待建 PO、Agent 建单、PO 详情、看板、物料与导出
 
 选中某个系统后，该系统的子页面从大标签**下方滑出**，点击子页切换内容区。  
 Agent 为右下角全局浮窗，不占用系统主标签。
@@ -92,8 +92,12 @@ Agent 为右下角全局浮窗，不占用系统主标签。
 | OA | 审批工作台 / 审批详情 | `/oa/approvals`、`/oa/approvals/:id` |
 | 采购云 | 采购申请列表 / 准备详情 | `/procurement`、`/procurement/requests`、`/procurement/requests/:prNo`（旧 `/procurement/:prNo` 兼容） |
 | ERP | 工作台 | `/erp`、`/erp/workbench` |
+| ERP | 待建 PO | `/erp/po-candidates` |
+| ERP | PO 创建执行 | `/erp/po-create/:taskId` |
+| ERP | PO 详情 | `/erp/pos/:poNo`（兼容 `/erp/orders/:poNo`） |
+| ERP | 看板（Agent 安全 / PO 统计） | `/erp/dashboard` |
+| ERP | 采购订单列表 | `/erp/orders` |
 | ERP | 物料主数据 | `/erp/materials` |
-| ERP | 采购订单 | `/erp/orders`、`/erp/orders/:poNo` |
 | ERP | 新建采购申请 | `/erp/requests/new` |
 | ERP | 批量导出与核对 | `/erp/export` |
 
@@ -106,13 +110,17 @@ Agent 为右下角全局浮窗，不占用系统主标签。
 3. 审批中 → **通过**（或驳回必填原因；驳回后可修改并重新提交）
 4. 仅 `APPROVED` 且采购执行未定标的单据，详情页可点 **提交采购** 进入采购云（`procurement_status=PREPARING`，审批状态仍为已通过）
 
-### 采购云 MVP：准备确认 → 提交 ERP
+### 采购云 → ERP 待建 PO（方案 A）
 
 1. 打开 OA → `OA-2026-0001`（已通过）→ **提交采购**（跳转 `/procurement/requests/{pr_no}`）
 2. 采购云准备详情：确认采购方式、选择 ERP 供应商、填写结果来源、核对含税单价
-3. **保存** → **校验** → **确认并提交 ERP**（弹窗核对 OA/PR/供应商/总额/行数）
-4. 成功后 OA `procurement_status=已定标`，列表可筛「已定标」并跳转 ERP PO
-5. Excel/批量导出仍在 ERP 导航；右下角 Agent 浮窗可查 `task_id` / 重置演示数据
+3. **保存** → **校验** → **确认定标并进入待建PO**（不经业务 API 直接建 PO）
+4. 成功后 `procurement_status=AWARDED`，`erp_sync_status=WAITING_PO`，跳转 `/erp/po-candidates`
+5. ERP 待建列表勾选 PR → **批量创建 PO** → 打开 `/erp/po-create/:taskId`
+6. 在 ERP 建单页确认 Header/Lines → **创建 PO** → 回读 `po_no` → `/erp/pos/:po_no`
+7. ERP 看板查看 Agent KPI 与 PO 统计
+
+> 硬约束：无采购云→ERP 业务 API；PO 创建成功为 MVP 终点；无 PO 号不得标记成功；重复建单拦截 `DUPLICATE_BLOCKED`。
 
 数据乱了可在 Agent 浮窗或原诊断入口执行重置：`POST /api/v1/demo/reset`。
 
@@ -158,12 +166,23 @@ POST /api/v1/oa/applications/{id}/resubmit
 GET  /api/v1/oa/approvals?queue=pending_start|in_approval|done
 GET  /api/v1/oa/applications/approved
 
-# S0 传输闭环
+# 采购云定标 → 待建 PO（方案 A，不经业务 API 直建 PO）
+POST /api/v1/procurement/requests/{pr_no}/submit-erp
+GET  /api/v1/erp/po-candidates
+POST /api/v1/erp/po-tasks/batch
+POST /api/v1/erp/po-tasks/{task_id}/run
+GET  /api/v1/erp/po-tasks/{task_id}
+POST /api/v1/erp/po-tasks/{task_id}/create-po
+POST /api/v1/erp/po-tasks/{task_id}/mark-created
+GET  /api/v1/erp/pos/{po_no}
+GET  /api/v1/erp/pos/{po_no}/lineage
+GET  /api/v1/erp/agent-dashboard/summary
+GET  /api/v1/erp/po-dashboard/summary
+
+# 兼容旧链路（演示/排障，非方案 A 主路径）
 POST /api/v1/oa/proposals/{oa_apply_no}/push-to-procurement
 POST /api/v1/procurement/requests/{pr_no}/prepare-erp-submit
 POST /api/v1/procurement/requests/{pr_no}/push-to-erp
-POST /api/v1/integration/transfers/{transfer_id}/retry
-GET  /api/v1/oa/proposals/{oa_apply_no}/lineage
 GET  /api/v1/erp/orders
 GET  /api/v1/erp/orders/{po_no}
 
@@ -190,7 +209,9 @@ GET  /api/v1/agent/tasks/active
 - 物料编码必须命中有效 ERP 主数据
 - PR 金额由服务端按行汇总（Decimal）
 - 跨系统差异留痕，禁止静默覆盖
-- 提交 ERP、批量导出等高风险动作必须显式确认
+- 定标确认、创建 PO 等高风险动作必须显式确认
+- 方案 A：采购云与 ERP 无业务 API；Agent/人工在 ERP 页面建 PO
+- 已有 `po_no` 重复创建拦截 `DUPLICATE_BLOCKED`；无 PO 号回读不得标记成功（`PO_READBACK_FAIL`）
 - `task_id + business_key + operation` 幂等；传输失败可重试；目标已创建时只重试回写
 
 ## 目录

@@ -35,6 +35,7 @@ class Database:
     def create_all(self) -> None:
         from .migrations import (
             backfill_s0,
+            migrate_erp_po_agent,
             migrate_oa_closure,
             migrate_procurement_cloud,
             migrate_s0,
@@ -48,6 +49,7 @@ class Database:
         migrate_oa_closure(self.engine)
         migrate_procurement_cloud(self.engine)
         migrate_supplier_award_sources(self.engine)
+        migrate_erp_po_agent(self.engine)
         backfill_s0(self.engine)
 
     def session(self) -> Generator[Session, None, None]:

@@ -103,7 +103,7 @@ export function ERPRequestNewPage() {
   const removeLine = (lineNo: number) => setLines((current) => current.filter((line) => line.line_no !== lineNo))
 
   const searchMaterials = async (search: string) => {
-    try { setMaterials((await api.listMaterials({ search })).items.filter((item) => item.status === 'active')) }
+    try { setMaterials((await api.listMaterials({ search, page_size: 100 })).items.filter((item) => item.status === 'active')) }
     catch (e) { message.error((e as Error).message) }
   }
 
