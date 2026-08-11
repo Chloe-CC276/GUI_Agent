@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
@@ -38,6 +38,9 @@ from .oa_services import (
     update_application,
 )
 from .schemas import (
+    AgentChatInput,
+    AgentContinueInput,
+    AgentStepResultInput,
     ApiResponse,
     AwardSourceOut,
     BatchExportInput,
@@ -69,6 +72,14 @@ from .schemas import (
     TransferOut,
     UpdateDraftInput,
 )
+from .agent_runtime import (
+    continue_agent_task,
+    create_task_from_message,
+    get_agent_task_view,
+    report_step_result,
+)
+from .agent_runtime.excel_reader import list_excel_files
+from .agent_runtime.intents import QUICK_CHIPS
 from .seed import reset_database
 from .services import (
     apply_oa_purchase_method_default,
@@ -834,16 +845,79 @@ def get_active_agent_tasks(session: Session = Depends(get_session)) -> ApiRespon
 def get_agent_task(
     task_id: str, session: Session = Depends(get_session)
 ) -> ApiResponse:
-    task = session.scalar(
-        select(AgentTask)
-        .where(AgentTask.task_id == task_id)
-        .order_by(AgentTask.id.desc())
+    view = get_agent_task_view(session, task_id)
+    return response(view, view["task_id"], view["business_key"], False)
+
+
+@router.get("/agent/chips", response_model=ApiResponse)
+def get_agent_chips() -> ApiResponse:
+    return response({"items": QUICK_CHIPS})
+
+
+@router.post("/agent/chat", response_model=ApiResponse)
+def post_agent_chat(
+    payload: AgentChatInput, session: Session = Depends(get_session)
+) -> ApiResponse:
+    data = create_task_from_message(
+        session,
+        message=payload.message,
+        page_context={"route": payload.route, "business_key": payload.business_key},
+        folder_path=payload.folder_path,
+        excel_path=payload.excel_path,
     )
-    if task is None:
-        raise AppError(404, "TASK_NOT_FOUND", "Agent task not found")
+    task = data.get("task") or {}
     return response(
-        TaskOut.model_validate(task), task.task_id, task.business_key, False
+        data,
+        task.get("task_id"),
+        task.get("business_key") or payload.business_key,
+        False,
     )
+
+
+@router.post("/agent/tasks/{task_id}/continue", response_model=ApiResponse)
+async def post_agent_continue(
+    task_id: str,
+    folder_path: str | None = Form(default=None),
+    excel_path: str | None = Form(default=None),
+    oa_id: int | None = Form(default=None),
+    file: UploadFile | None = File(default=None),
+    session: Session = Depends(get_session),
+) -> ApiResponse:
+    upload = await file.read() if file is not None else None
+    view = continue_agent_task(
+        session,
+        task_id,
+        payload={
+            "folder_path": folder_path,
+            "excel_path": excel_path,
+            "oa_id": oa_id,
+        },
+        upload=upload if upload else None,
+        upload_name=file.filename if file is not None else None,
+    )
+    return response(view, view["task_id"], view["business_key"], False)
+
+
+@router.post("/agent/tasks/{task_id}/step-result", response_model=ApiResponse)
+def post_agent_step_result(
+    task_id: str,
+    payload: AgentStepResultInput,
+    session: Session = Depends(get_session),
+) -> ApiResponse:
+    view = report_step_result(
+        session,
+        task_id,
+        step_id=payload.step_id,
+        status=payload.status,
+        actual=payload.actual,
+        detail=payload.detail,
+    )
+    return response(view, view["task_id"], view["business_key"], False)
+
+
+@router.get("/agent/fs/list-excels", response_model=ApiResponse)
+def get_agent_list_excels(path: str = Query(min_length=1)) -> ApiResponse:
+    return response({"items": list_excel_files(path), "path": path})
 
 
 @s0_router.get("/integration/transfers", response_model=ApiResponse)

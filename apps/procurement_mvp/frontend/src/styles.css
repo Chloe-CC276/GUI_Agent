@@ -191,6 +191,30 @@ html, body, #root { margin: 0; min-height: 100%; font-family: "Segoe UI", "PingF
   bottom: 24px;
   z-index: 1000;
 }
+.agent-float.agent-float-monitor {
+  top: 72px;
+  right: 16px;
+  bottom: auto;
+  left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(720px, calc(100vw - 32px));
+  height: auto;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #d7e0ea;
+  border-radius: 999px;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, .12);
+  backdrop-filter: blur(6px);
+}
+.agent-monitor-step {
+  flex: 1;
+  min-width: 120px;
+  max-width: 360px;
+  font-size: 12px;
+  color: #475569;
+}
 .agent-fab {
   width: 58px;
   height: 58px;
@@ -226,6 +250,34 @@ html, body, #root { margin: 0; min-height: 100%; font-family: "Segoe UI", "PingF
   overflow: hidden;
   animation: floatIn .25s ease;
 }
+.agent-chat-panel { width: 420px; max-height: 760px; }
+.agent-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.agent-chat-log {
+  margin-top: 12px;
+  max-height: 180px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.agent-chat-bubble {
+  border: 1px solid #e5edf5;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #f8fafc;
+}
+.agent-chat-user { background: #eef6ff; border-color: #d7e8fb; }
+.agent-step-list {
+  margin-top: 12px;
+  max-height: 180px;
+  overflow: auto;
+}
+.agent-chat-input { margin-top: 12px; }
 .agent-float-mini {
   display: flex;
   align-items: center;

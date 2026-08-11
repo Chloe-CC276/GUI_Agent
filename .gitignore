@@ -29,6 +29,16 @@ external/
 # LoRA / 模型调优本地产物
 lora_tuning/
 
+# Colab / 远程评测本地产物（不入库）
+requirements-colab-adapter.txt
+requirements-remote-eval.txt
+configs/gui_agent_evaluation.yaml
+notebooks/colab_adapter_offline.ipynb
+scripts/export_eval_word_report.py
+scripts/export_week5_three_layer_docx.py
+scripts/merge_colab_offline_results.py
+scripts/prepare_colab_adapter_bundle.py
+
 # 项目文档与设计资料
 docs/
 doc/

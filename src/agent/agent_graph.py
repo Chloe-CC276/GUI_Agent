@@ -321,14 +321,36 @@ class AgentGraph:
 
     async def verify_node(self, graph: GraphState) -> GraphState:
         state = graph["agent_state"]
-        try:
-            prompt = self.prompts.build_text(PromptKind.VERIFY, state)
-            data, raw = await self._call_structured(
-                prompt, VERIFY_RESPONSE_SCHEMA, target_kind=PromptKind.VERIFY
-            )
-            self._validate_verify(data)
-        except Exception as error:
-            return self._exception_reflection(state, error, "verification")
+        prompt = ""
+        raw: Any = None
+        dry_run = bool(state.metadata.get("dry_run"))
+        if dry_run:
+            data = {
+                "status": "uncertain",
+                "action_effective": False,
+                "task_complete": False,
+                "evidence": [
+                    "dry_run: executor did not apply side effects; UI cannot prove success"
+                ],
+                "reason": (
+                    "Synthetic verification for dry-run: action was planned/logged "
+                    "but not applied to the desktop."
+                ),
+                "confidence": 0.0,
+                "recommended_next": "continue",
+            }
+            prompt = "(synthetic dry-run verify)"
+            raw = data
+        else:
+            try:
+                prompt = self.prompts.build_text(PromptKind.VERIFY, state)
+                data, raw = await self._call_structured(
+                    prompt, VERIFY_RESPONSE_SCHEMA, target_kind=PromptKind.VERIFY
+                )
+                data = _coerce_verify_data(data)
+                self._validate_verify(data)
+            except Exception as error:
+                return self._exception_reflection(state, error, "verification")
 
         succeeded = bool(data["action_effective"]) and data["status"] == "success"
         task_complete = bool(data["task_complete"])
@@ -341,9 +363,19 @@ class AgentGraph:
             status=status,
             output=data,
             message=message,
-            metadata={"raw_response": raw},
+            metadata={"raw_response": raw, "synthetic": dry_run},
         )
         state.update_verification_result(verification)
+
+        if dry_run:
+            self._commit_current_step(state)
+            return {
+                "agent_state": state,
+                "verify_data": data,
+                "last_prompt": prompt,
+                "last_raw_response": raw,
+                "route": GraphRoute.MEMORY.value,
+            }
 
         if task_complete and confidence >= self.config.verify_confidence_threshold:
             self._commit_current_step(state)
@@ -663,15 +695,43 @@ def _supported_kwargs(method: Callable[..., Any], **candidates: Any) -> dict[str
     return result
 
 
+_VERIFY_KEYS = {
+    "status",
+    "action_effective",
+    "task_complete",
+    "evidence",
+    "reason",
+    "confidence",
+    "recommended_next",
+}
+_STRUCTURED_HINT_KEYS = _VERIFY_KEYS | {
+    "decision",
+    "action",
+    "failure_type",
+    "summary",
+    "should_replan",
+}
+
+
 def _parse_json_object(response: Any) -> dict[str, Any]:
     # BaseVLM.generate_json returns ``(parsed_value, VLMResponse)``.
     if isinstance(response, tuple) and response:
-        response = response[0]
+        first, second = response[0], response[1] if len(response) > 1 else None
+        if isinstance(first, Mapping):
+            response = first
+        elif second is not None:
+            response = second
+        else:
+            response = first
     if isinstance(response, Mapping):
+        if _STRUCTURED_HINT_KEYS.intersection(str(k).lower() for k in response):
+            return dict(response)
         for key in ("parsed", "json", "output", "content", "text"):
             value = response.get(key)
             if isinstance(value, Mapping):
                 return dict(value)
+            if isinstance(value, str) and value.strip():
+                return _parse_json_object(value)
         if response:
             return dict(response)
     for attribute in ("parsed", "json", "output", "content", "text"):
@@ -698,6 +758,38 @@ def _parse_json_object(response: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ModelResponseError("Model response must be one JSON object")
     return dict(value)
+
+
+def _coerce_verify_data(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize common aliases / missing optional shapes for verify JSON."""
+
+    out = {str(k): v for k, v in dict(data).items()}
+    aliases = {
+        "action_effective": ("actionEffective", "effective", "acted"),
+        "task_complete": ("taskComplete", "complete", "finished", "done"),
+        "recommended_next": ("recommendedNext", "next", "next_action"),
+        "status": ("result", "verdict"),
+        "reason": ("explanation", "message"),
+        "confidence": ("score",),
+        "evidence": ("evidences", "proof"),
+    }
+    for canonical, alts in aliases.items():
+        if canonical in out and out[canonical] is not None:
+            continue
+        for alt in alts:
+            if alt in out and out[alt] is not None:
+                out[canonical] = out[alt]
+                break
+    if "evidence" in out and isinstance(out["evidence"], str):
+        out["evidence"] = [out["evidence"]]
+    if "evidence" not in out:
+        out["evidence"] = []
+    if "confidence" in out:
+        try:
+            out["confidence"] = float(out["confidence"])
+        except (TypeError, ValueError):
+            out["confidence"] = 0.0
+    return out
 
 
 def _require_fields(data: Mapping[str, Any], fields: set[str], name: str) -> None:

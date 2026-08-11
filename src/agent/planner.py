@@ -352,12 +352,12 @@ def dictionary_action_factory(
     """
     Default action factory.
 
-    It returns a normalized dictionary. Projects with a concrete Action class
-    should inject a custom factory into Planner.
+    Emits Executor-compatible ``type`` (not only ``action_type``).
     """
+    params = dict(parameters)
     return {
-        "action_type": action_type,
-        **dict(parameters),
+        "type": str(action_type).strip().lower(),
+        **params,
     }
 
 
@@ -783,12 +783,26 @@ class Planner:
             return []
 
         if observation.screenshot_path is not None:
-            return [observation.screenshot_path]
+            path = str(observation.screenshot_path).strip()
+            if path:
+                return [path]
 
         if observation.screenshot is not None:
-            return [observation.screenshot]
+            # Convert ndarray/PIL to PNG bytes so provider payloads stay JSON-safe.
+            return [self._screenshot_as_provider_image(observation.screenshot)]
 
         return []
+
+    @staticmethod
+    def _screenshot_as_provider_image(image: Any) -> Any:
+        """Return a VLM-friendly image (path/bytes/data-url), never a raw ndarray in API extras."""
+
+        try:
+            from ..model.base_vlm import normalise_image
+
+            return normalise_image(image)
+        except Exception:
+            return image
 
 
     def call_vlm(
@@ -869,9 +883,8 @@ class Planner:
 
         candidate_values = {
             "prompt": prompt,
-            "messages": self._build_messages(prompt, images),
+            # Prefer images= ; do not pass raw "image" alias (leaks into API extra_body).
             "images": list(images),
-            "image": images[0] if images else None,
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
             "timeout": self.config.timeout_seconds,
@@ -963,11 +976,31 @@ class Planner:
     # Response parsing
     # --------------------------------------------------------
 
+    @staticmethod
+    def _unwrap_provider_result(response: Any, *, prefer_parsed: bool = True) -> Any:
+        """Unwrap ``generate_json`` / ``agenerate_json`` ``(parsed, VLMResponse)`` tuples.
+
+        Without this, ``str(tuple)`` becomes Python repr with single quotes and
+        ``json.loads`` fails with: Expecting property name enclosed in double quotes.
+        """
+
+        if isinstance(response, tuple) and response:
+            first = response[0]
+            second = response[1] if len(response) > 1 else None
+            if prefer_parsed and isinstance(first, Mapping):
+                return first
+            if second is not None:
+                return second
+            return first
+        return response
+
     def parse_response(
         self,
         response: Any,
     ) -> Mapping[str, Any]:
         """Extract one JSON object from provider-specific response formats."""
+        response = self._unwrap_provider_result(response, prefer_parsed=True)
+
         if self.response_parser is not None:
             parsed = self.response_parser(response)
 
@@ -1089,8 +1122,17 @@ class Planner:
         )
 
     def _extract_text(self, response: Any) -> str:
+        response = self._unwrap_provider_result(response, prefer_parsed=False)
+
         if response is None:
             return ""
+
+        if isinstance(response, Mapping):
+            # Parsed dict from generate_json — keep compact JSON text for logs.
+            try:
+                return json.dumps(dict(response), ensure_ascii=False)
+            except (TypeError, ValueError):
+                pass
 
         if isinstance(response, str):
             return response
@@ -1803,21 +1845,9 @@ class Planner:
 
         target_text = str(params.get("target_text", "")).strip()
         raw_element_id = params.get("element_id")
-        element_id: int | None = None
-        if raw_element_id is not None:
-            element_id = self._coerce_integer(raw_element_id, "element_id")
-            if element_id < 0:
-                raise PlannerValidationError(
-                    "element_id must be a non-negative integer."
-                )
-
-        if not target_text:
-            raise PlannerValidationError(
-                f"{action_type} requires target_text. "
-                "element_id alone cannot prove that the selected element "
-                "matches the task target. Return the visible OCR text or GUI "
-                "label and optionally include element_id."
-            )
+        element_id_int, element_id_token = self._parse_element_id_ref(
+            raw_element_id
+        )
 
         observation = state.observation
         if observation is None:
@@ -1832,28 +1862,70 @@ class Planner:
             )
 
         target: Any | None = None
-        resolved_element_id: int | None = None
+        resolved_element_id: int | str | None = None
+        resolved_by_element_id = False
 
-        if element_id is not None:
+        # LoRA / ScreenAgent outputs often give element_id without target_text.
+        # Resolve the element first, then backfill target_text from OCR/GUI labels.
+        if element_id_int is not None or element_id_token is not None:
             for index, element in enumerate(elements):
-                candidate_id = self._element_value(
+                candidate_raw = self._element_value(
                     element, "element_id", index
                 )
-                try:
-                    candidate_id = self._coerce_integer(
-                        candidate_id, "detected element_id"
-                    )
-                except PlannerValidationError:
-                    continue
-                if candidate_id == element_id:
+                if self._element_id_matches(
+                    candidate_raw,
+                    index=index,
+                    wanted_int=element_id_int,
+                    wanted_token=element_id_token,
+                ):
                     target = element
-                    resolved_element_id = candidate_id
+                    resolved_by_element_id = True
+                    try:
+                        cand_int, _ = self._parse_element_id_ref(candidate_raw)
+                    except PlannerValidationError:
+                        cand_int = None
+                    resolved_element_id = (
+                        cand_int if cand_int is not None else index
+                    )
                     break
             if target is None:
+                wanted = (
+                    element_id_token
+                    if element_id_token is not None
+                    else element_id_int
+                )
                 raise PlannerValidationError(
-                    f"element_id={element_id} is not present in the "
+                    f"element_id={wanted} is not present in the "
                     "current detected elements."
                 )
+            if not target_text:
+                for key in (
+                    "text",
+                    "label",
+                    "name",
+                    "content",
+                    "title",
+                    "aria_label",
+                    "value",
+                    "description",
+                ):
+                    value = self._element_value(target, key, "")
+                    if str(value).strip():
+                        target_text = str(value).strip()
+                        params["target_text"] = target_text
+                        break
+            # Icon-only controls: unique element_id + bbox is enough evidence.
+            if not target_text:
+                target_text = f"element:{resolved_element_id}"
+                params["target_text"] = target_text
+
+        if not target_text:
+            raise PlannerValidationError(
+                f"{action_type} requires target_text. "
+                "element_id alone cannot prove that the selected element "
+                "matches the task target. Return the visible OCR text or GUI "
+                "label and optionally include element_id."
+            )
 
         if target is None and target_text:
             expected = normalise_target_text(target_text)
@@ -1947,17 +2019,25 @@ class Planner:
             )
 
         if not detected_text:
-            raise PlannerValidationError(
-                f"Resolved element (element_id={resolved_element_id}) has no "
-                "text, label or name, so it cannot be verified as "
-                f"target_text={target_text!r}."
-            )
+            if resolved_by_element_id:
+                # Icon / unlabeled control resolved solely by element_id.
+                detected_text = target_text
+            else:
+                raise PlannerValidationError(
+                    f"Resolved element (element_id={resolved_element_id}) has no "
+                    "text, label or name, so it cannot be verified as "
+                    f"target_text={target_text!r}."
+                )
 
         if not texts_match(target_text, detected_text):
-            raise PlannerValidationError(
-                f"target_text={target_text!r} is not supported by detected "
-                f"text={detected_text!r} (element_id={resolved_element_id})."
-            )
+            if not (
+                resolved_by_element_id
+                and str(target_text).startswith("element:")
+            ):
+                raise PlannerValidationError(
+                    f"target_text={target_text!r} is not supported by detected "
+                    f"text={detected_text!r} (element_id={resolved_element_id})."
+                )
         bbox_value = self._element_value(target, "bbox")
         if not isinstance(bbox_value, Sequence) or len(bbox_value) != 4:
             raise PlannerValidationError(
@@ -2061,6 +2141,87 @@ class Planner:
         )
 
     @staticmethod
+    def _parse_element_id_ref(
+        value: Any,
+    ) -> tuple[int | None, str | None]:
+        """Parse model/fixture element ids.
+
+        Accepts ``0``, ``"0"``, ``"e0"``, ``"E12"``, ``"element_3"``, and keeps
+        other non-empty strings as opaque tokens for exact match.
+        """
+
+        if value is None:
+            return None, None
+        if isinstance(value, bool):
+            raise PlannerValidationError("element_id must be an integer.")
+        if isinstance(value, int):
+            if value < 0:
+                raise PlannerValidationError(
+                    "element_id must be a non-negative integer."
+                )
+            return value, None
+        if isinstance(value, float):
+            if value.is_integer() and value >= 0:
+                return int(value), None
+            raise PlannerValidationError("element_id must be an integer.")
+
+        token = str(value).strip()
+        if not token:
+            return None, None
+        if re.fullmatch(r"-?\d+", token):
+            parsed = int(token)
+            if parsed < 0:
+                raise PlannerValidationError(
+                    "element_id must be a non-negative integer."
+                )
+            return parsed, None
+        # LoRA / ScreenAgent style: e0, E12, element_3, element-3
+        prefixed = re.fullmatch(
+            r"(?:e|element[_-]?)(\d+)",
+            token,
+            flags=re.IGNORECASE,
+        )
+        if prefixed:
+            return int(prefixed.group(1)), token
+        return None, token
+
+    @staticmethod
+    def _element_id_matches(
+        candidate_raw: Any,
+        *,
+        index: int,
+        wanted_int: int | None,
+        wanted_token: str | None,
+    ) -> bool:
+        try:
+            cand_int, cand_token = Planner._parse_element_id_ref(candidate_raw)
+        except PlannerValidationError:
+            cand_int, cand_token = None, str(candidate_raw).strip() or None
+        if wanted_int is not None:
+            if cand_int is not None and cand_int == wanted_int:
+                return True
+            if wanted_int == index:
+                return True
+        if wanted_token is not None:
+            if cand_token is not None and cand_token == wanted_token:
+                return True
+            if str(candidate_raw).strip() == wanted_token:
+                return True
+            # "e0" vs fixture id 0 / "0"
+            pref = re.fullmatch(
+                r"(?:e|element[_-]?)(\d+)",
+                wanted_token,
+                flags=re.IGNORECASE,
+            )
+            if pref is not None:
+                pref_int = int(pref.group(1))
+                if cand_int is not None and cand_int == pref_int:
+                    return True
+                if pref_int == index:
+                    return True
+        return False
+
+    @staticmethod
     def _coerce_integer(
         value: Any,
         name: str,
@@ -2086,6 +2247,16 @@ class Planner:
 
             if re.fullmatch(r"-?\d+", stripped):
                 return int(stripped)
+
+            # element_id strings like "e0" — only for element_id field names.
+            if name in {"element_id", "detected element_id"}:
+                prefixed = re.fullmatch(
+                    r"(?:e|element[_-]?)(\d+)",
+                    stripped,
+                    flags=re.IGNORECASE,
+                )
+                if prefixed:
+                    return int(prefixed.group(1))
 
         raise PlannerValidationError(
             f"{name} must be an integer."
@@ -2320,6 +2491,7 @@ class Planner:
         self,
         response: Any,
     ) -> UsageInfo:
+        response = self._unwrap_provider_result(response, prefer_parsed=False)
         usage = None
         model = None
         provider = None

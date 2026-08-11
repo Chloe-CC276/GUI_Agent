@@ -173,6 +173,8 @@ def build_planner_rules(
             if resolved is PromptLanguage.ZH
             else "Never use an action outside the allowed-action list."
         )
+    for extra in cfg.extra_rules:
+        rules.append(extra)
     return "\n".join(f"{index}. {rule}" for index, rule in enumerate(rules, start=1))
 
 

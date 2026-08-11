@@ -72,6 +72,26 @@ from .base_vlm import (
 LOGGER = logging.getLogger(__name__)
 
 
+def _is_json_safe(value: Any) -> bool:
+    """Return False for numpy/PIL/binary objects that break OpenAI JSON encoding."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, Mapping):
+        return all(
+            isinstance(key, str) and _is_json_safe(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_safe(item) for item in value)
+    module = getattr(type(value), "__module__", "") or ""
+    if module.startswith("numpy") or module.startswith("PIL"):
+        return False
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return False
+    return False
+
+
 class QwenVLMConfigurationError(VLMConfigurationError):
     """Raised when Qwen-VL configuration is invalid."""
 
@@ -469,6 +489,9 @@ class QwenVLM(BaseVLM):
         for key, value in config.extra.items():
             if key == "extra_body":
                 continue
+            # Never forward local image objects into the HTTP JSON body.
+            if key in {"image", "images", "messages", "prompt", "metadata"}:
+                continue
 
             # Standard OpenAI SDK arguments may be supplied directly.
             if key in {
@@ -490,7 +513,13 @@ class QwenVLM(BaseVLM):
                 extra_body[key] = value
 
         if extra_body:
-            payload["extra_body"] = extra_body
+            payload["extra_body"] = {
+                key: value
+                for key, value in extra_body.items()
+                if _is_json_safe(value)
+            }
+            if not payload["extra_body"]:
+                payload.pop("extra_body", None)
 
         return payload
 

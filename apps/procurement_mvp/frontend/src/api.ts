@@ -201,6 +201,40 @@ export const api = {
   retryTransfer: (transferId: string, payload?: { task_id?: string }) =>
     client.post<Transfer>(`/integration/transfers/${transferId}/retry`, payload).then((r) => r.data),
   getTask: (taskId: string) => client.get<TaskStatus>(`/agent/tasks/${taskId}`).then((r) => r.data),
+  getAgentTask: (taskId: string) => client.get<TaskStatus>(`/agent/tasks/${taskId}`).then((r) => r.data),
+  agentChat: (payload: {
+    message: string
+    route?: string
+    business_key?: string
+    folder_path?: string
+    excel_path?: string
+  }) =>
+    client.post<{
+      intent?: string
+      reply?: string
+      chips?: Array<{ id: string; label: string }>
+      task?: TaskStatus | null
+    }>('/agent/chat', payload).then((r) => r.data),
+  continueAgentTask: (
+    taskId: string,
+    payload: { folder_path?: string; excel_path?: string; oa_id?: number; file?: File },
+  ) => {
+    const form = new FormData()
+    if (payload.folder_path) form.append('folder_path', payload.folder_path)
+    if (payload.excel_path) form.append('excel_path', payload.excel_path)
+    if (payload.oa_id != null) form.append('oa_id', String(payload.oa_id))
+    if (payload.file) form.append('file', payload.file)
+    return client
+      .post<TaskStatus>(`/agent/tasks/${taskId}/continue`, form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      .then((r) => r.data)
+  },
+  reportAgentStepResult: (
+    taskId: string,
+    payload: { step_id: string; status: 'passed' | 'failed'; actual?: unknown; detail?: Record<string, unknown> },
+  ) =>
+    client.post<TaskStatus>(`/agent/tasks/${taskId}/step-result`, payload).then((r) => r.data),
   resetDemo: () => client.post('/demo/reset').then((r) => r.data),
 
   getWorkbenchSummary: () =>

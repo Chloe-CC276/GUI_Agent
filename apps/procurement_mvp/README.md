@@ -3,6 +3,11 @@
 本地模拟 OA、采购云、ERP 三套业务系统，供人工操作与 GUI Agent / API 联调。  
 不连接真实企业系统；不修改仓库 `src/` 下 GUI Agent 核心。
 
+采购 MVP 内置 **方案 A 浏览器任务引擎**（浮窗 + LangChain 意图路由 + DomDriver）：
+- 任务 `import_purchase_to_oa`：选文件夹/上传 Excel → 填 OA → 仅保存草稿
+- 任务 `submit_approved_purchase`：定位已通过且未开始采购的 OA → 提交采购
+- 闭环：Observe → Decide → Act → Verify → Update State；单步最多重试 2 次后 `wait_user`
+
 当前版本按第二阶段规格书 **v2.1（传输闭环增强版）** 增量落地：
 
 1. OA → 采购云 → ERP 传输闭环（S0）

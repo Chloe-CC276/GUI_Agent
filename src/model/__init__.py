@@ -28,8 +28,10 @@ from .qwen_vlm import (
     QwenVLMResponseError,
 )
 
+from .local_peft_vlm import LocalPeftVLM, image_input_to_hf, request_to_hf_messages
 
-__all__ =[
+
+__all__ = [
     "BaseVLM",
     "ContentType",
     "ImageContent",
@@ -53,4 +55,8 @@ __all__ =[
     "QwenVLM",
     "QwenVLMConfigurationError",
     "QwenVLMProviderError",
-    "QwenVLMResponseError",]
+    "QwenVLMResponseError",
+    "LocalPeftVLM",
+    "image_input_to_hf",
+    "request_to_hf_messages",
+]

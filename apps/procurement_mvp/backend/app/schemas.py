@@ -444,6 +444,28 @@ class TaskOut(ORMModel):
     is_paused: bool = False
 
 
+class AgentChatInput(BaseModel):
+    message: str = Field(min_length=1)
+    route: str | None = None
+    business_key: str | None = None
+    folder_path: str | None = None
+    excel_path: str | None = None
+
+
+class AgentContinueInput(BaseModel):
+    folder_path: str | None = None
+    excel_path: str | None = None
+    oa_id: int | None = None
+    note: str | None = None
+
+
+class AgentStepResultInput(BaseModel):
+    step_id: str = Field(min_length=1)
+    status: Literal["passed", "failed"]
+    actual: Any = None
+    detail: dict[str, Any] | None = None
+
+
 class ApiResponse(BaseModel):
     ok: bool = True
     data: Any = None

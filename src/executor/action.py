@@ -465,6 +465,11 @@ class Action:
                 "data must be a dictionary."
             )
 
+        data = dict(data)
+        # Planner default factory historically used action_type.
+        if "type" not in data and data.get("action_type") is not None:
+            data["type"] = data.get("action_type")
+
         if "type" not in data:
             raise ValueError(
                 "Action dictionary must contain 'type'."

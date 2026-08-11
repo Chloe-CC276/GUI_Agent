@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
-import pyautogui
+from ._optional_pyautogui import pyautogui
 
 
 logger = logging.getLogger(__name__)

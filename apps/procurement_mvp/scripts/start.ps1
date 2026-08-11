@@ -87,10 +87,11 @@ if ($backendFresh) {
         Start-Sleep -Seconds 2
     }
     Write-Host "Starting backend -> $BackendLog"
+    # Reload only app/ — watching tests/ causes ECONNREFUSED mid-pytest and Vite surfaces that as HTTP 500.
     $backendCmd = @"
 `$ErrorActionPreference='Continue'
 Set-Location '$Backend'
-& '$VenvPython' -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 *>> '$BackendLog'
+& '$VenvPython' -m uvicorn app.main:app --reload --reload-dir app --reload-exclude '*.pyc' --reload-exclude '__pycache__' --host 127.0.0.1 --port 8000 *>> '$BackendLog'
 "@
     Start-Process powershell -ArgumentList @("-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $backendCmd) | Out-Null
 }
