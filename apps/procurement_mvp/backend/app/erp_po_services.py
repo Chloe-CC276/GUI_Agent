@@ -1,7 +1,13 @@
-"""ERP PO creation via GUI Agent (Scheme A) — task orchestration & dashboards."""
+"""ERP PO creation via GUI Agent (Scheme A) — task orchestration & dashboards.
+
+PRD v1.1 Phase 1: draft → pre-save verify → save → readback → upstream writeback.
+VLM is reserved via vlm_adapter but not invoked.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -11,7 +17,9 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .errors import AppError
+from .excel_tracking import write_batch_excel
 from .models import (
+    AgentBatch,
     AgentSafetyLog,
     AgentStepLog,
     AgentTask,
@@ -28,25 +36,45 @@ from .oa_services import (
     set_procurement_status,
 )
 from .services import _unique_number, _upsert_lineage, money
+from .vlm_adapter import vlm_adapter
 
 PO_OPERATION = "create_erp_po"
 
-TASK_WAITING_PO = "WAITING_PO"
-TASK_QUEUED = "QUEUED"
-TASK_RUNNING = "RUNNING"
-TASK_VERIFYING = "VERIFYING"
-TASK_PO_CREATED = "PO_CREATED"
-TASK_FAILED = "FAILED"
+# v1.1 state machine (primary)
+TASK_WAITING = "WAITING"
+TASK_PREPARING = "PREPARING"
+TASK_DRAFT_EDITING = "DRAFT_EDITING"
+TASK_PRE_SAVE_VERIFY = "PRE_SAVE_VERIFY"
+TASK_SAVING = "SAVING"
+TASK_READBACK = "READBACK"
+TASK_SUCCESS = "SUCCESS"
 TASK_WAIT_USER = "WAIT_USER"
+TASK_FAILED = "FAILED"
+TASK_DUPLICATE_BLOCKED = "DUPLICATE_BLOCKED"
 TASK_STOPPED = "STOPPED"
+TASK_PAUSED = "PAUSED"
+TASK_PENDING = "pending"  # batch created, not started
+
+# Legacy aliases kept for compatibility with earlier MVP code/UI
+TASK_WAITING_PO = TASK_WAITING
+TASK_QUEUED = TASK_PENDING
+TASK_RUNNING = TASK_DRAFT_EDITING
+TASK_VERIFYING = TASK_PRE_SAVE_VERIFY
+TASK_PO_CREATED = TASK_SUCCESS
+
+AMOUNT_TOLERANCE = Decimal("0.01")
 
 STEP_NAMES = (
     "READ_PR_DATA",
+    "CREATE_TASK_SNAPSHOT",
     "OPEN_ERP_FORM",
+    "CREATE_DRAFT",
     "FILL_HEADER",
     "FILL_LINES",
+    "PRE_SAVE_VERIFY",
     "SAVE_PO",
     "READ_BACK_PO_NO",
+    "UPSTREAM_WRITEBACK",
 )
 
 DEFAULT_ERP_CONFIG = {
@@ -57,6 +85,31 @@ DEFAULT_ERP_CONFIG = {
     "buyer_id": "BUYER-01",
     "tax_rate": Decimal("0.13"),
 }
+
+
+def _snapshot_hash(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_task_status(status: str | None) -> str:
+    value = (status or "").strip()
+    mapping = {
+        "WAITING_PO": TASK_WAITING,
+        "QUEUED": TASK_PENDING,
+        "pending": TASK_PENDING,
+        "RUNNING": TASK_DRAFT_EDITING,
+        "running": TASK_DRAFT_EDITING,
+        "VERIFYING": TASK_PRE_SAVE_VERIFY,
+        "PO_CREATED": TASK_SUCCESS,
+        "success": TASK_SUCCESS,
+        "failed": TASK_FAILED,
+        "wait_user": TASK_WAIT_USER,
+        "stopped": TASK_STOPPED,
+        "paused": TASK_PAUSED,
+        "duplicate_blocked": TASK_DUPLICATE_BLOCKED,
+    }
+    return mapping.get(value, value.upper() if value.isupper() or value in mapping else value.upper() if value else TASK_WAITING)
 
 
 def _dec(value: Any, default: str = "0") -> Decimal:
@@ -84,19 +137,21 @@ def _parse_date(value: str | date | None) -> date | None:
 
 def _candidate_status(request: ProcurementRequest, task: AgentTask | None) -> str:
     if request.po_no:
-        return TASK_PO_CREATED
+        return TASK_SUCCESS
     if task is not None and task.status:
-        return str(task.status).upper()
+        return _normalize_task_status(task.status)
     sync = (request.erp_sync_status or "").upper()
-    if sync in {TASK_WAITING_PO, "WAITING_PO"}:
-        return TASK_WAITING_PO
+    if sync in {TASK_WAITING, "WAITING_PO", TASK_WAITING_PO}:
+        return TASK_WAITING
     if sync == "FAILED":
         return TASK_FAILED
-    return TASK_WAITING_PO
+    return TASK_WAITING
 
 
 def _serialize_candidate(request: ProcurementRequest, task: AgentTask | None) -> dict[str, Any]:
     status = _candidate_status(request, task)
+    # UI may still filter WAITING_PO
+    display_status = "WAITING_PO" if status == TASK_WAITING else status
     return {
         "pr_no": request.request_no,
         "oa_apply_no": request.oa_apply_no,
@@ -108,12 +163,14 @@ def _serialize_candidate(request: ProcurementRequest, task: AgentTask | None) ->
         "total_amount": request.final_total_amount_tax or request.total_amount,
         "purchase_method": request.purchase_method_confirmed or request.purchase_type,
         "award_confirmed_at": request.award_confirmed_at,
-        "status": status,
+        "status": display_status,
+        "candidate_status": display_status,
         "task_id": task.task_id if task else None,
         "batch_id": task.batch_id if task else None,
         "po_no": request.po_no or (task.po_no if task else None),
         "error_code": task.error_code if task else None,
         "erp_sync_status": request.erp_sync_status,
+        "source_snapshot_hash": task.source_snapshot_hash if task else None,
     }
 
 
@@ -164,8 +221,19 @@ def list_po_candidates(
             continue
         task = _latest_po_task(session, request.request_no)
         item = _serialize_candidate(request, task)
-        if status and item["status"] != status.upper():
-            continue
+        if status:
+            want = status.upper()
+            got = str(item["status"]).upper()
+            waiting_alias = {"WAITING", "WAITING_PO"}
+            success_alias = {"SUCCESS", "PO_CREATED"}
+            if want in waiting_alias:
+                if got not in waiting_alias:
+                    continue
+            elif want in success_alias:
+                if got not in success_alias:
+                    continue
+            elif got != want:
+                continue
         if q:
             term = q.lower()
             blob = " ".join(
@@ -348,10 +416,20 @@ def create_po_batch(
     *,
     operator: str | None = None,
 ) -> dict[str, Any]:
+    """Create batch + tasks only (no PO). Enters pending/PREPARING with Excel snapshot."""
     if not pr_nos:
         raise AppError(422, "EMPTY_SELECTION", "At least one PR is required")
     batch_id = _new_id("batch")
+    batch = AgentBatch(
+        batch_id=batch_id,
+        status="open",
+        total_count=0,
+        operator=operator,
+    )
+    session.add(batch)
     tasks: list[dict[str, Any]] = []
+    excel_tasks: list[dict[str, Any]] = []
+    excel_lines: list[dict[str, Any]] = []
     for pr_no in pr_nos:
         request = session.scalar(
             select(ProcurementRequest)
@@ -381,36 +459,50 @@ def create_po_batch(
                 {
                     "task_id": None,
                     "pr_no": pr_no,
-                    "status": "DUPLICATE_BLOCKED",
+                    "status": TASK_DUPLICATE_BLOCKED,
                     "po_no": po_no,
                     "error_code": "DUPLICATE_BLOCKED",
+                    "route": None,
                 }
             )
             continue
         form = build_create_form_payload(request)
+        snap_hash = _snapshot_hash(form)
         task_id = _new_id("po-task")
         route = f"/erp/po-create/{task_id}"
         steps = _build_create_steps(pr_no, form)
         for step in steps:
             if step["step_id"] == "OPEN_ERP_FORM":
                 step["action"]["path"] = route
+        vlm = vlm_adapter.maybe_call(
+            scenario="page_understand",
+            payload={"route": route},
+            rpa_ok=False,
+        )
         task = AgentTask(
             task_id=task_id,
             business_key=pr_no,
             operation=PO_OPERATION,
-            status=TASK_QUEUED,
+            status=TASK_PENDING,
             batch_id=batch_id,
             retry_count=0,
-            executor_type="dom",
+            executor_type="rpa",
+            executor_mode="rpa+vlm" if vlm.get("called") else "rpa",
+            vlm_called=bool(vlm.get("called")),
             takeover_flag=False,
+            source_snapshot_hash=snap_hash,
+            draft_json=form,
             current_route=route,
             context_json={
                 "pr_no": pr_no,
                 "batch_id": batch_id,
                 "route": route,
                 "form": form,
+                "source": form,
                 "operator": operator,
                 "steps": steps,
+                "source_snapshot_hash": snap_hash,
+                "vlm": vlm,
             },
             result={"messages": [], "steps": steps},
         )
@@ -421,25 +513,52 @@ def create_po_batch(
                 AgentStepLog(
                     step_id=f"{task.task_id}-{step['step_id']}",
                     task_id=task.task_id,
+                    batch_id=batch_id,
                     step_name=step["step_id"],
                     expected_json={"expected": step.get("expected")},
                     status="pending",
                     retry_count=0,
+                    executor_type="rpa",
                 )
             )
         request.erp_sync_status = "QUEUED"
-        tasks.append(
+        task_view = {
+            "task_id": task.task_id,
+            "pr_no": pr_no,
+            "status": TASK_PENDING,
+            "po_no": None,
+            "error_code": None,
+            "route": route,
+            "source_snapshot_hash": snap_hash,
+        }
+        tasks.append(task_view)
+        excel_tasks.append(
             {
-                "task_id": task.task_id,
-                "pr_no": pr_no,
-                "status": TASK_QUEUED,
-                "po_no": None,
-                "error_code": None,
-                "route": route,
+                **task_view,
+                "oa_apply_no": request.oa_apply_no,
+                "supplier_code": request.supplier_code,
+                "supplier_name": request.supplier_name,
+                "total_amount": str(request.final_total_amount_tax or request.total_amount),
+                "retry_count": 0,
+                "created_at": utcnow().isoformat(),
             }
         )
+        for line in form.get("lines") or []:
+            excel_lines.append({"pr_no": pr_no, **line})
+
+    excel_path = write_batch_excel(
+        batch_id, operator=operator, tasks=excel_tasks, lines=excel_lines
+    )
+    batch.total_count = len([t for t in tasks if t.get("task_id")])
+    batch.failed_count = len([t for t in tasks if t.get("status") == TASK_DUPLICATE_BLOCKED])
+    batch.excel_snapshot_path = str(excel_path)
     session.commit()
-    return {"batch_id": batch_id, "tasks": tasks}
+    return {
+        "batch_id": batch_id,
+        "tasks": tasks,
+        "excel_snapshot_path": str(excel_path),
+        "status": "open",
+    }
 
 
 def get_po_task(session: Session, task_id: str) -> dict[str, Any]:
@@ -460,10 +579,16 @@ def get_po_task(session: Session, task_id: str) -> dict[str, Any]:
         "retry_count": task.retry_count,
         "started_at": task.started_at,
         "finished_at": task.finished_at,
+        "ended_at": task.finished_at,
         "executor_type": task.executor_type,
+        "executor_mode": getattr(task, "executor_mode", None) or "rpa",
+        "vlm_called": bool(getattr(task, "vlm_called", False)),
         "takeover_flag": task.takeover_flag,
         "current_route": task.current_route,
-        "form": context.get("form"),
+        "source_snapshot_hash": getattr(task, "source_snapshot_hash", None),
+        "writeback_status": getattr(task, "writeback_status", None),
+        "form": context.get("form") or getattr(task, "draft_json", None),
+        "draft": getattr(task, "draft_json", None) or context.get("form"),
         "steps": steps,
         "context_json": context,
         "result": result,
@@ -471,10 +596,17 @@ def get_po_task(session: Session, task_id: str) -> dict[str, Any]:
 
 
 def run_po_task(session: Session, task_id: str) -> dict[str, Any]:
+    """Alias of start: enter PREPARING → DRAFT_EDITING (does not create PO)."""
+    return start_po_task(session, task_id)
+
+
+def start_po_task(session: Session, task_id: str) -> dict[str, Any]:
     task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
     if task is None or task.operation != PO_OPERATION:
         raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
-    if task.status == TASK_PO_CREATED and task.po_no:
+    if _normalize_task_status(task.status) == TASK_SUCCESS and task.po_no:
+        task.status = TASK_DUPLICATE_BLOCKED
+        task.error_code = "DUPLICATE_BLOCKED"
         record_safety_event(
             session,
             event_type="DUPLICATE_BLOCKED",
@@ -483,7 +615,7 @@ def run_po_task(session: Session, task_id: str) -> dict[str, Any]:
             batch_id=task.batch_id,
             pr_no=task.business_key,
             po_no=task.po_no,
-            stage="RUN",
+            stage="START",
             expected="no po_no",
             actual=f"po_no={task.po_no}",
             action_taken="skip",
@@ -496,7 +628,7 @@ def run_po_task(session: Session, task_id: str) -> dict[str, Any]:
         select(ERPPurchaseOrder).where(ERPPurchaseOrder.pr_no == task.business_key)
     )
     if existing is not None:
-        task.status = TASK_PO_CREATED
+        task.status = TASK_DUPLICATE_BLOCKED
         task.po_no = existing.po_no
         task.error_code = "DUPLICATE_BLOCKED"
         task.finished_at = utcnow()
@@ -508,7 +640,7 @@ def run_po_task(session: Session, task_id: str) -> dict[str, Any]:
             batch_id=task.batch_id,
             pr_no=task.business_key,
             po_no=existing.po_no,
-            stage="RUN",
+            stage="START",
             expected="no existing PO",
             actual=f"po_no={existing.po_no}",
             action_taken="skip",
@@ -517,19 +649,30 @@ def run_po_task(session: Session, task_id: str) -> dict[str, Any]:
         payload = get_po_task(session, task_id)
         payload["error_code"] = "DUPLICATE_BLOCKED"
         return payload
-    if task.status == TASK_STOPPED:
+    if _normalize_task_status(task.status) == TASK_STOPPED:
         raise AppError(409, "TASK_STOPPED", "Task already stopped")
-    task.status = TASK_RUNNING
+    task.status = TASK_PREPARING
     task.started_at = task.started_at or utcnow()
     task.error_code = None
+    record_step_progress(
+        session,
+        task.task_id,
+        step_name="CREATE_DRAFT",
+        status="success",
+        expected={"action": "enter_draft"},
+        actual={"route": task.current_route},
+    )
+    task.status = TASK_DRAFT_EDITING
     request = session.scalar(
         select(ProcurementRequest).where(ProcurementRequest.request_no == task.business_key)
     )
     if request is not None:
-        request.erp_sync_status = "RUNNING"
-    route = task.current_route or f"/erp/po-create/{task.business_key}"
+        request.erp_sync_status = "DRAFT_EDITING"
+    route = task.current_route or f"/erp/po-create/{task.task_id}"
     context = dict(task.context_json or {})
     context["route"] = route
+    if not task.draft_json:
+        task.draft_json = context.get("form")
     task.context_json = context
     task.current_route = route
     session.commit()
@@ -621,7 +764,7 @@ def create_po_from_erp_form(
     existing = session.scalar(select(ERPPurchaseOrder).where(ERPPurchaseOrder.pr_no == pr_no))
     if existing is not None or request.po_no:
         po_no = request.po_no or existing.po_no
-        task.status = TASK_PO_CREATED
+        task.status = TASK_DUPLICATE_BLOCKED
         task.po_no = po_no
         task.error_code = "DUPLICATE_BLOCKED"
         task.finished_at = utcnow()
@@ -644,7 +787,27 @@ def create_po_from_erp_form(
     if not lines:
         raise AppError(422, "EMPTY_LINES", "At least one PO line is required")
 
-    task.status = TASK_VERIFYING
+    # Enforce pre-save verify before irreversible create
+    verify = pre_save_verify(session, task_id, header=header, lines=lines, commit=False)
+    if not verify.get("passed"):
+        task.status = TASK_FAILED
+        task.error_code = "VALIDATION_FAILED"
+        record_safety_event(
+            session,
+            event_type="VALIDATION_FAILED",
+            severity="BLOCKER",
+            task_id=task.task_id,
+            batch_id=task.batch_id,
+            pr_no=pr_no,
+            stage="PRE_SAVE_VERIFY",
+            expected="all checks pass",
+            actual=json.dumps(verify.get("errors") or [], ensure_ascii=False),
+            action_taken="block_save",
+        )
+        session.commit()
+        raise AppError(422, "VALIDATION_FAILED", "Pre-save validation failed", verify)
+
+    task.status = TASK_SAVING
     task.started_at = task.started_at or utcnow()
     record_step_progress(
         session,
@@ -712,6 +875,15 @@ def create_po_from_erp_form(
         raise AppError(500, "PO_READBACK_FAIL", "PO saved but po_no readback failed")
 
     po_no = _unique_number("PO-2026-")
+    # Phase2: optional OCR/readback assist (does not replace structured po_no).
+    vlm_read = vlm_adapter.maybe_call(
+        scenario="po_readback_ocr",
+        payload={"po_no": po_no, "task_id": task.task_id},
+        rpa_ok=True,
+    )
+    if vlm_read.get("called"):
+        task.vlm_called = True
+
     order = ERPPurchaseOrder(
         po_no=po_no,
         pr_no=pr_no,
@@ -732,6 +904,11 @@ def create_po_from_erp_form(
         total_amount_tax=money(total),
         created_by_agent_task_id=task.task_id,
         batch_id=task.batch_id,
+        purchase_method=(
+            (task.context_json or {}).get("form", {}).get("purchase_method")
+            or request.purchase_method_confirmed
+            or request.purchase_type
+        ),
     )
     for item in computed_lines:
         order.lines.append(
@@ -775,6 +952,15 @@ def create_po_from_erp_form(
         session.commit()
         raise AppError(500, "PO_READBACK_FAIL", "PO created without readable po_no")
 
+    task.status = TASK_READBACK
+    record_step_progress(
+        session,
+        task.task_id,
+        step_name="READ_BACK_PO_NO",
+        status="running",
+        expected={"po_no": "non-empty"},
+    )
+
     request.po_no = order.po_no
     request.erp_status = "success"
     request.erp_sync_status = "SUCCESS"
@@ -786,20 +972,43 @@ def create_po_from_erp_form(
         oa.erp_status = "success"
         set_procurement_status(oa, PROCUREMENT_STATUS_AWARDED)
 
-    task.status = TASK_PO_CREATED
     task.po_no = order.po_no
     task.error_code = None
-    task.finished_at = utcnow()
     result = dict(task.result or {})
     steps = list(result.get("steps") or [])
+    gui_driven = bool((task.context_json or {}).get("gui_driven"))
+    # GUI Agent still needs READ_BACK_PO_NO; keep loop alive until DOM readback reports.
+    done_ids = {
+        "SAVE_PO",
+        "FILL_HEADER",
+        "FILL_LINES",
+        "OPEN_ERP_FORM",
+        "READ_PR_DATA",
+        "PRE_SAVE_VERIFY",
+        "CREATE_DRAFT",
+        "UPSTREAM_WRITEBACK",
+    }
     for step in steps:
-        if step.get("step_id") in {"SAVE_PO", "READ_BACK_PO_NO", "FILL_HEADER", "FILL_LINES", "OPEN_ERP_FORM", "READ_PR_DATA"}:
-            step["status"] = "success"
-            if step.get("step_id") == "READ_BACK_PO_NO":
-                step["actual"] = order.po_no
+        sid = step.get("step_id")
+        if sid == "READ_BACK_PO_NO" and gui_driven:
+            step["status"] = "pending"
+            step["actual"] = {"po_no": order.po_no}
+            continue
+        if sid in done_ids or (sid == "READ_BACK_PO_NO" and not gui_driven):
+            step["status"] = "passed" if gui_driven else "success"
+            if sid == "READ_BACK_PO_NO":
+                step["actual"] = {"po_no": order.po_no}
+            elif sid == "SAVE_PO":
+                step["actual"] = {"po_no": order.po_no}
     result["steps"] = steps
     result["po_no"] = order.po_no
     task.result = result
+    if gui_driven:
+        task.status = "running"
+        task.finished_at = None
+    else:
+        task.status = TASK_SUCCESS
+        task.finished_at = utcnow()
 
     record_step_progress(
         session,
@@ -823,13 +1032,25 @@ def create_po_from_erp_form(
         task_id=task.task_id,
         status="po_created",
     )
+    # Upstream writeback (procurement cloud API). Failure must not recreate PO.
+    writeback = link_po_to_procurement(
+        session,
+        pr_no,
+        po_no=order.po_no,
+        task_id=task.task_id,
+        commit=False,
+        simulate_failure=False,
+    )
+    task.writeback_status = writeback.get("status")
+    _refresh_batch_excel(session, task.batch_id)
     session.commit()
     return {
         "task_id": task.task_id,
         "batch_id": task.batch_id,
         "pr_no": pr_no,
         "po_no": order.po_no,
-        "status": TASK_PO_CREATED,
+        "status": TASK_SUCCESS,
+        "writeback_status": task.writeback_status,
         "order": order,
     }
 
@@ -1084,7 +1305,7 @@ def agent_dashboard_summary(
     department: str | None = None,
     batch_id: str | None = None,
 ) -> dict[str, Any]:
-    waiting_items, _ = list_po_candidates(session, status=TASK_WAITING_PO, page_size=10000)
+    waiting_items, _ = list_po_candidates(session, status="WAITING_PO", page_size=10000)
     waiting_count = len(waiting_items)
 
     tasks = _filter_tasks(
@@ -1094,9 +1315,16 @@ def agent_dashboard_summary(
         department=department,
         batch_id=batch_id,
     )
-    created = [t for t in tasks if t.status == TASK_PO_CREATED and t.po_no]
+    created = [
+        t
+        for t in tasks
+        if _normalize_task_status(t.status) == TASK_SUCCESS and t.po_no
+    ]
     finished = [
-        t for t in tasks if t.status in {TASK_PO_CREATED, TASK_FAILED, TASK_STOPPED}
+        t
+        for t in tasks
+        if _normalize_task_status(t.status)
+        in {TASK_SUCCESS, TASK_FAILED, TASK_STOPPED, TASK_DUPLICATE_BLOCKED}
     ]
     success_rate = (len(created) / len(finished)) if finished else 0.0
     first_pass = [t for t in created if (t.retry_count or 0) == 0]
@@ -1111,7 +1339,13 @@ def agent_dashboard_summary(
             AgentStepLog.task_id.in_([t.task_id for t in tasks] or ["__none__"])
         )
     )
-    takeover = len([t for t in tasks if t.status == TASK_WAIT_USER or t.takeover_flag])
+    takeover = len(
+        [
+            t
+            for t in tasks
+            if _normalize_task_status(t.status) == TASK_WAIT_USER or t.takeover_flag
+        ]
+    )
     duplicate = session.scalar(
         select(func.count())
         .select_from(AgentSafetyLog)
@@ -1124,16 +1358,25 @@ def agent_dashboard_summary(
             or_(
                 AgentSafetyLog.event_type == "EMERGENCY_STOP",
                 AgentSafetyLog.event_type == "STOP",
+                AgentSafetyLog.event_type == "MANUAL_STOP",
             )
         )
     )
     readback_fail = session.scalar(
         select(func.count())
         .select_from(AgentSafetyLog)
-        .where(AgentSafetyLog.event_type == "PO_READBACK_FAIL")
+        .where(
+            or_(
+                AgentSafetyLog.event_type == "PO_READBACK_FAIL",
+                AgentSafetyLog.event_type == "PO_READBACK_FAILED",
+            )
+        )
     )
+    vlm_called_count = len([t for t in tasks if getattr(t, "vlm_called", False)])
+    executed = [t for t in tasks if _normalize_task_status(t.status) != TASK_PENDING]
     return {
         "waiting_pr_count": waiting_count,
+        "task_count": len(tasks),
         "agent_created_po_count": len(created),
         "success_rate": round(success_rate, 4),
         "first_pass_rate": round(first_pass_rate, 4),
@@ -1143,6 +1386,8 @@ def agent_dashboard_summary(
         "duplicate_blocked_count": int(duplicate or 0),
         "emergency_stop_count": int(emergency or 0),
         "po_readback_fail_count": int(readback_fail or 0),
+        "vlm_called_count": vlm_called_count,
+        "vlm_call_rate": round((vlm_called_count / len(executed)), 4) if executed else 0.0,
     }
 
 
@@ -1179,11 +1424,20 @@ def agent_dashboard_funnel(
     return {
         "queued": len(queued_like),
         "read_pr_data": _step_success("READ_PR_DATA"),
+        "task_snapshot": _step_success("CREATE_TASK_SNAPSHOT") or len(queued_like),
         "open_erp_form": _step_success("OPEN_ERP_FORM"),
+        "draft_entered": _step_success("CREATE_DRAFT")
+        or len([t for t in tasks if _normalize_task_status(t.status) in {
+            TASK_DRAFT_EDITING, TASK_PRE_SAVE_VERIFY, TASK_SAVING, TASK_READBACK, TASK_SUCCESS
+        }]),
         "fill_header": _step_success("FILL_HEADER"),
         "fill_lines": _step_success("FILL_LINES"),
+        "pre_save_verify": _step_success("PRE_SAVE_VERIFY"),
         "save_po": _step_success("SAVE_PO"),
-        "read_back_po_no": len([t for t in tasks if t.po_no and t.status == TASK_PO_CREATED]),
+        "read_back_po_no": len(
+            [t for t in tasks if t.po_no and _normalize_task_status(t.status) == TASK_SUCCESS]
+        ),
+        "upstream_writeback": _step_success("UPSTREAM_WRITEBACK"),
     }
 
 
@@ -1336,7 +1590,13 @@ def po_dashboard_summary(
     line_count = sum(len(o.lines or []) for o in orders)
     now = datetime.now(timezone.utc)
     month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-    month_new = len([o for o in orders if o.created_at and o.created_at >= month_start])
+
+    def _aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    month_new = len(
+        [o for o in orders if o.created_at and _aware(o.created_at) >= month_start]
+    )
     depts = {o.request_dept for o in orders if o.request_dept}
     complete = len([o for o in orders if o.oa_apply_no and o.pr_no and o.po_no])
     return {
@@ -1497,3 +1757,405 @@ def get_create_context(session: Session, reference: str) -> dict[str, Any]:
         "source": form,
         "steps": [],
     }
+
+
+def save_po_draft(
+    session: Session,
+    task_id: str,
+    *,
+    header: dict[str, Any],
+    lines: list[dict[str, Any]],
+) -> dict[str, Any]:
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+    if task is None or task.operation != PO_OPERATION:
+        raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
+    if _normalize_task_status(task.status) in {TASK_SUCCESS, TASK_DUPLICATE_BLOCKED}:
+        raise AppError(409, "INVALID_STATE", f"Task already finished: {task.status}")
+    context = dict(task.context_json or {})
+    source = context.get("source") or context.get("form") or {}
+    draft = {
+        "pr_no": task.business_key,
+        "oa_apply_no": source.get("oa_apply_no"),
+        "purchase_method": source.get("purchase_method"),
+        "award_confirmed_at": source.get("award_confirmed_at"),
+        "header": header,
+        "lines": lines,
+    }
+    task.draft_json = _jsonable(draft)
+    context["form"] = task.draft_json
+    task.context_json = context
+    task.status = TASK_DRAFT_EDITING
+    session.commit()
+    return get_po_task(session, task_id)
+
+
+def pre_save_verify(
+    session: Session,
+    task_id: str,
+    *,
+    header: dict[str, Any] | None = None,
+    lines: list[dict[str, Any]] | None = None,
+    commit: bool = True,
+) -> dict[str, Any]:
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+    if task is None or task.operation != PO_OPERATION:
+        raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
+    context = dict(task.context_json or {})
+    source = context.get("source") or context.get("form") or {}
+    draft = task.draft_json or context.get("form") or {}
+    header = header if header is not None else (draft.get("header") or {})
+    lines = lines if lines is not None else list(draft.get("lines") or [])
+    source_lines = list((source.get("lines") or []))
+    errors: list[dict[str, Any]] = []
+
+    if task.business_key != (draft.get("pr_no") or task.business_key):
+        errors.append({"code": "SOURCE_MISMATCH", "message": "Draft pr_no mismatches task"})
+    if not (header.get("supplier_name") or header.get("supplier_code")):
+        errors.append({"code": "SUPPLIER_REQUIRED", "message": "Supplier is required"})
+    if not lines:
+        errors.append({"code": "EMPTY_LINES", "message": "At least one line is required"})
+    if source_lines and len(lines) != len(source_lines):
+        errors.append(
+            {
+                "code": "LINE_COUNT_MISMATCH",
+                "message": f"line count {len(lines)} != source {len(source_lines)}",
+            }
+        )
+    for index, line in enumerate(lines, 1):
+        qty = _dec(line.get("quantity"))
+        price = _dec(line.get("unit_price_tax", line.get("unit_price")))
+        if qty <= 0:
+            errors.append({"code": "INVALID_QTY", "message": f"line {index} quantity must be > 0"})
+        if price < 0:
+            errors.append({"code": "INVALID_PRICE", "message": f"line {index} unit_price must be >= 0"})
+        if not (line.get("material_code") or line.get("material_name")):
+            errors.append({"code": "MATERIAL_REQUIRED", "message": f"line {index} material required"})
+    draft_total = money(
+        sum(
+            (_dec(line.get("quantity")) * _dec(line.get("unit_price_tax", line.get("unit_price"))) for line in lines),
+            Decimal("0"),
+        )
+    )
+    source_total = _dec((source.get("header") or {}).get("total_amount_tax") or source.get("total_amount") or 0)
+    if source_total > 0 and abs(draft_total - source_total) > AMOUNT_TOLERANCE:
+        errors.append(
+            {
+                "code": "AMOUNT_MISMATCH",
+                "message": f"total {draft_total} vs source {source_total}",
+            }
+        )
+    existing = session.scalar(
+        select(ERPPurchaseOrder).where(ERPPurchaseOrder.pr_no == task.business_key)
+    )
+    if existing is not None or task.po_no:
+        errors.append({"code": "DUPLICATE_BLOCKED", "message": "PO already exists for PR"})
+
+    # Phase2: visual check via VLM when enabled; low confidence gates save.
+    vlm = vlm_adapter.maybe_call(
+        scenario="pre_save_visual",
+        payload={"task_id": task_id, "rule_passed": not errors, "route": task.current_route},
+        rpa_ok=False,
+    )
+    if vlm.get("called"):
+        task.vlm_called = True
+        if vlm.get("block_save") or vlm.get("low_confidence"):
+            errors.append(
+                {
+                    "code": "VLM_LOW_CONFIDENCE",
+                    "message": vlm.get("suggestion") or "VLM low confidence before save",
+                }
+            )
+            task.takeover_flag = True
+            record_safety_event(
+                session,
+                event_type="VLM_LOW_CONFIDENCE",
+                severity="WARN",
+                task_id=task.task_id,
+                batch_id=task.batch_id,
+                pr_no=task.business_key,
+                stage="PRE_SAVE_VERIFY",
+                expected="confidence>=0.55",
+                actual=str(vlm.get("confidence")),
+                action_taken="wait_user",
+            )
+
+    passed = not errors
+    task.status = TASK_PRE_SAVE_VERIFY if passed else (
+        TASK_WAIT_USER if any(e.get("code") == "VLM_LOW_CONFIDENCE" for e in errors) else TASK_DRAFT_EDITING
+    )
+    record_step_progress(
+        session,
+        task.task_id,
+        step_name="PRE_SAVE_VERIFY",
+        status="success" if passed else "failed",
+        expected={"passed": True},
+        actual={"passed": passed, "errors": errors, "draft_total": str(draft_total)},
+        error_code=None if passed else "VALIDATION_FAILED",
+    )
+    if commit:
+        session.commit()
+    return {
+        "task_id": task_id,
+        "passed": passed,
+        "errors": errors,
+        "draft_total": draft_total,
+        "source_total": source_total,
+        "status": task.status,
+    }
+
+
+def link_po_to_procurement(
+    session: Session,
+    pr_no: str,
+    *,
+    po_no: str,
+    task_id: str | None = None,
+    commit: bool = True,
+    simulate_failure: bool = False,
+) -> dict[str, Any]:
+    """采购云回写 po_no（采购云 API）。失败只记状态，禁止重建 ERP PO。"""
+    request = session.scalar(
+        select(ProcurementRequest)
+        .where(ProcurementRequest.request_no == pr_no)
+        .options(selectinload(ProcurementRequest.oa_application))
+    )
+    if request is None:
+        raise AppError(404, "PR_NOT_FOUND", "PR not found")
+    task = None
+    if task_id:
+        task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+
+    if simulate_failure:
+        if task is not None:
+            task.writeback_status = "FAILED"
+        record_safety_event(
+            session,
+            event_type="UPSTREAM_WRITEBACK_FAILED",
+            severity="WARN",
+            task_id=task_id,
+            batch_id=task.batch_id if task else None,
+            pr_no=pr_no,
+            po_no=po_no,
+            stage="UPSTREAM_WRITEBACK",
+            expected="writeback success",
+            actual="simulated failure",
+            action_taken="retry_writeback_only",
+        )
+        record_step_progress(
+            session,
+            task_id or "unknown",
+            step_name="UPSTREAM_WRITEBACK",
+            status="failed",
+            error_code="UPSTREAM_WRITEBACK_FAILED",
+        )
+        if commit:
+            session.commit()
+        return {"status": "FAILED", "pr_no": pr_no, "po_no": po_no, "retryable": True}
+
+    request.po_no = po_no
+    request.erp_sync_status = "SUCCESS"
+    request.erp_status = "success"
+    oa = request.oa_application
+    if oa is not None:
+        oa.linked_po_no = po_no
+        oa.erp_status = "success"
+        set_procurement_status(oa, PROCUREMENT_STATUS_AWARDED)
+    if task is not None:
+        task.writeback_status = "SUCCESS"
+        task.po_no = po_no
+    record_step_progress(
+        session,
+        task_id or "unknown",
+        step_name="UPSTREAM_WRITEBACK",
+        status="success",
+        actual={"po_no": po_no},
+    )
+    if commit:
+        session.commit()
+    return {"status": "SUCCESS", "pr_no": pr_no, "po_no": po_no, "retryable": False}
+
+
+def retry_upstream_writeback(
+    session: Session, task_id: str, *, simulate_failure: bool = False
+) -> dict[str, Any]:
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+    if task is None or task.operation != PO_OPERATION:
+        raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
+    if not task.po_no:
+        raise AppError(409, "NO_PO", "Cannot retry writeback without local po_no")
+    return link_po_to_procurement(
+        session,
+        task.business_key,
+        po_no=task.po_no,
+        task_id=task.task_id,
+        simulate_failure=simulate_failure,
+    )
+
+
+def pause_po_task(session: Session, task_id: str) -> dict[str, Any]:
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+    if task is None or task.operation != PO_OPERATION:
+        raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
+    if _normalize_task_status(task.status) in {TASK_SUCCESS, TASK_DUPLICATE_BLOCKED, TASK_STOPPED}:
+        raise AppError(409, "INVALID_STATE", f"Cannot pause task in {task.status}")
+    task.status = TASK_PAUSED
+    task.is_paused = True
+    session.commit()
+    return get_po_task(session, task_id)
+
+
+def resume_po_task(session: Session, task_id: str) -> dict[str, Any]:
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+    if task is None or task.operation != PO_OPERATION:
+        raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
+    task.is_paused = False
+    task.status = TASK_DRAFT_EDITING
+    session.commit()
+    return get_po_task(session, task_id)
+
+
+def stop_po_task(session: Session, task_id: str) -> dict[str, Any]:
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+    if task is None or task.operation != PO_OPERATION:
+        raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
+    if _normalize_task_status(task.status) == TASK_SUCCESS and task.po_no:
+        # stop must not delete existing PO
+        record_safety_event(
+            session,
+            event_type="MANUAL_STOP",
+            severity="INFO",
+            task_id=task.task_id,
+            batch_id=task.batch_id,
+            pr_no=task.business_key,
+            po_no=task.po_no,
+            stage="STOP",
+            action_taken="keep_po",
+        )
+        session.commit()
+        return get_po_task(session, task_id)
+    task.status = TASK_STOPPED
+    task.finished_at = utcnow()
+    record_safety_event(
+        session,
+        event_type="MANUAL_STOP",
+        severity="WARN",
+        task_id=task.task_id,
+        batch_id=task.batch_id,
+        pr_no=task.business_key,
+        stage="STOP",
+        action_taken="stop",
+    )
+    session.commit()
+    return get_po_task(session, task_id)
+
+
+def user_response_po_task(
+    session: Session, task_id: str, *, action: str, note: str | None = None
+) -> dict[str, Any]:
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == task_id))
+    if task is None or task.operation != PO_OPERATION:
+        raise AppError(404, "TASK_NOT_FOUND", "PO create task not found")
+    action = (action or "").lower()
+    if action in {"continue", "resume"}:
+        task.status = TASK_DRAFT_EDITING
+        task.takeover_flag = False
+        task.is_paused = False
+    elif action in {"stop", "cancel"}:
+        return stop_po_task(session, task_id)
+    elif action == "retry_writeback":
+        return retry_upstream_writeback(session, task_id)
+    else:
+        raise AppError(422, "INVALID_ACTION", f"Unsupported user action: {action}")
+    context = dict(task.context_json or {})
+    context["last_user_action"] = {"action": action, "note": note, "at": utcnow().isoformat()}
+    task.context_json = context
+    session.commit()
+    return get_po_task(session, task_id)
+
+
+def get_batch_excel_path(session: Session, batch_id: str) -> str:
+    batch = session.scalar(select(AgentBatch).where(AgentBatch.batch_id == batch_id))
+    if batch is None or not batch.excel_snapshot_path:
+        raise AppError(404, "EXCEL_NOT_FOUND", "Batch excel tracking not found")
+    return batch.excel_snapshot_path
+
+
+def _refresh_batch_excel(session: Session, batch_id: str | None) -> None:
+    if not batch_id:
+        return
+    batch = session.scalar(select(AgentBatch).where(AgentBatch.batch_id == batch_id))
+    if batch is None:
+        return
+    tasks = list(
+        session.scalars(
+            select(AgentTask).where(
+                AgentTask.batch_id == batch_id, AgentTask.operation == PO_OPERATION
+            )
+        ).all()
+    )
+    excel_tasks = []
+    excel_lines = []
+    success = failed = wait_user = 0
+    for task in tasks:
+        status = _normalize_task_status(task.status)
+        if status == TASK_SUCCESS:
+            success += 1
+        elif status in {TASK_FAILED, TASK_DUPLICATE_BLOCKED}:
+            failed += 1
+        elif status == TASK_WAIT_USER:
+            wait_user += 1
+        form = task.draft_json or (task.context_json or {}).get("form") or {}
+        excel_tasks.append(
+            {
+                "task_id": task.task_id,
+                "pr_no": task.business_key,
+                "oa_apply_no": form.get("oa_apply_no"),
+                "supplier_name": (form.get("header") or {}).get("supplier_name"),
+                "total_amount": (form.get("header") or {}).get("total_amount_tax"),
+                "status": task.status,
+                "retry_count": task.retry_count,
+                "po_no": task.po_no,
+                "error_code": task.error_code,
+                "source_snapshot_hash": task.source_snapshot_hash,
+                "created_at": task.created_at.isoformat() if task.created_at else "",
+            }
+        )
+        for line in form.get("lines") or []:
+            excel_lines.append({"pr_no": task.business_key, **line})
+    path = write_batch_excel(
+        batch_id, operator=batch.operator, tasks=excel_tasks, lines=excel_lines
+    )
+    batch.excel_snapshot_path = str(path)
+    batch.success_count = success
+    batch.failed_count = failed
+    batch.wait_user_count = wait_user
+    batch.total_count = len(tasks)
+
+
+def agent_dashboard_errors(
+    session: Session, *, limit: int = 20
+) -> list[dict[str, Any]]:
+    rows = list(
+        session.scalars(
+            select(AgentSafetyLog).order_by(AgentSafetyLog.id.desc()).limit(200)
+        ).all()
+    )
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.event_type] = counts.get(row.event_type, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+    return [{"event_type": key, "count": value} for key, value in ordered]
+
+
+def po_dashboard_by_method(session: Session) -> list[dict[str, Any]]:
+    orders = _filter_orders(session)
+    groups: dict[str, dict[str, Any]] = {}
+    for order in orders:
+        key = order.purchase_method or "unknown"
+        item = groups.setdefault(key, {"purchase_method": key, "po_count": 0, "amount": Decimal("0")})
+        item["po_count"] += 1
+        item["amount"] = money(item["amount"] + _po_amount(order))
+    rows = list(groups.values())
+    rows.sort(key=lambda item: item["amount"], reverse=True)
+    return rows
+

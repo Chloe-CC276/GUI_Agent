@@ -19,10 +19,15 @@ from .excel_reader import (
     validate_application_payload,
 )
 from .intents import QUICK_CHIPS, route_message
-from .tasks import build_import_purchase_steps, build_submit_approved_steps
+from .tasks import (
+    build_create_erp_po_gui_steps,
+    build_import_purchase_steps,
+    build_submit_approved_steps,
+)
 
 MAX_STEP_RETRIES = 2
-GUI_OPERATIONS = {"import_purchase_to_oa", "submit_approved_purchase"}
+GUI_OPERATIONS = {"import_purchase_to_oa", "submit_approved_purchase", "create_erp_po"}
+PO_OPERATION = "create_erp_po"
 
 
 def _new_task_id(prefix: str) -> str:
@@ -350,6 +355,99 @@ def _start_submit_approved_purchase(
     return task
 
 
+def _start_create_erp_po(
+    session: Session,
+    *,
+    message: str,
+    params: dict[str, Any],
+    page_context: dict[str, Any],
+) -> tuple[AgentTask | None, str]:
+    """Scheme A: queue WAITING_PO → batch/start → GUI/RPA fill ERP form → save-and-create → writeback.
+
+    No procurement→ERP business create API is used.
+    """
+    from ..erp_po_services import (
+        create_po_batch,
+        list_po_candidates,
+        start_po_task,
+    )
+    from ..vlm_adapter import vlm_adapter
+
+    pr_filter = params.get("pr_no") or page_context.get("business_key")
+    if pr_filter and not str(pr_filter).upper().startswith("PR-"):
+        pr_filter = None
+
+    candidates, _ = list_po_candidates(session, status="WAITING_PO", page_size=200)
+    if pr_filter:
+        candidates = [item for item in candidates if item.get("pr_no") == pr_filter]
+    if not candidates:
+        return None, "没有待建 PO 的 PR。请先在采购云完成「确认定标并进入待建PO」。"
+
+    # Prefer explicit PR, otherwise first waiting item.
+    target = candidates[0]
+    pr_no = str(target["pr_no"])
+    vlm = vlm_adapter.maybe_call(
+        scenario="page_understand",
+        payload={"route": page_context.get("route") or "/erp/po-candidates"},
+    )
+
+    batch = create_po_batch(session, [pr_no], operator="gui-agent")
+    task_row = next((item for item in batch.get("tasks") or [] if item.get("task_id")), None)
+    if task_row is None or not task_row.get("task_id"):
+        return None, f"无法为 {pr_no} 创建建单任务（可能已建 PO 或被重复拦截）。"
+
+    po_task_id = str(task_row["task_id"])
+    started = start_po_task(session, po_task_id)
+    form = started.get("form") or started.get("draft") or {}
+    gui_steps = build_create_erp_po_gui_steps(pr_no=pr_no, task_id=po_task_id, form=form)
+
+    task = session.scalar(select(AgentTask).where(AgentTask.task_id == po_task_id))
+    if task is None:
+        return None, "建单任务创建失败。"
+
+    # Drive DOM executor: status must be running for floating window auto-loop.
+    task.operation = PO_OPERATION
+    task.status = "running"
+    task.started_at = task.started_at or utcnow()
+    task.current_route = f"/erp/po-create/{po_task_id}"
+    if vlm.get("called"):
+        task.vlm_called = True
+        task.executor_mode = "rpa+vlm"
+    context = dict(task.context_json or {})
+    context.update(
+        {
+            "pr_no": pr_no,
+            "batch_id": batch.get("batch_id"),
+            "route": task.current_route,
+            "form": form,
+            "steps": gui_steps,
+            "vlm": vlm,
+            "gui_driven": True,
+        }
+    )
+    task.context_json = context
+    result = dict(task.result or {})
+    result["steps"] = gui_steps
+    messages = list(result.get("messages") or [])
+    messages.append(
+        {
+            "role": "assistant",
+            "content": (
+                f"已为 {pr_no} 创建 ERP 建单任务 {po_task_id}。"
+                "将通过 GUI/RPA 打开草稿页→填写→校验→保存并创建PO→回写采购云（无采购云→ERP 建单业务 API）。"
+            ),
+            "at": utcnow().isoformat(),
+        }
+    )
+    result["messages"] = messages[-50:]
+    task.result = result
+    session.commit()
+    return task, (
+        f"已启动 {pr_no} → ERP PO 的 GUI Agent 任务（{po_task_id}）。"
+        "请保持页面打开，Agent 将自动在 ERP 建单页执行。"
+    )
+
+
 def create_task_from_message(
     session: Session,
     *,
@@ -415,6 +513,20 @@ def create_task_from_message(
             "reply": "已创建提交采购任务。",
             "chips": QUICK_CHIPS,
             "task": _task_view(task),
+        }
+
+    if intent == "create_erp_po":
+        task, reply = _start_create_erp_po(
+            session,
+            message=message,
+            params=params,
+            page_context=page_context,
+        )
+        return {
+            "intent": intent,
+            "reply": reply,
+            "chips": QUICK_CHIPS,
+            "task": _task_view(task) if task is not None else None,
         }
 
     raise AppError(400, "UNKNOWN_INTENT", f"Unsupported intent: {intent}")
@@ -555,8 +667,8 @@ def report_step_result(
         context["step_index"] = index + 1
         task.context_json = context
         if index + 1 >= len(steps):
-            task.status = "completed"
             if task.operation == "import_purchase_to_oa":
+                task.status = "completed"
                 app_no = (detail or {}).get("application_no") or (actual or {}).get("application_no")
                 if app_no:
                     context["application_no"] = app_no
@@ -567,7 +679,23 @@ def report_step_result(
                     "assistant",
                     f"草稿已保存。approval_status=DRAFT，procurement_status=NOT_STARTED，OA号={app_no or '-'}。",
                 )
+            elif task.operation == "create_erp_po":
+                po_no = None
+                if isinstance(actual, dict):
+                    po_no = actual.get("po_no") or (actual.get("text") if str(actual.get("text") or "").startswith("PO-") else None)
+                if isinstance(detail, dict) and not po_no:
+                    po_no = detail.get("po_no")
+                if po_no:
+                    task.po_no = str(po_no)
+                task.status = "SUCCESS" if task.po_no else "completed"
+                task.finished_at = utcnow()
+                _append_message(
+                    task,
+                    "assistant",
+                    f"ERP PO 创建完成。pr_no={task.business_key}，po_no={task.po_no or '-'}。",
+                )
             else:
+                task.status = "completed"
                 pr_no = (detail or {}).get("linked_pr_no") or (actual or {}).get("linked_pr_no")
                 _append_message(
                     task,
@@ -589,6 +717,27 @@ def report_step_result(
     result["steps"] = steps
     task.result = result
     if retry_count > MAX_STEP_RETRIES:
+        vlm = None
+        if task.operation == PO_OPERATION:
+            from ..vlm_adapter import vlm_adapter
+
+            vlm = vlm_adapter.maybe_call(
+                scenario="anomaly_recover",
+                payload={
+                    "error": (actual or {}).get("error") if isinstance(actual, dict) else None,
+                    "error_code": step_id,
+                    "testid": (step.get("action") or {}).get("testid"),
+                    "route": task.current_route,
+                },
+                rpa_ok=False,
+            )
+            if vlm.get("called"):
+                task.vlm_called = True
+                context = dict(task.context_json or {})
+                context["vlm_last"] = vlm
+                task.context_json = context
+                if vlm.get("low_confidence") or vlm.get("block_save"):
+                    task.takeover_flag = True
         _set_waiting(
             task,
             {
@@ -597,10 +746,29 @@ def report_step_result(
                 "expected": step.get("expected"),
                 "actual": step.get("actual"),
                 "retry_count": retry_count,
+                "vlm": vlm,
             },
-            f"步骤 {step_id} 验证失败且已重试 {MAX_STEP_RETRIES} 次，等待你处理（不会自动跳过）。",
+            f"步骤 {step_id} 验证失败且已重试 {MAX_STEP_RETRIES} 次，等待你处理（不会自动跳过）。"
+            + (f" VLM建议：{vlm.get('suggestion')}" if vlm and vlm.get("suggestion") else ""),
         )
     else:
+        if task.operation == PO_OPERATION:
+            from ..vlm_adapter import vlm_adapter
+
+            vlm = vlm_adapter.maybe_call(
+                scenario="locator_recover",
+                payload={
+                    "testid": (step.get("action") or {}).get("testid"),
+                    "route": task.current_route,
+                    "error": (actual or {}).get("error") if isinstance(actual, dict) else None,
+                },
+                rpa_ok=False,
+            )
+            if vlm.get("called"):
+                task.vlm_called = True
+                context = dict(task.context_json or {})
+                context["vlm_last"] = vlm
+                task.context_json = context
         step["status"] = "pending"
         steps[index] = step
         result["steps"] = steps

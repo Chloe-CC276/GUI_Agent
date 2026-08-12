@@ -13,15 +13,15 @@ import {
   message,
 } from 'antd'
 import {
-  CloseOutlined,
-  MinusOutlined,
-  RobotOutlined,
-  DragOutlined,
-  ExpandOutlined,
-  SendOutlined,
-  PauseCircleOutlined,
-  StopOutlined,
-} from '@ant-design/icons'
+  Bot,
+  GripVertical,
+  Maximize2,
+  Minus,
+  X,
+  Send,
+  Pause,
+  Square,
+} from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { api, friendlyUnavailable, isApiUnavailable } from '../api'
 import { currentRunnableStep, executeAgentStep, type AgentStep } from '../agent/domDriver'
@@ -45,9 +45,12 @@ type AgentTaskView = TaskStatus & {
   chips?: Array<{ id: string; label: string }>
 }
 
+const iconSm = { size: 16, strokeWidth: 1.75 } as const
+
 const DEFAULT_CHIPS = [
   { id: 'import_purchase_to_oa', label: '帮我导入生产部的采购申请到 OA' },
   { id: 'submit_approved_purchase', label: '处理已通过的采购申请' },
+  { id: 'create_erp_po', label: '帮我把待建 PR 创建成 ERP PO' },
   { id: 'view_current_task', label: '查看当前任务' },
   { id: 'resume_last_task', label: '继续上次任务' },
 ]
@@ -57,8 +60,13 @@ function resolveBusinessKey(pathname: string) {
   if (oa) return `OA#${oa[1]}`
   const pr = pathname.match(/^\/procurement\/(?!new$)([^/]+)/)
   if (pr) return pr[1]
+  const poCreate = pathname.match(/^\/erp\/po-create\/([^/]+)/)
+  if (poCreate) return poCreate[1]
+  const poPos = pathname.match(/^\/erp\/pos\/([^/]+)/)
+  if (poPos) return poPos[1]
   const po = pathname.match(/^\/erp\/orders\/([^/]+)/)
   if (po) return po[1]
+  if (pathname.includes('/erp/po-candidates')) return 'po-candidates'
   if (pathname.includes('/erp/workbench')) return 'workbench'
   if (pathname.includes('/erp/export')) return 'export-batch'
   if (pathname.includes('/erp/requests/new') || pathname.includes('/procurement/new')) return 'pr-draft'
@@ -290,7 +298,7 @@ export function AgentFloatingWindow() {
         aria-label="打开 Agent 浮窗"
         onClick={() => setMode('expanded')}
       >
-        <RobotOutlined />
+        <Bot size={20} strokeWidth={1.75} />
         <span className="agent-fab-dot" />
       </button>
     )
@@ -300,12 +308,12 @@ export function AgentFloatingWindow() {
     return (
       <div className="agent-float agent-float-mini" style={style} data-testid="agent-floating-window">
         <button type="button" className="agent-drag-handle" onMouseDown={onDragStart} data-testid="agent-drag-handle">
-          <DragOutlined />
+          <GripVertical {...iconSm} />
         </button>
         <Typography.Text>{task?.status || 'idle'} · {task?.task_id || '无任务'}</Typography.Text>
         <Button type="text" size="small" onClick={() => setMode('monitor')} data-testid="agent-monitor-button">监控</Button>
-        <Button type="text" size="small" icon={<ExpandOutlined />} onClick={() => setMode('expanded')} data-testid="agent-expand-button" />
-        <Button type="text" size="small" icon={<CloseOutlined />} onClick={() => setMode('collapsed')} data-testid="agent-collapse-button" />
+        <Button type="text" size="small" icon={<Maximize2 {...iconSm} />} onClick={() => setMode('expanded')} data-testid="agent-expand-button" />
+        <Button type="text" size="small" icon={<X {...iconSm} />} onClick={() => setMode('collapsed')} data-testid="agent-collapse-button" />
       </div>
     )
   }
@@ -314,18 +322,18 @@ export function AgentFloatingWindow() {
     return (
       <div className="agent-float agent-float-monitor" style={style} data-testid="agent-floating-window">
         <button type="button" className="agent-drag-handle" onMouseDown={onDragStart} data-testid="agent-drag-handle" aria-label="拖动监控条">
-          <DragOutlined />
+          <GripVertical {...iconSm} />
         </button>
-        <RobotOutlined />
+        <Bot {...iconSm} />
         <Tag color={online ? 'success' : 'default'} data-testid="agent-online-tag">{online ? '在线' : '离线'}</Tag>
         {task?.status && <Tag color={statusColor(task.status)} data-testid="agent-task-status">{task.status}</Tag>}
         <Typography.Text className="agent-monitor-step" ellipsis data-testid="agent-monitor-step">
           {currentStep ? `${currentStep.step_id} · ${currentStep.title || ''}` : (lastAssistant || '待命')}
         </Typography.Text>
         <Space size={4}>
-          <Button type="text" size="small" icon={<ExpandOutlined />} onClick={() => setMode('expanded')} data-testid="agent-expand-button">详情</Button>
-          <Button type="text" size="small" icon={<MinusOutlined />} onClick={() => setMode('minimized')} data-testid="agent-minimize-button" />
-          <Button type="text" size="small" icon={<CloseOutlined />} onClick={() => setMode('collapsed')} data-testid="agent-close-button" />
+          <Button type="text" size="small" icon={<Maximize2 {...iconSm} />} onClick={() => setMode('expanded')} data-testid="agent-expand-button">详情</Button>
+          <Button type="text" size="small" icon={<Minus {...iconSm} />} onClick={() => setMode('minimized')} data-testid="agent-minimize-button" />
+          <Button type="text" size="small" icon={<X {...iconSm} />} onClick={() => setMode('collapsed')} data-testid="agent-close-button" />
         </Space>
       </div>
     )
@@ -335,16 +343,16 @@ export function AgentFloatingWindow() {
     <div className="agent-float agent-float-panel agent-chat-panel" style={style} data-testid="agent-floating-window">
       <div className="agent-float-header" onMouseDown={onDragStart} data-testid="agent-drag-handle">
         <Space>
-          <DragOutlined />
-          <RobotOutlined />
+          <GripVertical {...iconSm} />
+          <Bot {...iconSm} />
           <strong>GUI Agent</strong>
           <Tag color={online ? 'success' : 'default'} data-testid="agent-online-tag">{online ? '在线' : '离线'}</Tag>
           {task?.status && <Tag color={statusColor(task.status)} data-testid="agent-task-status">{task.status}</Tag>}
         </Space>
         <Space>
           <Button type="text" size="small" onClick={() => setMode('monitor')} data-testid="agent-monitor-button">监控条</Button>
-          <Button type="text" size="small" icon={<MinusOutlined />} onClick={() => setMode('minimized')} data-testid="agent-minimize-button" />
-          <Button type="text" size="small" icon={<CloseOutlined />} onClick={() => setMode('collapsed')} data-testid="agent-close-button" />
+          <Button type="text" size="small" icon={<Minus {...iconSm} />} onClick={() => setMode('minimized')} data-testid="agent-minimize-button" />
+          <Button type="text" size="small" icon={<X {...iconSm} />} onClick={() => setMode('collapsed')} data-testid="agent-close-button" />
         </Space>
       </div>
       <div className="agent-float-body">
@@ -510,15 +518,15 @@ export function AgentFloatingWindow() {
             placeholder="描述你希望 Agent 完成的任务…"
             data-testid="agent-chat-input"
           />
-          <Button type="primary" icon={<SendOutlined />} loading={busy} onClick={() => void sendMessage(input)} data-testid="agent-send-button">
+          <Button type="primary" icon={<Send {...iconSm} />} loading={busy} onClick={() => void sendMessage(input)} data-testid="agent-send-button">
             发送
           </Button>
         </Space.Compact>
 
         <Space wrap className="agent-float-actions">
-          <Button icon={<PauseCircleOutlined />} onClick={() => void pause()} data-testid="agent-pause-button">暂停</Button>
+          <Button icon={<Pause {...iconSm} />} onClick={() => void pause()} data-testid="agent-pause-button">暂停</Button>
           {task?.status === 'paused' && <Button onClick={() => void resume()} data-testid="agent-resume-button">继续</Button>}
-          <Button danger icon={<StopOutlined />} onClick={() => void stop()} data-testid="agent-stop-button">停止</Button>
+          <Button danger icon={<Square {...iconSm} />} onClick={() => void stop()} data-testid="agent-stop-button">停止</Button>
           <Popconfirm title="确认重置演示数据？" onConfirm={() => void reset()}>
             <Button danger data-testid="reset-demo-button">重置演示</Button>
           </Popconfirm>

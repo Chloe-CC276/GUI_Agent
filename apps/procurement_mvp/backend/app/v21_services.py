@@ -907,6 +907,7 @@ ACTIVE_TASK_STATUSES = {
     "pending",
     "running",
     "wait_user",
+    "WAIT_USER",
     "paused",
     "partial",
     "failed",

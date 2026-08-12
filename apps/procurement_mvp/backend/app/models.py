@@ -312,8 +312,29 @@ class AgentTask(Base):
     po_no: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     executor_type: Mapped[str] = mapped_column(String(40), default="dom")
+    executor_mode: Mapped[str] = mapped_column(String(40), default="rpa")
     takeover_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+    vlm_called: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_snapshot_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    writeback_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    draft_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentBatch(Base):
+    __tablename__ = "agent_batches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="open", index=True)
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    wait_user_count: Mapped[int] = mapped_column(Integer, default=0)
+    operator: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    excel_snapshot_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AgentStepLog(Base):
@@ -322,6 +343,7 @@ class AgentStepLog(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     step_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     task_id: Mapped[str] = mapped_column(String(80), index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     step_name: Mapped[str] = mapped_column(String(80), index=True)
     expected_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     actual_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -329,7 +351,11 @@ class AgentStepLog(Base):
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     screenshot_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    screenshot_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    executor_type: Mapped[str] = mapped_column(String(40), default="rpa")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -348,6 +374,7 @@ class AgentSafetyLog(Base):
     expected: Mapped[str | None] = mapped_column(Text, nullable=True)
     actual: Mapped[str | None] = mapped_column(Text, nullable=True)
     action_taken: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    detail_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -430,6 +457,7 @@ class ERPPurchaseOrder(Base):
     total_amount_tax: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     created_by_agent_task_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     batch_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    purchase_method: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

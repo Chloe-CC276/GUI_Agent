@@ -12,6 +12,7 @@ OA_CLOSURE_VERSION = 4
 PROCUREMENT_CLOUD_VERSION = 5
 SUPPLIER_AWARD_SOURCE_VERSION = 6
 ERP_PO_AGENT_VERSION = 7
+ERP_PO_V11_VERSION = 8
 
 DEFAULT_AWARD_SOURCES = (
     ("offline_inquiry", "线下询比价"),
@@ -543,6 +544,69 @@ def migrate_erp_po_agent(engine: Engine) -> None:
                 "VALUES (:version, 'ERP PO Agent creation and dashboard schema')"
             ),
             {"version": ERP_PO_AGENT_VERSION},
+        )
+
+
+AGENT_TASK_V11_COLUMNS = {
+    "executor_mode": "VARCHAR(40) DEFAULT 'rpa'",
+    "vlm_called": "BOOLEAN NOT NULL DEFAULT 0",
+    "source_snapshot_hash": "VARCHAR(128)",
+    "writeback_status": "VARCHAR(40)",
+    "draft_json": "JSON",
+}
+
+AGENT_STEP_V11_COLUMNS = {
+    "batch_id": "VARCHAR(80)",
+    "screenshot_ref": "VARCHAR(255)",
+    "executor_type": "VARCHAR(40) DEFAULT 'rpa'",
+    "started_at": "DATETIME",
+    "ended_at": "DATETIME",
+}
+
+AGENT_SAFETY_V11_COLUMNS = {
+    "detail_json": "JSON",
+}
+
+ERP_PO_V11_COLUMNS = {
+    "purchase_method": "VARCHAR(50)",
+}
+
+
+def migrate_erp_po_v11(engine: Engine) -> None:
+    """PRD v1.1: batch table, draft/writeback/VLM-reserved fields, Excel snapshot path."""
+    with engine.begin() as connection:
+        tables = set(inspect(connection).get_table_names())
+        if "agent_tasks" in tables:
+            _add_columns(connection, "agent_tasks", AGENT_TASK_V11_COLUMNS)
+        if "agent_step_logs" in tables:
+            _add_columns(connection, "agent_step_logs", AGENT_STEP_V11_COLUMNS)
+        if "agent_safety_logs" in tables:
+            _add_columns(connection, "agent_safety_logs", AGENT_SAFETY_V11_COLUMNS)
+        if "erp_purchase_orders" in tables:
+            _add_columns(connection, "erp_purchase_orders", ERP_PO_V11_COLUMNS)
+
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS agent_batches ("
+                "id INTEGER PRIMARY KEY, "
+                "batch_id VARCHAR(80) NOT NULL UNIQUE, "
+                "status VARCHAR(40) NOT NULL DEFAULT 'open', "
+                "total_count INTEGER NOT NULL DEFAULT 0, "
+                "success_count INTEGER NOT NULL DEFAULT 0, "
+                "failed_count INTEGER NOT NULL DEFAULT 0, "
+                "wait_user_count INTEGER NOT NULL DEFAULT 0, "
+                "operator VARCHAR(80), "
+                "excel_snapshot_path VARCHAR(500), "
+                "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                "finished_at DATETIME)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT OR IGNORE INTO schema_versions(version, description) "
+                "VALUES (:version, 'ERP PO Phase1 draft/excel/writeback schema')"
+            ),
+            {"version": ERP_PO_V11_VERSION},
         )
 
 

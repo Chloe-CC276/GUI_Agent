@@ -36,6 +36,7 @@ class Database:
         from .migrations import (
             backfill_s0,
             migrate_erp_po_agent,
+            migrate_erp_po_v11,
             migrate_oa_closure,
             migrate_procurement_cloud,
             migrate_s0,
@@ -50,6 +51,7 @@ class Database:
         migrate_procurement_cloud(self.engine)
         migrate_supplier_award_sources(self.engine)
         migrate_erp_po_agent(self.engine)
+        migrate_erp_po_v11(self.engine)
         backfill_s0(self.engine)
 
     def session(self) -> Generator[Session, None, None]:

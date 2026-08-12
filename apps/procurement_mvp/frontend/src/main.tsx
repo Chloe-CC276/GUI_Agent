@@ -11,8 +11,22 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     <ConfigProvider
       locale={zhCN}
       theme={{
-        token: { colorPrimary: '#164b8f', borderRadius: 6, colorBgLayout: '#f3f6fa' },
-        components: { Layout: { headerBg: '#fff', siderBg: '#fff' } },
+        token: {
+          colorPrimary: '#164b8f',
+          borderRadius: 4,
+          colorBgLayout: '#f5f7fa',
+          colorBorder: '#d9e2ec',
+          colorText: '#1f2937',
+          colorTextSecondary: '#64748b',
+          fontFamily: '"Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+          controlHeight: 32,
+        },
+        components: {
+          Layout: { headerBg: '#ffffff', siderBg: '#ffffff', headerHeight: 56 },
+          Card: { borderRadiusLG: 4 },
+          Button: { borderRadius: 4 },
+          Tag: { borderRadiusSM: 2 },
+        },
       }}
     >
       <BrowserRouter><App /></BrowserRouter>

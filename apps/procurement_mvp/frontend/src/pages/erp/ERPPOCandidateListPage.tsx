@@ -23,18 +23,24 @@ type Candidate = {
 
 const statusOptions = [
   { value: 'WAITING_PO', label: '待建 PO' },
-  { value: 'QUEUED', label: '已入队' },
-  { value: 'RUNNING', label: '执行中' },
+  { value: 'pending', label: '已入队' },
+  { value: 'DRAFT_EDITING', label: '草稿编辑' },
+  { value: 'PRE_SAVE_VERIFY', label: '保存前校验' },
   { value: 'FAILED', label: '失败' },
   { value: 'WAIT_USER', label: '待人工' },
-  { value: 'PO_CREATED', label: '已创建' },
+  { value: 'SUCCESS', label: '已创建' },
+  { value: 'DUPLICATE_BLOCKED', label: '重复拦截' },
 ]
 
+const ENTER_DRAFT_STATUSES = new Set(['WAITING_PO', 'WAITING', 'FAILED', 'pending', 'QUEUED', 'DRAFT_EDITING'])
+
 function statusColor(status: string) {
-  if (status === 'PO_CREATED') return 'success'
-  if (status === 'FAILED') return 'error'
-  if (status === 'WAIT_USER' || status === 'WAITING_PO') return 'warning'
-  if (status === 'RUNNING' || status === 'QUEUED') return 'processing'
+  if (status === 'SUCCESS' || status === 'PO_CREATED') return 'success'
+  if (status === 'FAILED' || status === 'DUPLICATE_BLOCKED') return 'error'
+  if (status === 'WAIT_USER' || status === 'WAITING_PO' || status === 'WAITING') return 'warning'
+  if (status === 'DRAFT_EDITING' || status === 'PRE_SAVE_VERIFY' || status === 'pending' || status === 'QUEUED') {
+    return 'processing'
+  }
   return 'default'
 }
 
@@ -64,11 +70,11 @@ export function ERPPOCandidateListPage() {
   }, [status])
 
   const selectableKeys = useMemo(
-    () => rows.filter((row) => row.status === 'WAITING_PO' || row.status === 'FAILED' || row.status === 'QUEUED').map((row) => row.pr_no),
+    () => rows.filter((row) => ENTER_DRAFT_STATUSES.has(row.status) && !row.po_no).map((row) => row.pr_no),
     [rows],
   )
 
-  const createBatch = async (prNos: string[]) => {
+  const enterDraft = async (prNos: string[]) => {
     if (!prNos.length) {
       message.warning('请先勾选待建 PO 的单据')
       return
@@ -76,11 +82,11 @@ export function ERPPOCandidateListPage() {
     try {
       setCreating(true)
       const result = await api.createPOBatch({ pr_nos: prNos, operator: '采购员' })
-      message.success(`已创建批次 ${result.batch_id}`)
-      const firstRunnable = (result.tasks || []).find((item) => item.task_id && item.status === 'QUEUED')
+      message.success(`已创建批次 ${result.batch_id}（进入草稿，未创建 PO）`)
+      const firstRunnable = (result.tasks || []).find((item) => item.task_id && !item.po_no)
       await load()
       if (firstRunnable?.task_id) {
-        await api.runPOTask(firstRunnable.task_id)
+        await api.startPOTask(firstRunnable.task_id)
         navigate(`/erp/po-create/${firstRunnable.task_id}`)
       }
     } catch (e) {
@@ -95,7 +101,9 @@ export function ERPPOCandidateListPage() {
       <div className="page-title">
         <div>
           <Typography.Title level={3}>待创建 PO 列表</Typography.Title>
-          <Typography.Text type="secondary">仅展示采购云已定标且待写入 ERP 的 PR（方案 A：无采购云→ERP 业务 API）</Typography.Text>
+          <Typography.Text type="secondary">
+            进入草稿后在 ERP 建单页完成创建与回写；无采购云→ERP 建单业务 API。
+          </Typography.Text>
         </div>
       </div>
       <Card>
@@ -122,10 +130,10 @@ export function ERPPOCandidateListPage() {
             danger
             loading={creating}
             disabled={!selected.length}
-            onClick={() => void createBatch(selected)}
+            onClick={() => void enterDraft(selected)}
             data-testid="erp-batch-create-po-button"
           >
-            批量创建 PO
+            批量进入草稿
           </Button>
         </Space>
         <Table
@@ -159,13 +167,13 @@ export function ERPPOCandidateListPage() {
               title: '操作',
               render: (_, row) => (
                 <Space>
-                  {(row.status === 'WAITING_PO' || row.status === 'FAILED' || row.status === 'QUEUED') && !row.po_no ? (
+                  {ENTER_DRAFT_STATUSES.has(row.status) && !row.po_no ? (
                     <Button
                       type="link"
                       data-testid={`erp-create-po-${row.pr_no}`}
-                      onClick={() => void createBatch([row.pr_no])}
+                      onClick={() => void enterDraft([row.pr_no])}
                     >
-                      单条创建
+                      进入草稿
                     </Button>
                   ) : null}
                   {row.task_id ? (

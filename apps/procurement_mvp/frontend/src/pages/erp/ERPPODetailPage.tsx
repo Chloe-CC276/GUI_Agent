@@ -13,13 +13,49 @@ export function ERPPODetailPage() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    Promise.all([api.getPODetail(poNo), api.getPOLineage(poNo)])
-      .then(([d, l]) => {
+    let cancelled = false
+    const load = async () => {
+      setLoading(true)
+      setDetail(undefined)
+      setLineage(undefined)
+      try {
+        // Detail first — do not let lineage failure blank the whole page.
+        let d: Awaited<ReturnType<typeof api.getPODetail>> | undefined
+        try {
+          d = await api.getPODetail(poNo)
+        } catch {
+          // Fallback to classic /erp/orders/{poNo} shape
+          const order = await api.getERPOrder(poNo)
+          d = {
+            ...order,
+            total_amount_tax: order.total_amount,
+            lines: (order.lines || []).map((line) => ({
+              ...line,
+              po_item_no: line.line_no,
+              uom: line.unit,
+              unit_price_tax: line.unit_price,
+              line_amount_tax: line.line_amount,
+            })),
+          } as Awaited<ReturnType<typeof api.getPODetail>>
+        }
+        if (cancelled) return
         setDetail(d)
-        setLineage(l)
-      })
-      .catch((e) => message.error((e as Error).message))
-      .finally(() => setLoading(false))
+        try {
+          const l = await api.getPOLineage(poNo)
+          if (!cancelled) setLineage(l)
+        } catch {
+          // lineage optional
+        }
+      } catch (e) {
+        if (!cancelled) message.error((e as Error).message)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void load()
+    return () => {
+      cancelled = true
+    }
   }, [poNo])
 
   const openSteps = async () => {
@@ -48,7 +84,8 @@ export function ERPPODetailPage() {
           <Typography.Text type="secondary">采购订单头、行与 OA-PR-PO 关系链</Typography.Text>
         </div>
         <Space>
-          <Button onClick={() => navigate('/erp/po-candidates')}>返回列表</Button>
+          <Button onClick={() => navigate('/erp/orders')}>返回采购订单</Button>
+          <Button onClick={() => navigate('/erp/po-candidates')}>待建 PO</Button>
           <Button onClick={() => navigate(`/erp/dashboard?po_no=${detail.po_no}`)}>打开看板</Button>
           <Button type="primary" onClick={() => void openSteps()}>查看 Agent 轨迹</Button>
         </Space>
@@ -56,7 +93,9 @@ export function ERPPODetailPage() {
 
       <Card title="PO 基础信息" data-testid="erp-po-detail-header">
         <Descriptions column={3} bordered size="small">
-          <Descriptions.Item label="PO号">{detail.po_no}</Descriptions.Item>
+          <Descriptions.Item label="PO号">
+            <span data-testid="erp-po-created-po-no">{detail.po_no}</span>
+          </Descriptions.Item>
           <Descriptions.Item label="状态"><Tag color="success">{detail.status}</Tag></Descriptions.Item>
           <Descriptions.Item label="创建时间">{String(detail.created_at || '-')}</Descriptions.Item>
           <Descriptions.Item label="供应商">{detail.supplier_name || detail.supplier_code || '-'}</Descriptions.Item>

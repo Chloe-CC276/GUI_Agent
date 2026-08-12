@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Badge, Button, Card, Empty, Input, Space, Table, Tabs, message } from 'antd'
-import { SearchOutlined } from '@ant-design/icons'
+import { Search } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../../api'
 import type { ApprovalQueue, OARequest, OAStatusInput } from '../../types'
@@ -95,7 +95,7 @@ export function OAApprovalWorkbench() {
         <Space wrap className="filter-bar">
           <Input
             allowClear
-            prefix={<SearchOutlined />}
+            prefix={<Search size={16} strokeWidth={1.75} />}
             placeholder="申请编号、标题、申请人、部门"
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}

@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import router, s0_router, v21_router
+from .erp_po_routes import router as erp_po_router
 from .db import Database
 from .errors import install_error_handlers
 from .seed import init_database
@@ -48,7 +49,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # parameterized /procurement/requests/{request_id} on s0_router.
     app.include_router(router, prefix="/api/v1")
     app.include_router(v21_router, prefix="/api/v1")
+    app.include_router(erp_po_router, prefix="/api/v1")
     app.include_router(s0_router, prefix="/api/v1")
+    app.include_router(erp_po_router, prefix="/api", include_in_schema=False)
     app.include_router(v21_router, prefix="/api", include_in_schema=False)
     app.include_router(s0_router, prefix="/api", include_in_schema=False)
     return app

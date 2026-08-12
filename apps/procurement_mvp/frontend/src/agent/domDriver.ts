@@ -192,7 +192,12 @@ function readField(testid: string) {
   return (el.textContent || '').trim()
 }
 
-function countLines() {
+function countLines(testidPrefix?: string) {
+  if (testidPrefix) {
+    return document.querySelectorAll(`[data-testid="${testidPrefix}"]`).length
+  }
+  const erpRows = document.querySelectorAll('[data-testid="erp-po-line-row"]').length
+  if (erpRows > 0) return erpRows
   let count = 0
   while (qs(`oa-line-item-name-${count}`)) count += 1
   return count
@@ -253,6 +258,11 @@ async function act(step: AgentStep, navigate: NavigateFunction) {
     // Intentionally do not click forbidden control.
     return
   }
+  if (type === 'read_text') {
+    const testid = String(action.testid || '')
+    await waitForTestId(testid, 12000)
+    return
+  }
   if (type === 'read_draft_status' || type === 'noop' || type === 'verify_detail_payload') {
     return
   }
@@ -262,6 +272,30 @@ async function act(step: AgentStep, navigate: NavigateFunction) {
 async function verify(step: AgentStep): Promise<{ ok: boolean; actual: Record<string, unknown> }> {
   const rule = step.verify || {}
   const type = String(rule.type || '')
+  if (type === 'always') {
+    return { ok: true, actual: { always: true } }
+  }
+  if (type === 'po_created') {
+    const testid = String(rule.testid || 'erp-po-created-po-no')
+    const start = Date.now()
+    while (Date.now() - start < 15000) {
+      const el = qs(testid)
+      const text = (el?.textContent || '').trim()
+      if (text.startsWith('PO-')) {
+        return { ok: true, actual: { po_no: text, text, testid, visible: true } }
+      }
+      const pathMatch = window.location.pathname.match(/\/erp\/(?:pos|orders)\/(PO-[A-Z0-9-]+)/i)
+      if (pathMatch) {
+        return { ok: true, actual: { po_no: pathMatch[1], text: pathMatch[1], testid, visible: Boolean(el), path: window.location.pathname } }
+      }
+      const bodyHit = (document.body.innerText || '').match(/PO-2026-[A-Z0-9]+/i)
+      if (bodyHit) {
+        return { ok: true, actual: { po_no: bodyHit[0], text: bodyHit[0], testid, visible: Boolean(el) } }
+      }
+      await sleep(200)
+    }
+    return { ok: false, actual: { po_no: null, testid, visible: false } }
+  }
   if (type === 'testid_visible') {
     const testid = String(rule.testid || '')
     try {
@@ -286,8 +320,9 @@ async function verify(step: AgentStep): Promise<{ ok: boolean; actual: Record<st
     return { ok, actual: { fields: actualFields } }
   }
   if (type === 'line_count_at_least') {
-    const count = countLines()
-    return { ok: count >= Number(rule.count || 0), actual: { count } }
+    const prefix = rule.testid ? String(rule.testid) : undefined
+    const count = countLines(prefix)
+    return { ok: count >= Number(rule.count || 0), actual: { count, testid: prefix } }
   }
   if (type === 'url_matches') {
     const pattern = new RegExp(String(rule.pattern || '.*'))

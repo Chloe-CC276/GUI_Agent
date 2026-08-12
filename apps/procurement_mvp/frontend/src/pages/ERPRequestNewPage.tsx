@@ -22,7 +22,7 @@ import {
   message,
 } from 'antd'
 import type { UploadFile } from 'antd'
-import { CloudUploadOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons'
+import { CloudUpload, Plus, Trash2 } from 'lucide-react'
 import dayjs from 'dayjs'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, friendlyUnavailable, isApiUnavailable } from '../api'
@@ -293,9 +293,9 @@ export function ERPRequestNewPage() {
           extra={
             <Space>
               <Upload accept=".xlsx" showUploadList={false} beforeUpload={(file) => { void onImportUpload(file); return false }}>
-                <Button icon={<CloudUploadOutlined />} data-testid="excel-import-button">从 Excel 导入</Button>
+                <Button icon={<CloudUpload size={16} strokeWidth={1.75} />} data-testid="excel-import-button">从 Excel 导入</Button>
               </Upload>
-              <Button icon={<PlusOutlined />} onClick={addLine} data-testid="add-material-line">添加物品</Button>
+              <Button icon={<Plus size={16} strokeWidth={1.75} />} onClick={addLine} data-testid="add-material-line">添加物品</Button>
             </Space>
           }
         >
@@ -328,7 +328,7 @@ export function ERPRequestNewPage() {
               <InputNumber min={0} precision={2} value={line.unit_price as number | undefined} onChange={(v) => updateLine(line.line_no, { unit_price: v ?? undefined })} />
               <strong>¥{lineAmount(line).toFixed(2)}</strong>
               <Popconfirm title="删除该物资行？" onConfirm={() => removeLine(line.line_no)}>
-                <Button danger type="text" icon={<DeleteOutlined />} disabled={lines.length === 1} />
+                <Button danger type="text" icon={<Trash2 size={16} strokeWidth={1.75} />} disabled={lines.length === 1} />
               </Popconfirm>
             </div>
           ))}
@@ -337,7 +337,7 @@ export function ERPRequestNewPage() {
         </Card>
         <Card title="附件" className="section-card">
           <Upload.Dragger fileList={files} onChange={({ fileList }) => setFiles(fileList)} beforeUpload={() => false} multiple>
-            <CloudUploadOutlined className="upload-icon" />
+            <CloudUpload className="upload-icon" size={28} strokeWidth={1.5} />
             <p>附件仅生成 demo:// 引用</p>
           </Upload.Dragger>
         </Card>

@@ -315,3 +315,106 @@ def build_submit_approved_steps(
             expected="APPROVED + PREPARING + 采购准备中",
         ),
     ]
+
+
+def build_create_erp_po_gui_steps(
+    *,
+    pr_no: str,
+    task_id: str,
+    form: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """DOM steps for Scheme A: Agent fills ERP create page (no procurement→ERP business API)."""
+    header = form.get("header") or {}
+    lines = form.get("lines") or []
+    route = f"/erp/po-create/{task_id}"
+    fields = [
+        {"testid": "erp-po-supplier", "value": str(header.get("supplier_name") or "")},
+        {"testid": "erp-po-supplier-code", "value": str(header.get("supplier_code") or "")},
+        {"testid": "erp-po-purchasing-org", "value": str(header.get("purchasing_org") or "1000")},
+        {"testid": "erp-po-purchasing-group", "value": str(header.get("purchasing_group") or "P01")},
+        {"testid": "erp-po-currency", "value": str(header.get("currency_code") or "CNY")},
+        {"testid": "erp-po-payment-terms", "value": str(header.get("payment_terms") or "NET30")},
+        {"testid": "erp-po-request-dept", "value": str(header.get("request_dept") or "")},
+        {"testid": "erp-po-buyer", "value": str(header.get("buyer_id") or "BUYER-01")},
+    ]
+    line_fields: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        line_fields.extend(
+            [
+                {
+                    "testid": f"erp-po-line-material-{index}",
+                    "value": str(line.get("material_code") or ""),
+                },
+                {
+                    "testid": f"erp-po-line-qty-{index}",
+                    "value": str(line.get("quantity") or ""),
+                    "input_type": "number",
+                },
+                {
+                    "testid": f"erp-po-line-price-{index}",
+                    "value": str(line.get("unit_price_tax") or line.get("unit_price") or ""),
+                    "input_type": "number",
+                },
+            ]
+        )
+    return [
+        _step(
+            "READ_PR_DATA",
+            title=f"确认待建 PR {pr_no}",
+            action={"type": "noop", "pr_no": pr_no},
+            verify={"type": "always"},
+            expected=f"PR {pr_no} ready for ERP GUI create",
+        ),
+        _step(
+            "OPEN_ERP_FORM",
+            title="打开 ERP 建单草稿页",
+            action={"type": "navigate", "path": route},
+            verify={"type": "testid_visible", "testid": "erp-po-create-form"},
+            expected="ERP create form visible",
+        ),
+        _step(
+            "FILL_HEADER",
+            title="填写 PO Header",
+            action={"type": "fill_fields", "fields": fields},
+            verify={
+                "type": "fields_equals",
+                "fields": [
+                    {"testid": "erp-po-supplier", "value": str(header.get("supplier_name") or "")},
+                    {"testid": "erp-po-purchasing-org", "value": str(header.get("purchasing_org") or "1000")},
+                ],
+            },
+            expected="header fields match",
+        ),
+        _step(
+            "FILL_LINES",
+            title="填写物资行",
+            action={"type": "fill_fields", "fields": line_fields},
+            verify={
+                "type": "line_count_at_least",
+                "count": max(len(lines), 1),
+                "testid": "erp-po-line-row",
+            },
+            expected=f"line count >= {len(lines)}",
+        ),
+        _step(
+            "PRE_SAVE_VERIFY",
+            title="保存前校验",
+            action={"type": "click", "testid": "erp-po-verify-button"},
+            verify={"type": "always"},
+            expected="pre-save verify clicked",
+        ),
+        _step(
+            "SAVE_PO",
+            title="保存并创建 PO",
+            action={"type": "click", "testid": "erp-po-create-button"},
+            verify={"type": "po_created", "pr_no": pr_no, "testid": "erp-po-created-po-no"},
+            expected="PO created and po_no readable",
+        ),
+        _step(
+            "READ_BACK_PO_NO",
+            title="回读 PO 号",
+            action={"type": "read_text", "testid": "erp-po-created-po-no", "pr_no": pr_no},
+            verify={"type": "po_created", "pr_no": pr_no, "testid": "erp-po-created-po-no"},
+            expected="po_no non-empty",
+        ),
+    ]

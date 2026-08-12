@@ -77,6 +77,44 @@ export const friendlyUnavailable = (feature: string, error?: unknown) => {
   return `${feature}接口暂未就绪${detail ? `（${detail}）` : ''}，请稍后重试或确认后端已启动对应能力。`
 }
 
+const isNotFound = (error: unknown) => {
+  const status = (error as { response?: { status?: number } })?.response?.status
+  if (status === 404) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /404|Not Found/i.test(message)
+}
+
+async function getFirstAvailable<T>(paths: string[], config?: { params?: Record<string, unknown> }): Promise<T> {
+  let lastError: unknown
+  for (const path of paths) {
+    try {
+      const response = await client.get<T>(path, config)
+      return response.data
+    } catch (error) {
+      lastError = error
+      if (!isNotFound(error)) throw error
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Not Found')
+}
+
+async function postFirstAvailable<T>(
+  paths: string[],
+  payload?: unknown,
+): Promise<T> {
+  let lastError: unknown
+  for (const path of paths) {
+    try {
+      const response = await client.post<T>(path, payload)
+      return response.data
+    } catch (error) {
+      lastError = error
+      if (!isNotFound(error)) throw error
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Not Found')
+}
+
 export const client = axios.create({ baseURL: API_BASE, timeout: 15000 })
 client.interceptors.response.use(
   (response) => {
@@ -194,8 +232,19 @@ export const api = {
     client.post<ProcurementRequest & { confirmation_token: string }>(`/procurement/requests/${id}/prepare-submit`, payload).then((r) => r.data),
   confirmSubmit: (id: number, payload: { task_id: string; business_key: string; confirmation_token: string }) =>
     client.post<ProcurementRequest>(`/procurement/requests/${id}/confirm-submit`, payload).then((r) => r.data),
-  listERPOrders: (params?: { po_no?: string; pr_no?: string; oa_apply_no?: string; status?: string }) =>
-    client.get<PageResult<ERPOrder>>('/erp/orders', { params }).then((r) => r.data),
+  listERPOrders: (params?: {
+    po_no?: string
+    pr_no?: string
+    oa_apply_no?: string
+    status?: string
+    page?: number
+    page_size?: number
+  }) =>
+    client
+      .get<PageResult<ERPOrder>>('/erp/orders', {
+        params: { page: 1, page_size: 100, ...params },
+      })
+      .then((r) => r.data),
   getERPOrder: (poNo: string) => client.get<ERPOrder>(`/erp/orders/${poNo}`).then((r) => r.data),
   listTransfers: (params?: { business_key?: string }) =>
     client.get<PageResult<Transfer>>('/integration/transfers', { params }).then((r) => r.data),
@@ -373,50 +422,75 @@ export const api = {
     client.post<TaskStatus>(`/agent/tasks/${taskId}/stop`).then((r) => r.data),
 
   listPOCandidates: (params?: { status?: string; q?: string; page?: number; page_size?: number }) =>
-    client.get<PageResult<Record<string, unknown> & { pr_no: string; status: string }>>('/erp/po-candidates', { params }).then((r) => r.data),
+    getFirstAvailable<PageResult<Record<string, unknown> & { pr_no: string; status: string }>>(
+      ['/procurement/erp-po-candidates', '/erp/po-candidates'],
+      { params },
+    ),
   createPOBatch: (payload: { pr_nos: string[]; operator?: string }) =>
-    client.post<{
+    postFirstAvailable<{
       batch_id: string
+      excel_snapshot_path?: string
       tasks: Array<{ task_id?: string | null; pr_no: string; status: string; po_no?: string | null; route?: string }>
-    }>('/erp/po-tasks/batch', payload).then((r) => r.data),
+    }>(['/erp/po-batches', '/erp/po-tasks/batch'], payload),
+  /** v1.1: enter PREPARING -> DRAFT_EDITING (does not create PO). Alias of startPOTask. */
   runPOTask: (taskId: string) =>
-    client.post<Record<string, unknown>>(`/erp/po-tasks/${taskId}/run`).then((r) => r.data),
+    postFirstAvailable<Record<string, unknown>>([`/erp/po-tasks/${taskId}/start`, `/erp/po-tasks/${taskId}/run`]),
+  startPOTask: (taskId: string) =>
+    postFirstAvailable<Record<string, unknown>>([`/erp/po-tasks/${taskId}/start`, `/erp/po-tasks/${taskId}/run`]),
   getPOTask: (taskId: string) =>
     client.get<Record<string, unknown>>(`/erp/po-tasks/${taskId}`).then((r) => r.data),
   getPOCreateContext: (reference: string) =>
-    client.get<{
-      task_id?: string | null
-      pr_no: string
-      status?: string
-      po_no?: string | null
-      steps?: Array<{ step_id: string; title?: string; status?: string }>
-      form?: {
-        header?: Record<string, unknown>
-        lines?: Array<Record<string, unknown>>
-        oa_apply_no?: string
-        award_confirmed_at?: string
-        purchase_method?: string
-      }
-      source?: {
-        oa_apply_no?: string
-        award_confirmed_at?: string
-        purchase_method?: string
-      }
-    }>(`/erp/po-create-context/${reference}`).then((r) => r.data),
+    client
+      .get<{
+        task_id?: string | null
+        pr_no: string
+        status?: string
+        po_no?: string | null
+        steps?: Array<{ step_id: string; title?: string; status?: string }>
+        form?: {
+          header?: Record<string, unknown>
+          lines?: Array<Record<string, unknown>>
+          oa_apply_no?: string
+          award_confirmed_at?: string
+          purchase_method?: string
+        }
+        source?: {
+          oa_apply_no?: string
+          award_confirmed_at?: string
+          purchase_method?: string
+        }
+      }>(`/erp/po-create-context/${reference}`)
+      .then((r) => r.data),
+  savePODraft: (taskId: string, payload: { header: Record<string, unknown>; lines: Array<Record<string, unknown>> }) =>
+    client.post<Record<string, unknown>>(`/erp/po-tasks/${taskId}/save-draft`, payload).then((r) => r.data),
+  preSaveVerifyPO: (taskId: string, payload: { header: Record<string, unknown>; lines: Array<Record<string, unknown>> }) =>
+    client
+      .post<{
+        passed: boolean
+        errors?: Array<{ code?: string; message?: string }>
+        draft_total?: string | number
+        status?: string
+      }>(`/erp/po-tasks/${taskId}/pre-save-verify`, payload)
+      .then((r) => r.data),
+  /** v1.1: save-and-create (pre-verify -> save -> readback -> writeback). */
   createPOFromForm: (
     taskId: string,
     payload: { header: Record<string, unknown>; lines: Array<Record<string, unknown>>; simulate_readback_fail?: boolean },
   ) =>
-    client.post<{ task_id: string; pr_no: string; po_no: string; status: string; order?: ERPOrder }>(
-      `/erp/po-tasks/${taskId}/create-po`,
-      payload,
-    ).then((r) => r.data),
+    postFirstAvailable<{
+      task_id: string
+      pr_no: string
+      po_no: string
+      status: string
+      writeback_status?: string
+      order?: ERPOrder
+    }>([`/erp/po-tasks/${taskId}/save-and-create`, `/erp/po-tasks/${taskId}/create-po`], payload),
   markPOCreated: (
     taskId: string,
     payload: { po_no?: string; success?: boolean; error_code?: string; message?: string },
   ) => client.post<Record<string, unknown>>(`/erp/po-tasks/${taskId}/mark-created`, payload).then((r) => r.data),
   getPODetail: (poNo: string) =>
-    client.get<{
+    getFirstAvailable<{
       po_no: string
       pr_no: string
       oa_apply_no?: string
@@ -441,33 +515,42 @@ export const api = {
         error_code?: string | null
         executor_type?: string | null
       }
-    }>(`/erp/pos/${poNo}`).then((r) => r.data),
+    }>([`/erp/pos/${poNo}`, `/erp/orders/${poNo}`, `/erp/purchase-orders/${poNo}`]),
   getPOLineage: (poNo: string) =>
-    client.get<Lineage & { batch_id?: string }>(`/erp/pos/${poNo}/lineage`).then((r) => r.data),
+    getFirstAvailable<Lineage & { batch_id?: string }>([
+      `/erp/pos/${poNo}/lineage`,
+      `/erp/orders/${poNo}/lineage`,
+    ]),
   getAgentDashboardSummary: (params?: { date_from?: string; date_to?: string; department?: string; batch_id?: string }) =>
-    client.get<Record<string, number>>('/erp/agent-dashboard/summary', { params }).then((r) => r.data),
+    client.get<Record<string, number>>('/erp/dashboard/agent/summary', { params }).then((r) => r.data),
   getAgentDashboardFunnel: (params?: { date_from?: string; date_to?: string; batch_id?: string }) =>
-    client.get<Record<string, number>>('/erp/agent-dashboard/funnel', { params }).then((r) => r.data),
-  getAgentDashboardEvents: (params?: { event_type?: string; severity?: string; stage?: string; task_id?: string; page?: number; page_size?: number }) =>
-    client.get<PageResult<Record<string, unknown>>>('/erp/agent-dashboard/events', { params }).then((r) => r.data),
+    client.get<Record<string, number>>('/erp/dashboard/agent/funnel', { params }).then((r) => r.data),
+  getAgentDashboardEvents: (params?: {
+    event_type?: string
+    severity?: string
+    stage?: string
+    task_id?: string
+    page?: number
+    page_size?: number
+  }) => client.get<PageResult<Record<string, unknown>>>('/erp/dashboard/agent/security-events', { params }).then((r) => r.data),
   getAgentDashboardTasks: (params?: { status?: string; batch_id?: string; pr_no?: string; po_no?: string }) =>
-    client.get<{ items: Array<Record<string, unknown>> }>('/erp/agent-dashboard/tasks', { params }).then((r) => r.data),
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/dashboard/agent/tasks', { params }).then((r) => r.data),
   getAgentDashboardTaskSteps: (taskId: string) =>
-    client.get<{ items: Array<Record<string, unknown>> }>(`/erp/agent-dashboard/tasks/${taskId}/steps`).then((r) => r.data),
+    client.get<{ items: Array<Record<string, unknown>> }>(`/erp/agent/tasks/${taskId}/steps`).then((r) => r.data),
   retryAgentDashboardTask: (taskId: string) =>
     client.post<Record<string, unknown>>(`/erp/agent-dashboard/tasks/${taskId}/retry`).then((r) => r.data),
   stopAgentDashboardBatch: (batchId: string) =>
     client.post<Record<string, unknown>>(`/erp/agent-dashboard/batches/${batchId}/stop`).then((r) => r.data),
   getPODashboardSummary: (params?: { date_from?: string; date_to?: string; department?: string; supplier?: string }) =>
-    client.get<Record<string, number | string>>('/erp/po-dashboard/summary', { params }).then((r) => r.data),
+    client.get<Record<string, number | string>>('/erp/dashboard/po/summary', { params }).then((r) => r.data),
   getPODashboardTrend: (params?: { grain?: string; date_from?: string; date_to?: string }) =>
-    client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/trend', { params }).then((r) => r.data),
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/dashboard/po/trend', { params }).then((r) => r.data),
   getPODashboardByDepartment: (params?: { metric?: string }) =>
-    client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/by-department', { params }).then((r) => r.data),
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/dashboard/po/by-department', { params }).then((r) => r.data),
   getPODashboardBySupplier: (params?: { limit?: number; metric?: string }) =>
-    client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/by-supplier', { params }).then((r) => r.data),
+    client.get<{ items: Array<Record<string, unknown>> }>('/erp/dashboard/po/by-supplier', { params }).then((r) => r.data),
   getPODashboardByMaterial: (params?: { limit?: number; metric?: string }) =>
     client.get<{ items: Array<Record<string, unknown>> }>('/erp/po-dashboard/by-material', { params }).then((r) => r.data),
   getPODashboardRecent: (params?: { page?: number; page_size?: number; status?: string }) =>
-    client.get<PageResult<Record<string, unknown>>>('/erp/po-dashboard/recent-pos', { params }).then((r) => r.data),
+    client.get<PageResult<Record<string, unknown>>>('/erp/purchase-orders', { params }).then((r) => r.data),
 }

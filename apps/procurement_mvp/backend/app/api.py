@@ -73,7 +73,9 @@ from .schemas import (
     UpdateDraftInput,
     POBatchCreateInput,
     POCreateFormInput,
+    POLinkInput,
     POMarkCreatedInput,
+    POUserResponseInput,
 )
 from .agent_runtime import (
     continue_agent_task,
@@ -121,6 +123,7 @@ from .v21_services import (
     workbench_summary,
 )
 from .erp_po_services import (
+    agent_dashboard_errors,
     agent_dashboard_events,
     agent_dashboard_funnel,
     agent_dashboard_summary,
@@ -128,21 +131,32 @@ from .erp_po_services import (
     agent_task_steps,
     create_po_batch,
     create_po_from_erp_form,
+    get_batch_excel_path,
     get_create_context,
     get_po_detail,
     get_po_lineage,
     get_po_task,
+    link_po_to_procurement,
     list_po_candidates,
     mark_po_created,
+    pause_po_task,
     po_dashboard_by_department,
     po_dashboard_by_material,
+    po_dashboard_by_method,
     po_dashboard_by_supplier,
     po_dashboard_summary,
     po_dashboard_trend,
+    pre_save_verify,
     recent_pos,
+    resume_po_task,
     retry_po_task,
+    retry_upstream_writeback,
     run_po_task,
+    save_po_draft,
+    start_po_task,
     stop_batch,
+    stop_po_task,
+    user_response_po_task,
 )
 
 router = APIRouter()
@@ -524,7 +538,7 @@ def list_erp_orders(
     po_no: str | None = None,
     status: str | None = None,
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(100, ge=1, le=500),
     session: Session = Depends(get_session),
 ) -> ApiResponse:
     filters = []
@@ -1210,298 +1224,5 @@ def demo_state(session: Session = Depends(get_session)) -> ApiResponse:
     return response({"counts": counts, "oa_statuses": oa_statuses})
 
 
-def _parse_optional_dt(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise AppError(422, "INVALID_DATE", f"Invalid datetime: {value}") from exc
 
-
-@s0_router.get("/erp/po-candidates", response_model=ApiResponse)
-def get_po_candidates(
-    status: str | None = None,
-    q: str | None = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    items, total = list_po_candidates(
-        session, status=status, q=q, page=page, page_size=page_size
-    )
-    return response(page_payload(items, total, page, page_size))
-
-
-@s0_router.post("/erp/po-tasks/batch", response_model=ApiResponse)
-def post_po_tasks_batch(
-    payload: POBatchCreateInput,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    result = create_po_batch(session, payload.pr_nos, operator=payload.operator)
-    return response(result)
-
-
-@s0_router.post("/erp/po-tasks/{task_id}/run", response_model=ApiResponse)
-def post_po_task_run(task_id: str, session: Session = Depends(get_session)) -> ApiResponse:
-    return response(run_po_task(session, task_id))
-
-
-@s0_router.get("/erp/po-tasks/{task_id}", response_model=ApiResponse)
-def get_po_task_status(task_id: str, session: Session = Depends(get_session)) -> ApiResponse:
-    return response(get_po_task(session, task_id))
-
-
-@s0_router.get("/erp/po-create-context/{reference}", response_model=ApiResponse)
-def get_po_create_context(
-    reference: str, session: Session = Depends(get_session)
-) -> ApiResponse:
-    return response(get_create_context(session, reference))
-
-
-@s0_router.post("/erp/po-tasks/{task_id}/create-po", response_model=ApiResponse)
-def post_create_po_from_form(
-    task_id: str,
-    payload: POCreateFormInput,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    result = create_po_from_erp_form(
-        session,
-        task_id,
-        header=payload.header,
-        lines=payload.lines,
-        simulate_readback_fail=payload.simulate_readback_fail,
-    )
-    order = result.pop("order", None)
-    data = {
-        **result,
-        "order": PurchaseOrderOut.model_validate(order) if order is not None else None,
-    }
-    return response(data, task_id, result.get("pr_no"))
-
-
-@s0_router.post("/erp/po-tasks/{task_id}/mark-created", response_model=ApiResponse)
-def post_mark_po_created(
-    task_id: str,
-    payload: POMarkCreatedInput,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        mark_po_created(
-            session,
-            task_id,
-            po_no=payload.po_no,
-            success=payload.success,
-            error_code=payload.error_code,
-            message=payload.message,
-        )
-    )
-
-
-@s0_router.get("/erp/pos/{po_no}", response_model=ApiResponse)
-def get_erp_pos(po_no: str, session: Session = Depends(get_session)) -> ApiResponse:
-    return response(get_po_detail(session, po_no))
-
-
-@s0_router.get("/erp/pos/{po_no}/lineage", response_model=ApiResponse)
-def get_erp_pos_lineage(po_no: str, session: Session = Depends(get_session)) -> ApiResponse:
-    payload = get_po_lineage(session, po_no)
-    transfers = payload.get("transfers") or []
-    payload["transfers"] = [TransferOut.model_validate(item) for item in transfers]
-    return response(payload)
-
-
-@s0_router.get("/erp/agent-dashboard/summary", response_model=ApiResponse)
-def get_agent_dashboard_summary(
-    date_from: str | None = None,
-    date_to: str | None = None,
-    department: str | None = None,
-    batch_id: str | None = None,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        agent_dashboard_summary(
-            session,
-            date_from=_parse_optional_dt(date_from),
-            date_to=_parse_optional_dt(date_to),
-            department=department,
-            batch_id=batch_id,
-        )
-    )
-
-
-@s0_router.get("/erp/agent-dashboard/funnel", response_model=ApiResponse)
-def get_agent_dashboard_funnel(
-    date_from: str | None = None,
-    date_to: str | None = None,
-    batch_id: str | None = None,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        agent_dashboard_funnel(
-            session,
-            date_from=_parse_optional_dt(date_from),
-            date_to=_parse_optional_dt(date_to),
-            batch_id=batch_id,
-        )
-    )
-
-
-@s0_router.get("/erp/agent-dashboard/events", response_model=ApiResponse)
-def get_agent_dashboard_events(
-    event_type: str | None = None,
-    severity: str | None = None,
-    stage: str | None = None,
-    task_id: str | None = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    rows, total = agent_dashboard_events(
-        session,
-        event_type=event_type,
-        severity=severity,
-        stage=stage,
-        task_id=task_id,
-        page=page,
-        page_size=page_size,
-    )
-    items = [
-        {
-            "event_id": row.event_id,
-            "task_id": row.task_id,
-            "batch_id": row.batch_id,
-            "pr_no": row.pr_no,
-            "po_no": row.po_no,
-            "stage": row.stage,
-            "event_type": row.event_type,
-            "severity": row.severity,
-            "expected": row.expected,
-            "actual": row.actual,
-            "action_taken": row.action_taken,
-            "retry_count": row.retry_count,
-            "created_at": row.created_at,
-        }
-        for row in rows
-    ]
-    return response(page_payload(items, total, page, page_size))
-
-
-@s0_router.get("/erp/agent-dashboard/tasks", response_model=ApiResponse)
-def get_agent_dashboard_tasks(
-    status: str | None = None,
-    batch_id: str | None = None,
-    pr_no: str | None = None,
-    po_no: str | None = None,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        {
-            "items": agent_dashboard_tasks(
-                session, status=status, batch_id=batch_id, pr_no=pr_no, po_no=po_no
-            )
-        }
-    )
-
-
-@s0_router.get("/erp/agent-dashboard/tasks/{task_id}/steps", response_model=ApiResponse)
-def get_agent_dashboard_task_steps(
-    task_id: str, session: Session = Depends(get_session)
-) -> ApiResponse:
-    return response({"items": agent_task_steps(session, task_id)})
-
-
-@s0_router.post("/erp/agent-dashboard/tasks/{task_id}/retry", response_model=ApiResponse)
-def post_agent_dashboard_task_retry(
-    task_id: str, session: Session = Depends(get_session)
-) -> ApiResponse:
-    return response(retry_po_task(session, task_id))
-
-
-@s0_router.post("/erp/agent-dashboard/batches/{batch_id}/stop", response_model=ApiResponse)
-def post_agent_dashboard_batch_stop(
-    batch_id: str, session: Session = Depends(get_session)
-) -> ApiResponse:
-    return response(stop_batch(session, batch_id))
-
-
-@s0_router.get("/erp/po-dashboard/summary", response_model=ApiResponse)
-def get_po_dashboard_summary(
-    date_from: str | None = None,
-    date_to: str | None = None,
-    department: str | None = None,
-    supplier: str | None = None,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        po_dashboard_summary(
-            session,
-            date_from=_parse_optional_dt(date_from),
-            date_to=_parse_optional_dt(date_to),
-            department=department,
-            supplier=supplier,
-        )
-    )
-
-
-@s0_router.get("/erp/po-dashboard/trend", response_model=ApiResponse)
-def get_po_dashboard_trend(
-    grain: str = Query("day"),
-    date_from: str | None = None,
-    date_to: str | None = None,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        {
-            "items": po_dashboard_trend(
-                session,
-                grain=grain,
-                date_from=_parse_optional_dt(date_from),
-                date_to=_parse_optional_dt(date_to),
-            )
-        }
-    )
-
-
-@s0_router.get("/erp/po-dashboard/by-department", response_model=ApiResponse)
-def get_po_dashboard_by_department(
-    metric: str = Query("amount"),
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response({"items": po_dashboard_by_department(session, metric=metric)})
-
-
-@s0_router.get("/erp/po-dashboard/by-supplier", response_model=ApiResponse)
-def get_po_dashboard_by_supplier(
-    limit: int = Query(10, ge=1, le=50),
-    metric: str = Query("amount"),
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        {"items": po_dashboard_by_supplier(session, limit=limit, metric=metric)}
-    )
-
-
-@s0_router.get("/erp/po-dashboard/by-material", response_model=ApiResponse)
-def get_po_dashboard_by_material(
-    limit: int = Query(10, ge=1, le=50),
-    metric: str = Query("amount"),
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    return response(
-        {"items": po_dashboard_by_material(session, limit=limit, metric=metric)}
-    )
-
-
-@s0_router.get("/erp/po-dashboard/recent-pos", response_model=ApiResponse)
-def get_po_dashboard_recent(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    status: str | None = None,
-    session: Session = Depends(get_session),
-) -> ApiResponse:
-    items, total = recent_pos(session, page=page, page_size=page_size, status=status)
-    return response(page_payload(items, total, page, page_size))
+# ERP PO / dashboard routes live in erp_po_routes.py (PRD v1.1 + aliases).

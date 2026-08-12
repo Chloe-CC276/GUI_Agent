@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Button, Card, Empty, Input, Select, Space, Table, message } from 'antd'
-import { PlusOutlined, SearchOutlined } from '@ant-design/icons'
+import { Plus, Search } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../../api'
 import { oaStatusOptions, procurementStatusOptions } from '../../config'
@@ -56,7 +56,7 @@ export function OAListPage() {
         extra={
           <Button
             type="primary"
-            icon={<PlusOutlined />}
+            icon={<Plus size={16} strokeWidth={1.75} />}
             onClick={() => navigate('/oa/applications/new')}
             data-testid="oa-create-button"
           >
@@ -68,7 +68,7 @@ export function OAListPage() {
         <Space wrap className="filter-bar">
           <Input
             allowClear
-            prefix={<SearchOutlined />}
+            prefix={<Search size={16} strokeWidth={1.75} />}
             placeholder="申请编号、标题、申请人"
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}

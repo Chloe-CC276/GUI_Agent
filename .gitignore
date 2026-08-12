@@ -28,6 +28,7 @@ external/
 
 # LoRA / 模型调优本地产物
 lora_tuning/
+.cursor/
 
 # Colab / 远程评测本地产物（不入库）
 requirements-colab-adapter.txt

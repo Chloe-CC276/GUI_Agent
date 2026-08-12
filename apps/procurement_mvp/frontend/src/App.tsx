@@ -27,11 +27,12 @@ import {
 } from 'antd'
 import type { UploadFile } from 'antd'
 import {
-  CloudUploadOutlined,
-  DeleteOutlined,
-  PlusOutlined,
-  RobotOutlined,
-} from '@ant-design/icons'
+  CloudUpload,
+  Plus,
+  Bot,
+  Building2,
+  Trash2,
+} from 'lucide-react'
 import {
   Navigate,
   Outlet,
@@ -100,8 +101,13 @@ export function EnterpriseLayout() {
     <Layout className="app-shell" data-testid="enterprise-layout">
       <Header className="app-topbar">
         <div className="brand brand-inline" data-testid="brand">
-          <div className="brand-mark">企</div>
-          <div><strong>智慧采购助手</strong><small>PROCUREMENT AI</small></div>
+          <div className="brand-mark" aria-hidden>
+            <Building2 size={18} strokeWidth={1.75} />
+          </div>
+          <div>
+            <strong>企业采购平台</strong>
+            <small>OA · 采购云 · ERP</small>
+          </div>
         </div>
         <nav className="system-tabs" data-testid="main-navigation">
           {systemTabs.map((tab) => (
@@ -116,7 +122,7 @@ export function EnterpriseLayout() {
             </button>
           ))}
         </nav>
-        <Typography.Text type="secondary" className="topbar-meta">安全 · 合规 · 可追溯</Typography.Text>
+        <Typography.Text type="secondary" className="topbar-meta">操作可追溯</Typography.Text>
       </Header>
       <div
         key={subnavKey}
@@ -310,15 +316,17 @@ function ProcurementListPage() {
           {
             title: '操作',
             render: (_, row) => {
-              const awarded = row.procurement_status === 'AWARDED' || Boolean(row.po_no)
+              // Lock by THIS PR's ERP progress — not OA-level AWARDED (avoids freezing duplicate PRs).
+              const erpDone = Boolean(row.po_no)
+                || ['WAITING_PO', 'SUCCESS', 'DRAFT_EDITING', 'QUEUED', 'SENDING'].includes(String(row.erp_sync_status || ''))
               return (
                 <Space>
                   <Button
                     type="link"
                     onClick={() => navigate(`/procurement/requests/${row.request_no}`)}
-                    data-testid={awarded ? `procurement-view-${row.request_no}` : `procurement-continue-${row.request_no}`}
+                    data-testid={erpDone ? `procurement-view-${row.request_no}` : `procurement-continue-${row.request_no}`}
                   >
-                    {awarded ? '查看详情' : '继续准备'}
+                    {erpDone ? '查看详情' : '继续准备'}
                   </Button>
                   {row.po_no ? (
                     <Button
@@ -368,10 +376,18 @@ function ProcurementDetailPage() {
       }
     }).catch(() => undefined)
   }, [prNo])
-  const readOnly = Boolean(record?.po_no)
-    || record?.procurement_status === 'AWARDED'
-    || record?.erp_sync_status === 'WAITING_PO'
-    || record?.status === 'submitted'
+  // Only lock THIS PR after它进入待建PO/已建PO；勿用 OA.procurement_status=AWARDED 锁死未提交的重复 PR。
+  const waitingPo = record?.erp_sync_status === 'WAITING_PO'
+  const hasPo = Boolean(record?.po_no) || record?.erp_sync_status === 'SUCCESS'
+  const readOnly = hasPo || waitingPo
+  const siblingPrNo = lineage?.pr_no && lineage.pr_no !== record?.request_no ? lineage.pr_no : null
+  const looksLikeDuplicate = Boolean(
+    siblingPrNo
+    && record
+    && !hasPo
+    && !waitingPo
+    && (record.procurement_status === 'AWARDED' || record.erp_sync_status === 'NOT_SENT'),
+  )
   const searchMaterials = async (search: string) => {
     try { setMaterials((await api.listMaterials({ search, page_size: 100 })).items.filter((item) => item.status === 'active')) }
     catch (e) { message.error((e as Error).message) }
@@ -626,6 +642,25 @@ function ProcurementDetailPage() {
         <Descriptions.Item label="确认人">{record.award_confirmed_by || '-'}</Descriptions.Item>
       </Descriptions>
     </Card>
+    {looksLikeDuplicate && siblingPrNo ? (
+      <Alert
+        className="section-card"
+        type="warning"
+        showIcon
+        data-testid="procurement-duplicate-pr-alert"
+        message="检测到同一 OA 下另有已提交 ERP 的 PR"
+        description={
+          <span>
+            当前单 {record.request_no} 尚未进入待建 PO（erp_sync_status={record.erp_sync_status || 'NOT_SENT'}）。
+            你之前定标提交的是{' '}
+            <Button type="link" style={{ padding: 0 }} onClick={() => navigate(`/procurement/requests/${siblingPrNo}`)}>
+              {siblingPrNo}
+            </Button>
+            ，请到该单继续，或去「待建 PO」创建订单。本单多为重复创建，不是状态回退。
+          </span>
+        }
+      />
+    ) : null}
     <Card title="F. 提交区" className="section-card" data-testid="procurement-actions-card">
       <Descriptions>
         <Descriptions.Item label="PR状态">{record.status}</Descriptions.Item>
@@ -640,12 +675,17 @@ function ProcurementDetailPage() {
             确认定标并进入待建PO
           </Button>
         )}
-        {record.erp_sync_status === 'WAITING_PO' && !record.po_no && (
+        {(waitingPo || record.erp_sync_status === 'WAITING_PO') && !record.po_no && (
           <Button type="primary" onClick={() => navigate('/erp/po-candidates')} data-testid="open-po-candidates">
             打开待建 PO 列表
           </Button>
         )}
         {record.po_no && <Button onClick={() => navigate(`/erp/pos/${record.po_no}`)}>跳转ERP详情</Button>}
+        {siblingPrNo && !waitingPo && (
+          <Button onClick={() => navigate(`/procurement/requests/${siblingPrNo}`)} data-testid="open-sibling-pr">
+            打开已提交的 PR
+          </Button>
+        )}
       </Space>
     </Card>
     <Card title="G. ERP结果" className="section-card" data-testid="procurement-erp-result-card">
@@ -692,26 +732,66 @@ function ERPOrderListPage() {
   const navigate = useNavigate()
   const [filters, setFilters] = useState({ po_no: '', pr_no: '', oa_apply_no: '', status: '' })
   const [rows, setRows] = useState<ERPOrder[]>([])
-  const load = async () => {
-    try { setRows((await api.listERPOrders(Object.fromEntries(Object.entries(filters).filter(([, value]) => value)) as typeof filters)).items) }
-    catch (e) { message.error((e as Error).message) }
+  const [loading, setLoading] = useState(false)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(50)
+  const [total, setTotal] = useState(0)
+  const load = async (nextPage = page, nextPageSize = pageSize) => {
+    setLoading(true)
+    try {
+      const params = Object.fromEntries(Object.entries(filters).filter(([, value]) => value)) as typeof filters
+      const data = await api.listERPOrders({ ...params, page: nextPage, page_size: nextPageSize })
+      setRows(data.items || [])
+      setTotal(data.pagination?.total ?? data.items?.length ?? 0)
+      setPage(data.pagination?.page ?? nextPage)
+      setPageSize(data.pagination?.page_size ?? nextPageSize)
+    } catch (e) {
+      message.error((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
   }
-  useEffect(() => { void load() }, [])
+  useEffect(() => { void load(1, pageSize) }, [])
   return <>
-    <PageTitle title="ERP 采购订单" subtitle="查询已由采购云传输至 ERP 的采购订单" />
+    <PageTitle title="ERP 采购订单" subtitle={`查询已创建的 ERP 采购订单（共 ${total} 条）`} />
     <Card>
       <Space wrap className="filter-bar">
-        <Input placeholder="PO号" value={filters.po_no} onChange={(e) => setFilters({ ...filters, po_no: e.target.value })} onPressEnter={load} data-testid="erp-order-search" />
+        <Input placeholder="PO号" value={filters.po_no} onChange={(e) => setFilters({ ...filters, po_no: e.target.value })} onPressEnter={() => void load(1, pageSize)} data-testid="erp-order-search" />
         <Input placeholder="PR号" value={filters.pr_no} onChange={(e) => setFilters({ ...filters, pr_no: e.target.value })} />
         <Input placeholder="OA号" value={filters.oa_apply_no} onChange={(e) => setFilters({ ...filters, oa_apply_no: e.target.value })} />
         <Select allowClear placeholder="状态" value={filters.status || undefined} onChange={(value) => setFilters({ ...filters, status: value || '' })} options={['created'].map((value) => ({ value, label: value }))} />
-        <Button type="primary" onClick={load}>查询</Button>
+        <Button type="primary" onClick={() => void load(1, pageSize)}>查询</Button>
       </Space>
-      <Table rowKey="po_no" dataSource={rows} data-testid="erp-order-table" columns={[
-        { title: 'PO', dataIndex: 'po_no' }, { title: 'PR', dataIndex: 'pr_no' }, { title: 'OA', dataIndex: 'oa_apply_no' },
-        { title: '金额', dataIndex: 'total_amount', render: (value) => `¥${Number(value).toFixed(2)}` }, { title: '状态', dataIndex: 'status' }, { title: '时间', dataIndex: 'created_at' },
-        { title: '操作', render: (_, row) => <Button type="link" onClick={() => navigate(`/erp/pos/${row.po_no}`)} data-testid={`erp-order-view-${row.po_no}`}>查看</Button> },
-      ]} />
+      <Table
+        rowKey="po_no"
+        loading={loading}
+        dataSource={rows}
+        data-testid="erp-order-table"
+        pagination={{
+          current: page,
+          pageSize,
+          total,
+          showSizeChanger: true,
+          pageSizeOptions: [20, 50, 100],
+          onChange: (nextPage, nextPageSize) => void load(nextPage, nextPageSize || pageSize),
+        }}
+        columns={[
+          { title: 'PO', dataIndex: 'po_no' },
+          { title: 'PR', dataIndex: 'pr_no' },
+          { title: 'OA', dataIndex: 'oa_apply_no' },
+          { title: '金额', dataIndex: 'total_amount', render: (value) => `¥${Number(value).toFixed(2)}` },
+          { title: '状态', dataIndex: 'status' },
+          { title: '时间', dataIndex: 'created_at' },
+          {
+            title: '操作',
+            render: (_, row) => (
+              <Button type="link" onClick={() => navigate(`/erp/pos/${row.po_no}`)} data-testid={`erp-order-view-${row.po_no}`}>
+                查看
+              </Button>
+            ),
+          },
+        ]}
+      />
     </Card>
   </>
 }
@@ -873,7 +953,7 @@ function ProcurementPage() {
             {procurementHeaderFields.map((field) => <Col span={8} key={field.name}><Form.Item name={field.name} label={field.label} rules={[{ required: field.required, message: `请填写${field.label}` }]}><Input placeholder={field.placeholder} data-testid={`header-${field.name}`} /></Form.Item></Col>)}
           </Row>
         </Card>
-        <Card title="物资明细" className="section-card" extra={<Button icon={<PlusOutlined />} onClick={addLine} data-testid="add-material-line">新增一行</Button>}>
+        <Card title="物资明细" className="section-card" extra={<Button icon={<Plus size={16} strokeWidth={1.75} />} onClick={addLine} data-testid="add-material-line">新增一行</Button>}>
           <div className="line-grid line-grid-header"><span>行号</span><span>ERP 物料</span><span>规格</span><span>单位</span><span>数量</span><span>单价（元）</span><span>金额（元）</span><span>操作</span></div>
           {lines.map((line) => (
             <div className="line-grid" key={line.line_no} data-testid={`material-line-${line.line_no}`}>
@@ -894,14 +974,14 @@ function ProcurementPage() {
               <InputNumber min={0.0001} value={line.quantity} onChange={(v) => updateLine(line.line_no, { quantity: v || undefined })} data-testid={`line-quantity-${line.line_no}`} />
               <InputNumber min={0} precision={2} value={line.unit_price} onChange={(v) => updateLine(line.line_no, { unit_price: v || undefined })} data-testid={`line-price-${line.line_no}`} />
               <strong>¥{lineAmount(line).toFixed(2)}</strong>
-              <Popconfirm title="删除该物资行？" onConfirm={() => removeLine(line.line_no)}><Button danger type="text" icon={<DeleteOutlined />} disabled={lines.length === 1} data-testid={`delete-line-${line.line_no}`} /></Popconfirm>
+              <Popconfirm title="删除该物资行？" onConfirm={() => removeLine(line.line_no)}><Button danger type="text" icon={<Trash2 size={16} strokeWidth={1.75} />} disabled={lines.length === 1} data-testid={`delete-line-${line.line_no}`} /></Popconfirm>
             </div>
           ))}
           <Divider />
           <div className="amount-summary" data-testid="total-amount"><Statistic title="采购总金额" value={amount} precision={2} prefix="¥" /></div>
           <Alert className="price-notice" type="info" showIcon message="价格权威说明" description="页面单价可编辑并用于预估；保存后服务端将以 ERP standard_price 重新计算，输入差异会留痕审计。" data-testid="server-price-notice" />
         </Card>
-        <Card title="附件" className="section-card"><Upload.Dragger fileList={files} onChange={({ fileList }) => setFiles(fileList)} beforeUpload={() => false} multiple data-testid="attachment-upload"><CloudUploadOutlined className="upload-icon" /><p>附件仅生成 demo:// 引用，不上传二进制</p></Upload.Dragger></Card>
+        <Card title="附件" className="section-card"><Upload.Dragger fileList={files} onChange={({ fileList }) => setFiles(fileList)} beforeUpload={() => false} multiple data-testid="attachment-upload"><CloudUpload className="upload-icon" size={28} strokeWidth={1.5} /><p>附件仅生成 demo:// 引用，不上传二进制</p></Upload.Dragger></Card>
         <Card title="提交前校验" className="section-card" data-testid="validation-area">
           <Alert showIcon type={lines.every((l) => l.material_code && l.quantity && l.unit_price != null) ? 'success' : 'warning'} message="校验项" description="单据头必填；每行需选择 ERP 物料并填写数量、单价；OA 来源须已审批通过。" />
         </Card>
@@ -929,8 +1009,8 @@ function AgentPage() {
   }
   return (
     <>
-      <PageTitle title="GUI Agent 操作中心" subtitle="查询采购自动化任务，查看业务关联与执行状态" />
-      <Alert type="info" showIcon icon={<RobotOutlined />} message="GUI Agent 操作入口" description="采购单确认提交后，后端创建自动化任务。Agent 将根据 task_id 执行采购系统操作，并以 business_key 关联业务单据。" data-testid="agent-guide" />
+      <PageTitle title="GUI Agent 操作中心" subtitle="查询自动化任务状态与业务关联" />
+      <Alert type="info" showIcon icon={<Bot size={16} strokeWidth={1.75} />} message="GUI Agent" description="单据确认提交后，后端创建自动化任务。Agent 按 task_id 执行页面操作，并以 business_key 关联业务单据。" data-testid="agent-guide" />
       <Card title="任务查询" className="section-card">
         <Space.Compact block>
           <Input value={taskId} onChange={(e) => setTaskId(e.target.value)} onPressEnter={query} placeholder="输入 task_id" data-testid="agent-task-id-input" />

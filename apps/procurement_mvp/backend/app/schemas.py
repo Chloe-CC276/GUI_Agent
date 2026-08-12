@@ -436,6 +436,17 @@ class POMarkCreatedInput(BaseModel):
     message: str | None = None
 
 
+class POUserResponseInput(BaseModel):
+    action: str = Field(min_length=1)
+    note: str | None = None
+
+
+class POLinkInput(BaseModel):
+    po_no: str = Field(min_length=1)
+    task_id: str | None = None
+    simulate_failure: bool = False
+
+
 class TransferOut(ORMModel):
     transfer_id: str
     source_system: str

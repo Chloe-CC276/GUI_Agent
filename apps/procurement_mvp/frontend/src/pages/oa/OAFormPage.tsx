@@ -17,7 +17,7 @@ import {
   message,
 } from 'antd'
 import type { UploadFile } from 'antd'
-import { CloudUploadOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons'
+import { CloudUpload, Plus, Trash2 } from 'lucide-react'
 import dayjs from 'dayjs'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api } from '../../api'
@@ -411,7 +411,7 @@ export function OAFormPage() {
                         <Button
                           type="link"
                           danger
-                          icon={<DeleteOutlined />}
+                          icon={<Trash2 size={16} strokeWidth={1.75} />}
                           disabled={fields.length <= 1}
                           onClick={() => remove(field.name)}
                           data-testid={`oa-line-remove-${field.name}`}
@@ -423,7 +423,7 @@ export function OAFormPage() {
                 <Space style={{ marginTop: 12 }}>
                   <Button
                     type="dashed"
-                    icon={<PlusOutlined />}
+                    icon={<Plus size={16} strokeWidth={1.75} />}
                     onClick={() => add({ item_name: '', specification: '', quantity: 1, estimated_unit_price: 0 })}
                     data-testid="oa-line-add-button"
                   >
@@ -517,7 +517,7 @@ export function OAFormPage() {
             }}
             data-testid="oa-form-upload"
           >
-            <CloudUploadOutlined className="upload-icon" />
+            <CloudUpload className="upload-icon" size={28} strokeWidth={1.5} />
             <p>附件仅生成 demo:// 引用，不上传二进制</p>
           </Upload.Dragger>
         </Card>
