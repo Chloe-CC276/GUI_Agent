@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-import pyautogui
+from ._optional_pyautogui import pyautogui
 
 try:
     import pyperclip

@@ -191,12 +191,17 @@ class PromptConfig:
         default_factory=lambda: dict(_DEFAULT_KIND_FORMATS)
     )
     system_overrides: Mapping[PromptKind, str] = field(default_factory=dict)
+    # Appended after stock PLANNER_RULES_* (evaluation optimized prompts). Empty = original.
+    extra_rules: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.language = PromptLanguage.coerce(self.language)
         self.format = PromptFormat.coerce(self.format)
         self.allowed_actions = _unique_actions(self.allowed_actions)
+        self.extra_rules = tuple(
+            str(item).strip() for item in tuple(self.extra_rules or ()) if str(item).strip()
+        )
 
         _validate_non_negative("history_limit", self.history_limit)
         _validate_positive("max_elements", self.max_elements)

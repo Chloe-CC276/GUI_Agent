@@ -173,6 +173,8 @@ def build_planner_rules(
             if resolved is PromptLanguage.ZH
             else "Never use an action outside the allowed-action list."
         )
+    for extra in cfg.extra_rules:
+        rules.append(extra)
     return "\n".join(f"{index}. {rule}" for index, rule in enumerate(rules, start=1))
 
 
@@ -197,6 +199,19 @@ def _task_text(state: Any) -> str:
     text = compact_whitespace(task)
     if not text:
         raise ValueError("Planner task instruction must not be empty")
+    task_object = _read(state, "task")
+    subgoal = _read(state, "subgoal") or _read(task_object, "subgoal")
+    metadata = _read(state, "metadata", default={}) or {}
+    if not subgoal and isinstance(metadata, Mapping):
+        sub_tasks = metadata.get("sub_tasks") or []
+        index = int(metadata.get("sub_task_index") or 0)
+        if sub_tasks and index < len(sub_tasks):
+            item = sub_tasks[index]
+            subgoal = item.get("instruction") if isinstance(item, Mapping) else item
+    if subgoal:
+        text = (
+            f"{text}\nCurrent sub-task: {compact_whitespace(subgoal)}"
+        )
     return text
 
 

@@ -1081,14 +1081,25 @@ class BaseVLM(ABC):
             schema=schema,
         )
 
+        # Planner may pass response_format / messages / image alias via **kwargs.
+        overrides = dict(generation_overrides)
+        response_format = overrides.pop("response_format", "json") or "json"
+        messages = overrides.pop("messages", None)
+        # Singular "image" must not fall into generation config.extra → API extra_body.
+        singular = overrides.pop("image", None)
+        resolved_images = images
+        if not resolved_images and singular is not None:
+            resolved_images = [singular]
+
         response = self.generate(
             prompt=structured_prompt,
-            images=images,
+            images=resolved_images,
+            messages=messages,
             system_prompt=system_prompt,
             config=config,
             metadata=metadata,
-            response_format="json",
-            **generation_overrides,
+            response_format=response_format,
+            **overrides,
         )
 
         return response.json(), response
@@ -1109,14 +1120,23 @@ class BaseVLM(ABC):
             schema=schema,
         )
 
+        overrides = dict(generation_overrides)
+        response_format = overrides.pop("response_format", "json") or "json"
+        messages = overrides.pop("messages", None)
+        singular = overrides.pop("image", None)
+        resolved_images = images
+        if not resolved_images and singular is not None:
+            resolved_images = [singular]
+
         response = await self.agenerate(
             prompt=structured_prompt,
-            images=images,
+            images=resolved_images,
+            messages=messages,
             system_prompt=system_prompt,
             config=config,
             metadata=metadata,
-            response_format="json",
-            **generation_overrides,
+            response_format=response_format,
+            **overrides,
         )
 
         return response.json(), response

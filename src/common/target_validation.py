@@ -18,6 +18,7 @@ OpenCV or any model SDK.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any, Mapping
 
 
@@ -39,13 +40,21 @@ MIN_MATCH_CHARS: int = 2
 # Shortest acceptable length of the shorter text relative to the longer one.
 MIN_MATCH_RATIO: float = 0.3
 
-_KEEP_CHARACTERS = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+# Keep digits, latin, CJK, and common window-close glyphs (× ✕ ✖ ❌ …).
+# Without this, labels like "×" normalise to "" and falsely fail texts_match.
+_KEEP_CHARACTERS = re.compile(
+    r"[^0-9a-z\u4e00-\u9fff\u00d7\u2715\u2716\u274c\u2573\uff38\uff58]+"
+)
+
+# Interchangeable title-bar close marks (not plain latin "x" / word "close").
+_CLOSE_GLYPHS = frozenset({"×", "✕", "✖", "❌", "ｘ", "Ｘ", "⨉", "⨯"})
 
 
 def normalise_target_text(value: Any) -> str:
     """Reduce a label to comparable characters: digits, latin letters and CJK."""
 
-    return _KEEP_CHARACTERS.sub("", str(value or "").casefold())
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return _KEEP_CHARACTERS.sub("", text)
 
 
 def _loose_tokens(value: Any) -> set[str]:
@@ -60,6 +69,14 @@ def texts_match(target_text: Any, candidate_text: Any) -> bool:
     apply once the shorter text is long enough both absolutely and relative to
     the longer text.
     """
+
+    raw_a = unicodedata.normalize("NFKC", str(target_text or "")).strip()
+    raw_b = unicodedata.normalize("NFKC", str(candidate_text or "")).strip()
+    if raw_a and raw_a.casefold() == raw_b.casefold():
+        return True
+    # Title-bar close control: single glyph labels that look identical in logs.
+    if raw_a in _CLOSE_GLYPHS and raw_b in _CLOSE_GLYPHS:
+        return True
 
     expected = normalise_target_text(target_text)
     actual = normalise_target_text(candidate_text)

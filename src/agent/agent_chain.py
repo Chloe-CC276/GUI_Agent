@@ -22,6 +22,20 @@ from ..common.target_validation import (
 )
 from .memory import AgentMemory, MemoryImportance, MemoryKind
 from .result import ErrorInfo, ResultStatus, RunTerminationReason, ToolResult
+from .robustness import (
+    action_fingerprint,
+    apply_error_class,
+    bump_retry_budget,
+    classify_error,
+    decompose_instruction,
+    ensure_retry_budget,
+    is_empty_observation,
+    mark_recoverable,
+    observation_fingerprint,
+    robustness_snapshot,
+    sub_task_text,
+    sync_step_budget,
+)
 from .state import AgentPhase, AgentState, ObservationState
 from .tools import AgentTools
 
@@ -61,6 +75,7 @@ class VLMProtocol(Protocol):
 
 
 class ChainStage(str, Enum):
+    DECOMPOSE = "decompose"
     OBSERVE = "observe"
     PLAN = "plan"
     EXECUTE = "execute"
@@ -84,6 +99,7 @@ class ChainState(TypedDict, total=False):
     chain_error: str
     failed_stage: str
     error_type: str
+    error_class: str
     traceback: str
     error_details: dict[str, Any]
 
@@ -101,6 +117,13 @@ class AgentChainConfig:
     summarize_memory: bool = True
     fail_on_execution_error: bool = False
     max_chain_iterations: int = 20
+    # When True, skip VLM verify after dry-run executes (UI cannot change).
+    synthetic_verify_on_dry_run: bool = False
+    enable_decompose: bool = True
+    max_sub_tasks: int = 8
+    max_target_rejections: int = 2
+    max_repeated_actions: int = 2
+    max_empty_ocr_retries: int = 2
 
     def __post_init__(self) -> None:
         if not 0 <= self.post_action_wait_seconds <= 60:
@@ -120,6 +143,16 @@ class AgentChainConfig:
         if self.max_chain_iterations <= 0:
             raise ValueError(
                 "max_chain_iterations must be positive"
+            )
+        if (
+            self.max_sub_tasks <= 0
+            or self.max_target_rejections < 0
+            or self.max_repeated_actions < 0
+            or self.max_empty_ocr_retries < 0
+        ):
+            raise ValueError(
+                "max_sub_tasks must be positive; rejection/repeat/OCR "
+                "limits must be non-negative"
             )
 
 
@@ -209,7 +242,13 @@ class AgentChain:
             state.begin()
         elif state.is_terminal:
             raise AgentChainError("Cannot run a terminal AgentState")
-        return {"agent_state": state, "stage": ChainStage.OBSERVE.value}
+        ensure_retry_budget(state.metadata)
+        stage = (
+            ChainStage.DECOMPOSE.value
+            if self.config.enable_decompose
+            else ChainStage.OBSERVE.value
+        )
+        return {"agent_state": state, "stage": stage}
 
     async def _run_loop(self, context: ChainState) -> ChainState:
         for _ in range(self.config.max_chain_iterations):
@@ -229,6 +268,7 @@ class AgentChain:
 
     async def _dispatch(self, context: ChainState) -> ChainState:
         handlers = {
+            ChainStage.DECOMPOSE.value: self._decompose,
             ChainStage.OBSERVE.value: self._observe,
             ChainStage.PLAN.value: self._plan,
             ChainStage.EXECUTE.value: self._execute,
@@ -245,13 +285,33 @@ class AgentChain:
             return self._fail_update(
                 context["agent_state"], f"Unknown AgentChain stage: {stage!r}"
             )
+        started = time.perf_counter()
         try:
-            return await handler(context)
+            next_context = await handler(context)
         except Exception as error:
             logger.exception("AgentChain stage failed unexpectedly: stage=%s", stage)
             return self._exception_failure(
                 context["agent_state"], error, stage
             )
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        state = next_context.get("agent_state") or context["agent_state"]
+        error_class = next_context.get("error_class") or state.metadata.get(
+            "last_error_class"
+        )
+        logger.info(
+            "task_id=%s step=%s stage=%s next=%s error_class=%s "
+            "latency_ms=%.0f retry_count=%s",
+            getattr(state, "run_id", None),
+            getattr(getattr(state, "runtime", None), "step_index", None),
+            stage,
+            next_context.get("stage"),
+            error_class or "-",
+            elapsed_ms,
+            getattr(getattr(state, "runtime", None), "retry_count", 0),
+        )
+        next_context["error_class"] = error_class
+        next_context["latency_ms"] = elapsed_ms
+        return next_context
 
     @staticmethod
     def _terminal(context: ChainState) -> bool:
@@ -261,6 +321,43 @@ class AgentChain:
             ChainStage.FAIL.value,
         }
 
+    async def _decompose(self, context: ChainState) -> ChainState:
+        state = context["agent_state"]
+        existing = state.metadata.get("sub_tasks")
+        if isinstance(existing, list) and existing:
+            sub_tasks = existing
+        else:
+            sub_tasks = decompose_instruction(
+                state.task.instruction,
+                max_sub_tasks=self.config.max_sub_tasks,
+            )
+            state.metadata["sub_tasks"] = sub_tasks
+        state.metadata["sub_task_index"] = int(state.metadata.get("sub_task_index") or 0)
+        current = (
+            sub_tasks[state.metadata["sub_task_index"]]
+            if sub_tasks
+            else None
+        )
+        text = sub_task_text(current)
+        if text:
+            state.task.set_subgoal(text)
+        state.add_history(
+            event_type="decompose",
+            message=text or state.task.instruction,
+            status=ResultStatus.SUCCESS,
+            metadata={
+                "sub_task_count": len(sub_tasks),
+                "sub_tasks": [sub_task_text(item) for item in sub_tasks],
+            },
+        )
+        logger.info(
+            "task_id=%s stage=decompose sub_task_count=%s current=%s",
+            state.run_id,
+            len(sub_tasks),
+            text,
+        )
+        return {"agent_state": state, "stage": ChainStage.OBSERVE.value}
+
     async def _observe(self, context: ChainState) -> ChainState:
         state = context["agent_state"]
         if self._limit_reached(state):
@@ -269,6 +366,27 @@ class AgentChain:
         if not result.succeeded or not isinstance(result.output, ObservationState):
             return self._tool_failure(state, result, "observation")
         state.update_observation(result.output, tool_result=result)
+        if is_empty_observation(result.output):
+            count = bump_retry_budget(state, "empty_ocr")
+            mark_recoverable(state, "empty_ocr")
+            state.add_history(
+                event_type="empty_ocr_retry",
+                message="Observation has no OCR text or GUI elements.",
+                status=ResultStatus.RETRY,
+                metadata={"retry_count": count},
+            )
+            if count > self.config.max_empty_ocr_retries:
+                return self._fail_update(
+                    state,
+                    "Empty OCR/UI observation retry limit reached.",
+                    error_class="empty_ocr",
+                )
+            return {
+                "agent_state": state,
+                "stage": ChainStage.OBSERVE.value,
+                "error_class": "empty_ocr",
+                "chain_error": "empty_ocr",
+            }
         return {"agent_state": state, "stage": ChainStage.PLAN.value}
 
     async def _plan(self, context: ChainState) -> ChainState:
@@ -307,11 +425,17 @@ class AgentChain:
             ) + 1
 
             state.metadata["planner_retry_count"] = retry_count
+            bump_retry_budget(state, "planner")
+            mark_recoverable(state, "parse")
 
             retry_reason = (
                 result.reason
                 or "Planner requested another observation."
             )
+            error_class = classify_error(
+                getattr(result, "error", None), retry_reason, stage="plan"
+            )
+            state.metadata["last_error_class"] = error_class
 
             state.add_history(
                 event_type="planner_retry",
@@ -320,6 +444,7 @@ class AgentChain:
                 metadata={
                     "retry_count": retry_count,
                     "max_retries": self.config.max_planner_retries,
+                    "error_class": error_class,
                     "raw_output": getattr(result, "raw_output", None),
                 },
             )
@@ -334,6 +459,7 @@ class AgentChain:
                         f"Last reason: {retry_reason}"
                     ),
                     getattr(result, "error", None),
+                    error_class="planner_retry_exhausted",
                 )
 
             return {
@@ -341,6 +467,7 @@ class AgentChain:
                 "stage": ChainStage.OBSERVE.value,
                 "chain_error": retry_reason,
                 "planner_retry_count": retry_count,
+                "error_class": error_class,
             }
 
         return self._fail_update(
@@ -373,6 +500,8 @@ class AgentChain:
                 int(state.metadata.get("target_rejection_count", 0)) + 1
             )
             state.metadata["target_rejection_count"] = target_rejection_count
+            bump_retry_budget(state, "target_rejection")
+            mark_recoverable(state, "target_rejected")
 
             state.add_history(
                 event_type="action_rejected",
@@ -380,22 +509,25 @@ class AgentChain:
                 status=ResultStatus.RETRY,
                 metadata={
                     "rejection_count": target_rejection_count,
-                    "max_rejections": 2,
+                    "max_rejections": self.config.max_target_rejections,
+                    "error_class": "target_rejected",
                     "action": self._action_mapping(state.latest_action),
                 },
             )
 
-            if target_rejection_count > 2:
+            if target_rejection_count > self.config.max_target_rejections:
                 return self._fail_update(
                     state,
                     "Target validation failed repeatedly: "
                     f"{validation_error}",
+                    error_class="target_rejected",
                 )
 
             return {
                 "agent_state": state,
                 "stage": ChainStage.OBSERVE.value,
                 "chain_error": validation_error,
+                "error_class": "target_rejected",
             }
 
         # 目标校验成功，清零连续拒绝次数
@@ -440,19 +572,68 @@ class AgentChain:
         if not result.succeeded or not isinstance(result.output, ObservationState):
             return self._tool_failure(state, result, "post-action observation")
         state.update_observation(result.output, tool_result=result)
+        stalled = self._update_progress_guard(state)
+        if stalled:
+            if state.runtime.repeated_action_count > self.config.max_repeated_actions:
+                return self._fail_update(
+                    state,
+                    "Repeated action produced no visible UI change.",
+                    error_class="no_progress",
+                )
+            mark_recoverable(state, "no_progress")
+            state.add_history(
+                event_type="no_progress",
+                message="Same action and unchanged observation; forcing reflection.",
+                status=ResultStatus.RETRY,
+                metadata={
+                    "repeated_action_count": state.runtime.repeated_action_count,
+                    "error_class": "no_progress",
+                },
+            )
+            return {
+                "agent_state": state,
+                "stage": ChainStage.REFLECT.value,
+                "error_class": "no_progress",
+                "chain_error": "no_progress",
+            }
         state.set_phase(AgentPhase.VERIFYING)
         return {"agent_state": state, "stage": ChainStage.VERIFY.value}
 
     async def _verify(self, context: ChainState) -> ChainState:
         state = context["agent_state"]
-        try:
-            prompt = self.prompts.build_text(PromptKind.VERIFY, state)
-            data, raw = await self._call_structured(
-                prompt, VERIFY_RESPONSE_SCHEMA, PromptKind.VERIFY
-            )
-            self._validate_verify(data)
-        except Exception as error:
-            return self._exception_reflection(state, error, "verification")
+        prompt = ""
+        raw: Any = None
+        dry_run = bool(
+            state.metadata.get("dry_run")
+            or self.config.synthetic_verify_on_dry_run
+        )
+        if dry_run:
+            data = {
+                "status": "uncertain",
+                "action_effective": False,
+                "task_complete": False,
+                "evidence": [
+                    "dry_run: executor did not apply side effects; UI cannot prove success"
+                ],
+                "reason": (
+                    "Synthetic verification for dry-run: action was planned/logged "
+                    "but not applied to the desktop."
+                ),
+                "confidence": 0.0,
+                "recommended_next": "continue",
+            }
+            prompt = "(synthetic dry-run verify)"
+            raw = data
+        else:
+            try:
+                prompt = self.prompts.build_text(PromptKind.VERIFY, state)
+                data, raw = await self._call_structured(
+                    prompt, VERIFY_RESPONSE_SCHEMA, PromptKind.VERIFY, state=state
+                )
+                data = _coerce_verify_data(data)
+                self._validate_verify(data)
+            except Exception as error:
+                return self._exception_reflection(state, error, "verification")
 
         succeeded = bool(data["action_effective"]) and data["status"] == "success"
         complete = bool(data["task_complete"])
@@ -462,7 +643,7 @@ class AgentChain:
             status=ResultStatus.SUCCESS if succeeded else ResultStatus.RETRY,
             output=data,
             message=str(data["reason"]),
-            metadata={"raw_response": raw},
+            metadata={"raw_response": raw, "synthetic": dry_run},
         )
         state.update_verification_result(verification)
         shared: ChainState = {
@@ -473,7 +654,16 @@ class AgentChain:
         }
         if complete and confidence >= self.config.verify_confidence_threshold:
             self._commit_current_step(state)
-            shared["stage"] = ChainStage.FINISH.value
+            self._advance_sub_task(state)
+            shared["stage"] = (
+                ChainStage.MEMORY.value
+                if self._has_remaining_sub_tasks(state)
+                else ChainStage.FINISH.value
+            )
+        elif dry_run:
+            # Dry-run cannot prove task completion; keep stepping until planner finish/max.
+            self._commit_current_step(state)
+            shared["stage"] = ChainStage.MEMORY.value
         elif succeeded and str(data["recommended_next"]) in {"continue", "replan"}:
             self._commit_current_step(state)
             shared["stage"] = ChainStage.MEMORY.value
@@ -486,11 +676,15 @@ class AgentChain:
         count = int(state.metadata.get("reflection_count", 0)) + 1
         state.metadata["reflection_count"] = count
         if count > self.config.max_reflections:
-            return self._fail_update(state, "Maximum reflection count reached.")
+            return self._fail_update(
+                state,
+                "Maximum reflection count reached.",
+                error_class="reflection_exhausted",
+            )
         try:
             prompt = self.prompts.build_text(PromptKind.REFLECTION, state)
             data, raw = await self._call_structured(
-                prompt, REFLECTION_RESPONSE_SCHEMA, PromptKind.REFLECTION
+                prompt, REFLECTION_RESPONSE_SCHEMA, PromptKind.REFLECTION, state=state
             )
             self._validate_reflection(data)
         except Exception as error:
@@ -514,6 +708,11 @@ class AgentChain:
         )
         self.memory.attach_to_state(state)
         self._commit_current_step(state)
+        if bool(data.get("should_replan")):
+            state.metadata["replan_count"] = int(
+                state.metadata.get("replan_count") or 0
+            ) + 1
+            mark_recoverable(state)
         if state.is_terminal or self._limit_reached(state):
             return self._fail_update(state, "Agent reached its step/time limit.")
         stage = ChainStage.PLAN if bool(data["should_replan"]) else ChainStage.OBSERVE
@@ -568,6 +767,10 @@ class AgentChain:
                 or "Task completed."
             )
             state.finish(str(message))
+        if state.metadata.get("recoverable_failure"):
+            state.metadata["auto_recovered"] = True
+        state.metadata.update(robustness_snapshot(state))
+        sync_step_budget(state)
         self.memory.ingest_state(state, recent_only=20)
         self.memory.attach_to_state(state)
         return {"agent_state": state, "stage": ChainStage.FINISH.value}
@@ -577,10 +780,20 @@ class AgentChain:
         if not state.is_terminal:
             message = context.get("chain_error") or "Agent chain failed."
             state.fail(
-                error=ErrorInfo(error_type="AgentChainFailure", message=message),
+                error=ErrorInfo(
+                    error_type="AgentChainFailure",
+                    message=message,
+                    error_class=str(
+                        context.get("error_class")
+                        or state.metadata.get("last_error_class")
+                        or "unknown"
+                    ),
+                ),
                 reason=RunTerminationReason.UNKNOWN,
                 message=message,
             )
+        state.metadata.update(robustness_snapshot(state))
+        sync_step_budget(state)
         self.memory.ingest_state(state, recent_only=20)
         self.memory.attach_to_state(state)
         return {"agent_state": state, "stage": ChainStage.FAIL.value}
@@ -590,6 +803,7 @@ class AgentChain:
         prompt: str,
         schema: Mapping[str, Any],
         target_kind: PromptKind,
+        state: AgentState | None = None,
     ) -> tuple[dict[str, Any], Any]:
         current_prompt = prompt
         raw: Any = None
@@ -602,6 +816,9 @@ class AgentChain:
                 last_error = error
                 if attempt >= self.config.max_model_repairs:
                     break
+                if state is not None:
+                    bump_retry_budget(state, "repair")
+                    mark_recoverable(state, "parse")
                 current_prompt = self.prompts.build_text(
                     PromptKind.REPAIR,
                     prompt,
@@ -660,6 +877,55 @@ class AgentChain:
                 raise
 
     @staticmethod
+    def _has_remaining_sub_tasks(state: AgentState) -> bool:
+        tasks = state.metadata.get("sub_tasks") or []
+        index = int(state.metadata.get("sub_task_index") or 0)
+        return bool(tasks) and index < len(tasks)
+
+    def _advance_sub_task(self, state: AgentState) -> None:
+        tasks = list(state.metadata.get("sub_tasks") or [])
+        if not tasks:
+            return
+        index = int(state.metadata.get("sub_task_index") or 0)
+        current = tasks[index] if index < len(tasks) else None
+        current_text = sub_task_text(current)
+        if current_text:
+            try:
+                state.task.complete_subgoal(current_text)
+            except Exception:
+                if current_text not in state.task.completed_subgoals:
+                    state.task.completed_subgoals.append(current_text)
+                state.task.set_subgoal(None)
+        index += 1
+        state.metadata["sub_task_index"] = index
+        if index < len(tasks):
+            state.task.set_subgoal(sub_task_text(tasks[index]))
+            state.metadata["sub_tasks_complete"] = False
+        else:
+            state.task.set_subgoal(None)
+            state.metadata["sub_tasks_complete"] = True
+
+    def _update_progress_guard(self, state: AgentState) -> bool:
+        action_fp = action_fingerprint(state.latest_action)
+        obs_fp = observation_fingerprint(state.observation)
+        previous_action = state.metadata.get("last_action_fingerprint")
+        previous_obs = state.metadata.get("last_observation_fingerprint")
+        stalled = bool(
+            previous_action
+            and previous_action == action_fp
+            and previous_obs == obs_fp
+        )
+        if stalled:
+            state.runtime.repeated_action_count += 1
+            bump_retry_budget(state, "repeated_action")
+            state.metadata["last_error_class"] = "no_progress"
+        else:
+            state.runtime.repeated_action_count = 0
+        state.metadata["last_action_fingerprint"] = action_fp
+        state.metadata["last_observation_fingerprint"] = obs_fp
+        return stalled
+
+    @staticmethod
     def _limit_reached(state: AgentState) -> bool:
         return bool(state.runtime.reached_max_steps or state.runtime.is_timed_out)
 
@@ -667,18 +933,24 @@ class AgentChain:
         self, state: AgentState, result: ToolResult, stage: str
     ) -> ChainState:
         message = result.message or f"{stage} failed"
+        error_class = classify_error(result.error, message, stage=stage)
         if result.should_retry and not self._limit_reached(state):
+            mark_recoverable(state, error_class)
             state.add_history(
                 event_type=f"{stage}_retry",
                 message=message,
                 status=ResultStatus.RETRY,
+                metadata={"error_class": error_class},
             )
             return {
                 "agent_state": state,
                 "stage": ChainStage.REFLECT.value,
                 "chain_error": message,
+                "error_class": error_class,
             }
-        update = self._fail_update(state, message, result.error)
+        update = self._fail_update(
+            state, message, result.error, error_class=error_class
+        )
         update["failed_stage"] = stage
         update["error_type"] = getattr(
             result.error, "error_type", "ToolFailure"
@@ -689,10 +961,13 @@ class AgentChain:
     def _exception_reflection(
         self, state: AgentState, error: BaseException, stage: str
     ) -> ChainState:
+        error_class = classify_error(error, str(error), stage=stage)
+        mark_recoverable(state, error_class)
         state.add_history(
             event_type=f"{stage}_error",
             message=str(error),
             status=ResultStatus.RETRY,
+            metadata={"error_class": error_class},
         )
         diagnostics = _exception_diagnostics(error, stage)
         logger.error(
@@ -705,12 +980,14 @@ class AgentChain:
             "agent_state": state,
             "stage": ChainStage.REFLECT.value,
             "chain_error": str(error),
+            "error_class": error_class,
             **diagnostics,
         }
 
     def _exception_failure(
         self, state: AgentState, error: BaseException, stage: str
     ) -> ChainState:
+        error_class = classify_error(error, str(error), stage=stage)
         diagnostics = _exception_diagnostics(error, stage)
         logger.error(
             "%s failed: %s",
@@ -721,9 +998,11 @@ class AgentChain:
         update = self._fail_update(
             state,
             f"{stage} failed: {error}",
-            ErrorInfo.from_exception(error, retryable=False),
+            ErrorInfo.from_exception(error, retryable=False, error_class=error_class),
+            error_class=error_class,
         )
         update.update(diagnostics)
+        update["error_class"] = error_class
         return update
 
     def _planner_failure_update(
@@ -737,41 +1016,28 @@ class AgentChain:
             or getattr(result, "reason", None)
             or "Planner failed."
         )
-        update: ChainState = {
-            "agent_state": state,
-            "stage": ChainStage.FAIL.value,
-            "chain_error": str(message),
-            "failed_stage": ChainStage.PLAN.value,
-            "error_type": str(
-                getattr(error, "error_type", "PlannerFailure")
-            ),
-            "error_details": _error_info_details(error),
-        }
-        metadata = getattr(result, "metadata", None)
-        if isinstance(metadata, Mapping):
-            diagnostic = metadata.get("diagnostic")
-            if isinstance(diagnostic, Mapping):
-                update["error_details"] = {
-                    **update["error_details"],
-                    **dict(diagnostic),
-                }
-                if diagnostic.get("traceback"):
-                    update["traceback"] = str(diagnostic["traceback"])
-        raw_output = getattr(result, "raw_output", None)
-        if raw_output is not None:
-            update["last_raw_response"] = raw_output
-        return update
+        error_class = classify_error(error, str(message), stage="plan")
+        return self._fail_update(
+            state, str(message), error, error_class=error_class
+        )
 
     @staticmethod
     def _fail_update(
         state: AgentState,
         message: str,
         error: ErrorInfo | None = None,
+        *,
+        error_class: str | None = None,
     ) -> ChainState:
+        resolved = error_class or classify_error(error, message)
+        apply_error_class(error, resolved)
+        state.metadata["last_error_class"] = resolved
         if not state.is_terminal:
             state.fail(
                 error=error or ErrorInfo(
-                    error_type="AgentChainFailure", message=message
+                    error_type="AgentChainFailure",
+                    message=message,
+                    error_class=resolved,
                 ),
                 reason=(
                     RunTerminationReason.MAX_STEPS
@@ -782,21 +1048,28 @@ class AgentChain:
                 ),
                 message=message,
             )
+        state.metadata.update(robustness_snapshot(state))
+        sync_step_budget(state)
         return {
             "agent_state": state,
             "stage": ChainStage.FAIL.value,
             "chain_error": message,
+            "error_class": resolved,
         }
 
     def _iteration_limit_failure(self, context: ChainState) -> ChainState:
         return self._fail_update(
             context["agent_state"],
             f"AgentChain exceeded {self.config.max_chain_iterations} stages.",
+            error_class="no_progress",
         )
 
     @staticmethod
     def _finalise_output(context: ChainState) -> Any:
-        return context["agent_state"].to_run_result()
+        state = context["agent_state"]
+        state.metadata.update(robustness_snapshot(state))
+        sync_step_budget(state)
+        return state.to_run_result()
 
 
 def create_agent_chain(
@@ -837,14 +1110,44 @@ def _supported_kwargs(method: Callable[..., Any], **values: Any) -> dict[str, An
     return result
 
 
+_VERIFY_KEYS = {
+    "status",
+    "action_effective",
+    "task_complete",
+    "evidence",
+    "reason",
+    "confidence",
+    "recommended_next",
+}
+_STRUCTURED_HINT_KEYS = _VERIFY_KEYS | {
+    "decision",
+    "action",
+    "failure_type",
+    "summary",
+    "should_replan",
+}
+
+
 def _parse_json_object(response: Any) -> dict[str, Any]:
     if isinstance(response, tuple) and response:
-        response = response[0]
+        # generate_json returns (parsed_mapping, VLMResponse)
+        first, second = response[0], response[1] if len(response) > 1 else None
+        if isinstance(first, Mapping):
+            response = first
+        elif second is not None:
+            response = second
+        else:
+            response = first
     if isinstance(response, Mapping):
+        # Prefer the outer object when it already looks structured.
+        if _STRUCTURED_HINT_KEYS.intersection(str(k).lower() for k in response):
+            return dict(response)
         for key in ("parsed", "json", "output", "content", "text"):
             value = response.get(key)
             if isinstance(value, Mapping):
                 return dict(value)
+            if isinstance(value, str) and value.strip():
+                return _parse_json_object(value)
         if response:
             return dict(response)
     for attribute in ("parsed", "json", "output", "content", "text"):
@@ -871,6 +1174,38 @@ def _parse_json_object(response: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ModelResponseError("Model response must be one JSON object")
     return dict(value)
+
+
+def _coerce_verify_data(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize common aliases / missing optional shapes for verify JSON."""
+
+    out = {str(k): v for k, v in dict(data).items()}
+    aliases = {
+        "action_effective": ("actionEffective", "effective", "acted"),
+        "task_complete": ("taskComplete", "complete", "finished", "done"),
+        "recommended_next": ("recommendedNext", "next", "next_action"),
+        "status": ("result", "verdict"),
+        "reason": ("explanation", "message"),
+        "confidence": ("score",),
+        "evidence": ("evidences", "proof"),
+    }
+    for canonical, alts in aliases.items():
+        if canonical in out and out[canonical] is not None:
+            continue
+        for alt in alts:
+            if alt in out and out[alt] is not None:
+                out[canonical] = out[alt]
+                break
+    if "evidence" in out and isinstance(out["evidence"], str):
+        out["evidence"] = [out["evidence"]]
+    if "evidence" not in out:
+        out["evidence"] = []
+    if "confidence" in out:
+        try:
+            out["confidence"] = float(out["confidence"])
+        except (TypeError, ValueError):
+            out["confidence"] = 0.0
+    return out
 
 
 def _require_fields(data: Mapping[str, Any], fields: set[str], name: str) -> None:
@@ -920,7 +1255,7 @@ def _error_info_details(error: Any) -> dict[str, Any]:
         return {}
     details = getattr(error, "details", None)
     result = dict(details) if isinstance(details, Mapping) else {}
-    for name in ("error_type", "message", "retryable"):
+    for name in ("error_type", "message", "retryable", "error_class"):
         value = getattr(error, name, None)
         if value is not None:
             result[name] = value
