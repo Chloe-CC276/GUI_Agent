@@ -35,9 +35,39 @@ class ScriptedVLM:
         self.calls = 0
         self.model = "scripted-vlm"
 
+    def _task_slice(self, prompt: str) -> str:
+        text = prompt or ""
+        start = text.find("## Current task")
+        if start < 0:
+            start = text.find("## 当前任务")
+        if start < 0:
+            return text
+        rest = text[start:]
+        nxt = rest.find("\n## ", 5)
+        return rest if nxt < 0 else rest[:nxt]
+
     def _pick_from_prompt(self, prompt: str) -> dict[str, Any]:
         text = prompt or ""
-        if "关闭" in text or "close" in text.lower():
+        task = self._task_slice(text)
+        if '"element_count": 0' in text:
+            return {
+                "decision": "retry",
+                "action": None,
+                "reason": "scripted retry: observation missing OCR/UI evidence",
+                "confidence": 0.2,
+                "observation_summary": "empty observation",
+                "goal_progress": "wait for UI",
+            }
+        if "加载中" in text:
+            return {
+                "decision": "retry",
+                "action": None,
+                "reason": "scripted retry: page still loading",
+                "confidence": 0.3,
+                "observation_summary": "loading",
+                "goal_progress": "wait",
+            }
+        if "关闭" in task or "close" in task.lower():
             return {
                 "decision": "act",
                 "action": {
@@ -49,7 +79,7 @@ class ScriptedVLM:
                 "observation_summary": "word document visible",
                 "goal_progress": "closing document",
             }
-        if "搜索" in text or "search" in text.lower():
+        if "搜索" in task or "search" in task.lower():
             return {
                 "decision": "act",
                 "action": {
@@ -61,7 +91,7 @@ class ScriptedVLM:
                 "observation_summary": "browser visible",
                 "goal_progress": "focus address bar",
             }
-        if "发送" in text or "消息" in text or "message" in text.lower():
+        if "发送" in task or "消息" in task or "message" in task.lower():
             return {
                 "decision": "act",
                 "action": {
@@ -73,15 +103,15 @@ class ScriptedVLM:
                 "observation_summary": "chat window",
                 "goal_progress": "focus input",
             }
-        if "打开" in text and (
-            "文件" in text
-            or "file" in text.lower()
-            or "PDF" in text
-            or ".xlsx" in text.lower()
-            or "物料" in text
+        if "打开" in task and (
+            "文件" in task
+            or "file" in task.lower()
+            or "PDF" in task
+            or ".xlsx" in task.lower()
+            or "物料" in task
         ):
             target = "ERP物料主数据_100条.xlsx"
-            if "ERP物料主数据_100条.xlsx" in text:
+            if "ERP物料主数据_100条.xlsx" in task:
                 target = "ERP物料主数据_100条.xlsx"
             return {
                 "decision": "act",
@@ -94,7 +124,7 @@ class ScriptedVLM:
                 "observation_summary": "desktop icons",
                 "goal_progress": "open file",
             }
-        if "浏览器" in text or "browser" in text.lower() or "Edge" in text:
+        if "浏览器" in task or "browser" in task.lower() or "Edge" in task:
             return {
                 "decision": "act",
                 "action": {

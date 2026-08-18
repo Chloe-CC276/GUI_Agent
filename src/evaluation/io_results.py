@@ -78,5 +78,6 @@ OVERALL_FIELDS = [
     "timeout_rate",
     "avg_latency_seconds",
     "avg_total_tokens",
+    "auto_recovery_rate",
     "notes",
 ]

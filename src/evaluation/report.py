@@ -101,6 +101,9 @@ def lift_table(overall: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             ("action_accuracy", False),
             ("json_valid_rate", False),
             ("misoperation_rate", True),
+            ("retry_rate", True),
+            ("timeout_rate", True),
+            ("auto_recovery_rate", False),
             ("avg_latency_seconds", True),
         ):
             b = None if base is None else base.get(metric)
@@ -249,6 +252,29 @@ def _render_markdown(summary: Mapping[str, Any], records: Sequence[Mapping[str, 
                 click_hit_rate=format_metric(row.get("click_hit_rate")),
                 task_success_rate=format_metric(row.get("task_success_rate")),
                 notes=row.get("notes") or "",
+            )
+        )
+    lines.extend(["", "## 5.1 Robustness", ""])
+    lines.append(
+        "| layer | variant | n | misop | retry | repeated | timeout | auto_recovery | error_classes |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---|")
+    for row in summary.get("overall") or []:
+        classes = row.get("error_class_counts") or {}
+        class_text = ",".join(f"{k}:{v}" for k, v in classes.items()) if classes else ""
+        lines.append(
+            "| {test_layer} | {variant} | {sample_count} | {misoperation_rate} | "
+            "{retry_rate} | {repeated_action_rate} | {timeout_rate} | "
+            "{auto_recovery_rate} | {error_classes} |".format(
+                test_layer=row.get("test_layer"),
+                variant=row.get("variant"),
+                sample_count=row.get("sample_count"),
+                misoperation_rate=format_metric(row.get("misoperation_rate")),
+                retry_rate=format_metric(row.get("retry_rate")),
+                repeated_action_rate=format_metric(row.get("repeated_action_rate")),
+                timeout_rate=format_metric(row.get("timeout_rate")),
+                auto_recovery_rate=format_metric(row.get("auto_recovery_rate")),
+                error_classes=class_text,
             )
         )
     lines.extend(["", "## 6. Relative lifts", ""])

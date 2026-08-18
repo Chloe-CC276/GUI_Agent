@@ -178,6 +178,11 @@ def run_e2e_task(
         if not success and total_steps:
             notes.append("task_success=false expected unless planner emits finish")
 
+    from src.agent.robustness import robustness_fields_from_run
+
+    robustness = robustness_fields_from_run(run_result)
+    error_class = robustness.get("error_class") or getattr(err, "error_class", None)
+
     return {
         **base,
         "status": "success" if success else "failed",
@@ -190,6 +195,8 @@ def run_e2e_task(
         "notes": ";".join(notes),
         "error_type": None if success else err_type,
         "error_message": None if success else err_msg,
+        "error_class": error_class,
+        **robustness,
     }
 
 
@@ -293,6 +300,10 @@ def _fixture_e2e_loop(
         "action_correct": first_action_correct,
         # No real OS clicks in fixture-sim → misoperation is N/A
         "misoperation": None,
+        "planner_retry_count": sum(1 for item in decisions if item == "retry"),
+        "repeated_action_count": max(0, len(decisions) - len(set(decisions))),
+        "error_class": error_type,
+        "recoverable_failure": "retry" in decisions,
         "notes": (
             "fixture_sim_e2e (not live desktop); "
             "task_success if finish OR first act matches expected_action_types"

@@ -220,6 +220,17 @@ def build_agent_context(
         "task": _task_context(task),
         "observation": build_observation_context(current, config=cfg, label="current"),
     }
+    metadata = _read(state, "metadata", default={}) or {}
+    if isinstance(metadata, Mapping):
+        sub_tasks = metadata.get("sub_tasks")
+        if sub_tasks:
+            context["sub_tasks"] = sub_tasks
+            context["current_sub_task"] = _read(task, "subgoal", "current_subgoal")
+            context["sub_task_index"] = metadata.get("sub_task_index")
+        if metadata.get("retry_budget_used"):
+            context["retry_budget_used"] = metadata.get("retry_budget_used")
+        if metadata.get("last_error_class"):
+            context["last_error_class"] = metadata.get("last_error_class")
 
     if cfg.include_previous_observation:
         context["previous_observation"] = build_observation_context(

@@ -302,6 +302,7 @@ class ErrorInfo:
     code: str | int | None = None
     retryable: bool = False
     traceback: str | None = None
+    error_class: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -327,6 +328,7 @@ class ErrorInfo:
         code: str | int | None = None,
         traceback_text: str | None = None,
         details: Mapping[str, Any] | None = None,
+        error_class: str | None = None,
     ) -> "ErrorInfo":
         resolved_code = code
 
@@ -342,6 +344,7 @@ class ErrorInfo:
             code=resolved_code,
             retryable=retryable,
             traceback=traceback_text,
+            error_class=error_class,
             details=dict(details or {}),
         )
 
@@ -352,6 +355,7 @@ class ErrorInfo:
             "code": self.code,
             "retryable": self.retryable,
             "traceback": self.traceback,
+            "error_class": self.error_class,
             "details": to_json_safe(self.details),
         }
 

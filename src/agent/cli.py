@@ -756,6 +756,7 @@ def _action_detail(action: Any) -> str:
 def _stage_detail(context: Mapping[str, Any], stage: str) -> str:
     state = context.get("agent_state")
     observation = _value(state, "observation")
+    detail = ""
     if stage in {"observe", "observe_after"}:
         width = _value(observation, "screen_width")
         height = _value(observation, "screen_height")
@@ -778,28 +779,53 @@ def _stage_detail(context: Mapping[str, Any], stage: str) -> str:
                 parts.append(f"感知耗时={float(elapsed):.3f}s")
             except (TypeError, ValueError):
                 pass
-        return " | ".join(parts)
-    if stage in {"plan", "execute"}:
+        detail = " | ".join(parts)
+    elif stage in {"plan", "execute"}:
         action = _value(state, "latest_action")
         if action is None:
             action = _value(_value(state, "last_planner_result"), "action")
-        return _action_detail(action) if action is not None else "未生成动作"
-    if stage == "verify":
+        detail = _action_detail(action) if action is not None else "未生成动作"
+    elif stage == "verify":
         data = _as_mapping(context.get("verify_data"))
-        return (
+        detail = (
             f"动作生效={data.get('action_effective', 'unknown')}"
             f" | 任务完成={data.get('task_complete', 'unknown')}"
             f" | 置信度={data.get('confidence', 'unknown')}"
             f" | 下一步={data.get('recommended_next', 'unknown')}"
         )
-    if stage == "reflect":
+    elif stage == "reflect":
         data = _as_mapping(context.get("reflection_data"))
-        return (
+        detail = (
             f"失败类型={data.get('failure_type', 'unknown')}"
             f" | 反思={data.get('summary') or data.get('likely_cause') or '重新规划'}"
             f" | 重新规划={data.get('should_replan', 'unknown')}"
         )
-    return ""
+    elif stage == "decompose":
+        metadata = _as_mapping(_value(state, "metadata"))
+        count = metadata.get("sub_task_count") or len(metadata.get("sub_tasks") or [])
+        current = _value(_value(state, "task"), "subgoal")
+        detail = f"子任务数={count} | 当前={current or '-'}"
+    extra = _robustness_detail(context, state)
+    if detail and extra:
+        return f"{detail} | {extra}"
+    return extra or detail
+
+
+def _robustness_detail(context: Mapping[str, Any], state: Any) -> str:
+    metadata = _as_mapping(_value(state, "metadata"))
+    error_class = context.get("error_class") or metadata.get("last_error_class")
+    budget = _as_mapping(metadata.get("retry_budget_used"))
+    parts = []
+    if error_class:
+        parts.append(f"error_class={error_class}")
+    retry = _value(_value(state, "runtime"), "retry_count")
+    if retry:
+        parts.append(f"retry={retry}")
+    if budget.get("planner"):
+        parts.append(f"planner_retry={budget.get('planner')}")
+    if budget.get("target_rejection"):
+        parts.append(f"target_reject={budget.get('target_rejection')}")
+    return " | ".join(parts)
 
 
 def _failure_reason(

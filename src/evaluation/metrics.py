@@ -71,8 +71,10 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "timeout_rate": None,
             "avg_latency_seconds": None,
             "avg_total_tokens": None,
+            "auto_recovery_rate": None,
             "status_counts": {},
             "error_type_counts": {},
+            "error_class_counts": {},
         }
 
     json_ok = sum(1 for r in records if r.get("json_valid") is True)
@@ -92,6 +94,16 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     retries = sum(int(r.get("planner_retry_count") or 0) for r in records)
     repeated = sum(int(r.get("repeated_action_count") or 0) for r in records)
     timeouts = sum(1 for r in records if r.get("timeout") is True or r.get("status") == "timeout")
+    recoverable = [r for r in records if r.get("recoverable_failure") is True]
+    recovery_eligible = [
+        r for r in recoverable
+        if r.get("task_success") is not None or r.get("auto_recovered") is True
+    ]
+    recovered = sum(
+        1
+        for r in recovery_eligible
+        if r.get("task_success") is True or r.get("auto_recovered") is True
+    )
 
     success_steps = [
         float(r["total_steps"])
@@ -105,6 +117,9 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     status_counts = Counter(str(r.get("status") or "unknown") for r in records)
     error_counts = Counter(
         str(r.get("error_type")) for r in records if r.get("error_type")
+    )
+    error_class_counts = Counter(
+        str(r.get("error_class")) for r in records if r.get("error_class")
     )
 
     return {
@@ -123,8 +138,10 @@ def aggregate_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "timeout_rate": safe_rate(timeouts, n) if n else None,
         "avg_latency_seconds": _mean(latencies),
         "avg_total_tokens": _mean(tokens),
+        "auto_recovery_rate": safe_rate(recovered, len(recovery_eligible)) if recovery_eligible else None,
         "status_counts": dict(status_counts),
         "error_type_counts": dict(error_counts),
+        "error_class_counts": dict(error_class_counts),
     }
 
 

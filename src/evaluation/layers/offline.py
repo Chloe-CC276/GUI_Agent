@@ -197,6 +197,16 @@ def run_offline_case(
         "parsed_output": result.parsed_output,
         "error_type": None if schema_valid else "planner_error",
         "error_message": None if result.error is None else str(result.error),
+        "error_class": (
+            getattr(result.error, "error_class", None)
+            if result.error is not None
+            else ("empty_ocr" if str(getattr(result.decision, "value", result.decision)).lower() == "retry" and not (case.get("ocr_text") or case.get("gui_elements")) else None)
+        ),
+        "planner_retry_count": (
+            1 if str(getattr(result.decision, "value", result.decision)).lower() == "retry" else 0
+        ),
+        "repeated_action_count": 0,
+        "recoverable_failure": str(getattr(result.decision, "value", result.decision)).lower() == "retry",
         "task_success": None,
         "notes": "click_hit=N/A when target_bbox missing",
     }
